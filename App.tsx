@@ -12,7 +12,7 @@ import { MockupState, AppImages, Point, Sign, Dimension, TitleBlock, TitleBlockF
 import { hexToRgb } from './utils/math';
 import { TITLE_BLOCK_TEMPLATES } from './data/titleBlockTemplates';
 import { StorageService } from './services/StorageService';
-import { Wifi, WifiOff, RefreshCw, LogIn, LogOut, Loader2, AlertTriangle, User as UserIcon, HardDrive, Database } from 'lucide-react';
+import { Wifi, WifiOff, RefreshCw, LogIn, LogOut, Loader2, AlertTriangle, User as UserIcon, HardDrive, Database, KeyRound, X as XIcon } from 'lucide-react';
 
 // Declare globals for UMD libraries
 declare global {
@@ -129,6 +129,9 @@ const App: React.FC = () => {
   const [showCleanupTool, setShowCleanupTool] = useState(false);
   const [showAssistant, setShowAssistant] = useState(false);
   const [showProjectManager, setShowProjectManager] = useState(false);
+  const [showApiKeyModal, setShowApiKeyModal] = useState(false);
+  const [geminiKey, setGeminiKey] = useState<string>(() => localStorage.getItem('gemini_api_key') ?? '');
+  const effectiveApiKey = geminiKey.trim() || process.env.API_KEY;
   
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const stateRef = useRef(state);
@@ -694,12 +697,46 @@ const App: React.FC = () => {
       <div className="absolute top-4 right-4 z-50 flex items-center gap-3 bg-gray-900/80 backdrop-blur p-1 pr-3 rounded-full border border-gray-700">
           <img src={state.user.photoURL || 'https://via.placeholder.com/32'} className="w-8 h-8 rounded-full border border-gray-600" alt="User" />
           <span className="text-xs font-medium text-gray-300 hidden md:block">{state.user.displayName}</span>
+          <button onClick={() => setShowApiKeyModal(true)} className={`p-1.5 rounded-full transition-colors ${geminiKey.trim() ? 'text-green-400 hover:bg-green-500/20' : 'text-yellow-400 hover:bg-yellow-500/20'}`} title={geminiKey.trim() ? 'Gemini API Key set (your key)' : 'Set your Gemini API Key'}>
+              <KeyRound className="w-4 h-4" />
+          </button>
           <button onClick={handleLogout} className="p-1.5 hover:bg-red-500/20 hover:text-red-400 text-gray-400 rounded-full transition-colors" title="Sign Out">
               <LogOut className="w-4 h-4" />
           </button>
       </div>
 
-      <Assistant isOpen={showAssistant} setIsOpen={setShowAssistant} />
+      {/* Gemini API Key Modal */}
+      {showApiKeyModal && (
+          <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-[200] flex items-center justify-center p-4" onClick={() => setShowApiKeyModal(false)}>
+              <div className="bg-gray-900 border border-gray-700 rounded-2xl shadow-2xl p-6 w-full max-w-md" onClick={e => e.stopPropagation()}>
+                  <div className="flex items-center justify-between mb-4">
+                      <h2 className="text-white font-bold text-lg flex items-center gap-2"><KeyRound className="w-5 h-5 text-yellow-400" /> Gemini AI Settings</h2>
+                      <button onClick={() => setShowApiKeyModal(false)} className="text-gray-400 hover:text-white"><XIcon className="w-5 h-5" /></button>
+                  </div>
+                  <p className="text-gray-400 text-sm mb-4">
+                      Enter your own <strong className="text-white">Google Gemini API key</strong> to use AI features (Pro Guide &amp; Magic Cleanup) on your own quota. Leave blank to use the shared key (Sign Image account).
+                  </p>
+                  <input
+                      type="password"
+                      placeholder="AIza..."
+                      value={geminiKey}
+                      onChange={e => setGeminiKey(e.target.value)}
+                      className="w-full bg-gray-800 border border-gray-600 text-white px-3 py-2 rounded-lg text-sm font-mono mb-4 focus:outline-none focus:border-blue-500"
+                  />
+                  <div className="flex gap-2">
+                      <button onClick={() => { localStorage.setItem('gemini_api_key', geminiKey.trim()); setShowApiKeyModal(false); }} className="flex-1 bg-blue-600 hover:bg-blue-500 text-white py-2 rounded-lg text-sm font-semibold transition-colors">Save Key</button>
+                      {geminiKey.trim() && (
+                          <button onClick={() => { setGeminiKey(''); localStorage.removeItem('gemini_api_key'); }} className="px-4 bg-gray-700 hover:bg-gray-600 text-red-400 py-2 rounded-lg text-sm transition-colors">Clear</button>
+                      )}
+                  </div>
+                  {!geminiKey.trim() && !process.env.API_KEY && (
+                      <p className="text-red-400 text-xs mt-3 flex items-center gap-1"><AlertTriangle className="w-3 h-3" /> No key available — AI features will be disabled.</p>
+                  )}
+              </div>
+          </div>
+      )}
+
+      <Assistant isOpen={showAssistant} setIsOpen={setShowAssistant} apiKey={effectiveApiKey} />
       
       <ControlsPanel
         state={state}
@@ -787,7 +824,7 @@ const App: React.FC = () => {
            imageUrl={activeCanvas.backgroundImage}
            onClose={() => setShowCleanupTool(false)}
            onSave={handleCleanupSave}
-           apiKey={process.env.API_KEY}
+           apiKey={effectiveApiKey}
         />
       )}
     </div>

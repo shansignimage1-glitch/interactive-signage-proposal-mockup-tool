@@ -28,9 +28,10 @@ interface Message {
 interface AssistantProps {
   isOpen?: boolean;
   setIsOpen?: (isOpen: boolean) => void;
+  apiKey?: string;
 }
 
-const Assistant: React.FC<AssistantProps> = ({ isOpen: propIsOpen, setIsOpen: propSetIsOpen }) => {
+const Assistant: React.FC<AssistantProps> = ({ isOpen: propIsOpen, setIsOpen: propSetIsOpen, apiKey }) => {
   const [internalIsOpen, setInternalIsOpen] = useState(false);
   const [isMinimized, setIsMinimized] = useState(false);
   const [messages, setMessages] = useState<Message[]>([
@@ -49,18 +50,22 @@ const Assistant: React.FC<AssistantProps> = ({ isOpen: propIsOpen, setIsOpen: pr
   const isOpen = propIsOpen !== undefined ? propIsOpen : internalIsOpen;
   const setIsOpen = propSetIsOpen || setInternalIsOpen;
 
-  // Initialize AI
+  // Initialize AI — reinitialize whenever the resolved key changes
   useEffect(() => {
-    if (process.env.API_KEY) {
-      aiRef.current = new GoogleGenAI({ apiKey: process.env.API_KEY });
+    const key = apiKey || process.env.API_KEY;
+    if (key) {
+      aiRef.current = new GoogleGenAI({ apiKey: key });
       chatSessionRef.current = aiRef.current.chats.create({
         model: 'gemini-2.5-flash',
         config: {
           systemInstruction: SYSTEM_INSTRUCTION,
         }
       });
+    } else {
+      aiRef.current = null;
+      chatSessionRef.current = null;
     }
-  }, []);
+  }, [apiKey]);
 
   // Auto-scroll
   useEffect(() => {
