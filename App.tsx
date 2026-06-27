@@ -155,20 +155,49 @@ const App: React.FC = () => {
 
   // --- Auth & Data Loading ---
   useEffect(() => {
-    // TEMPORARY: Firebase Auth disabled to prevent environment warnings.
-    // We immediately stop loading to show the login screen.
-    setIsAuthLoading(false);
+    const unsubscribe = auth.onAuthStateChanged(async (firebaseUser) => {
+      if (firebaseUser) {
+        const user = {
+          uid: firebaseUser.uid,
+          displayName: firebaseUser.displayName,
+          email: firebaseUser.email,
+          photoURL: firebaseUser.photoURL,
+        };
+        // Try to load the most recent project from cloud, fall back to local
+        const projects = await StorageService.listProjectsCloud(user.uid);
+        if (projects.length > 0) {
+          const latest = projects.sort((a, b) => (b.lastModified ?? 0) - (a.lastModified ?? 0))[0];
+          const loaded = await StorageService.loadProjectCloud(user.uid, latest.id);
+          if (loaded) {
+            setState({ ...loaded, user, isOnline: navigator.onLine, isSyncing: false });
+            setIsAuthLoading(false);
+            return;
+          }
+        }
+        // No cloud project — start fresh
+        setState({ ...getInitialState(), user, isOnline: navigator.onLine });
+      } else {
+        // Not signed in — show login screen
+        setState(getInitialState());
+      }
+      setIsAuthLoading(false);
+    });
+    return () => unsubscribe();
   }, []);
 
-
   const handleLogin = async () => {
-    // TEMPORARY: Disable Google Auth
-    alert("Firebase Auth is temporarily disabled. Please continue as Guest.");
+    setAuthError(null);
+    try {
+      await auth.signInWithPopup(googleProvider);
+      // onAuthStateChanged above handles the rest
+    } catch (err: any) {
+      setAuthError(err.message ?? 'Sign-in failed. Please try again.');
+    }
   };
 
   const handleLogout = async () => {
-      // Simply reset state locally without calling auth.signOut
-      setState(getInitialState());
+    await auth.signOut();
+    setState(getInitialState());
   };
 
   const updateState = useCallback((updates: Partial<MockupState>) => {

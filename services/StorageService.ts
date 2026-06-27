@@ -96,21 +96,93 @@ export const StorageService = {
       await idbOperation(STORE_METADATA, 'readwrite', (store) => store.delete(projectId));
   },
 
-  // --- Cloud Sync (Legacy / Future) ---
-  
-  // Note: We currently prefer Local DB for full asset saving as it is more robust for large Base64 strings 
-  // without requiring a full Firebase Storage implementation for this scope.
-  // This satisfies "Save in App Database" by using the Browser's persistent database.
-  
+  // --- Cloud Sync (Firestore) ---
+
   saveProject: async (userId: string, state: MockupState): Promise<'cloud' | 'local' | 'error'> => {
-      // 1. Always save to Local DB
+      // Always save to local first
       try {
           await StorageService.saveProjectLocal(state);
       } catch (e) {
           console.error("Local save failed", e);
           return 'error';
       }
-      
-      return 'local';
-  }
+
+      // Skip cloud sync for guest users
+      if (userId.startsWith('guest_')) return 'local';
+
+      try {
+          // Strip base64 image data from the cloud copy — only URL-based images sync.
+          // Large base64 blobs exceed Firestore's 1MB document limit.
+          const cloudState = {
+              ...state,
+              canvases: state.canvases.map(canvas => ({
+                  ...canvas,
+                  backgroundImage: canvas.backgroundImage?.startsWith('data:')
+                      ? '' : canvas.backgroundImage,
+                  signs: canvas.signs.map(sign => ({
+                      ...sign,
+                      image: sign.image?.startsWith('data:') ? '' : sign.image,
+                  })),
+              })),
+          };
+
+          await db
+              .collection(FIRESTORE_COLLECTION)
+              .doc(`${userId}_${state.projectId}`)
+              .set({
+                  ...cloudState,
+                  userId,
+                  updatedAt: Date.now(),
+              });
+
+          return 'cloud';
+      } catch (e) {
+          console.warn("Cloud save failed, project is local only:", e);
+          return 'local';
+      }
+  },
+
+  listProjectsCloud: async (userId: string): Promise<ProjectMetadata[]> => {
+      if (userId.startsWith('guest_')) return [];
+      try {
+          const snapshot = await db
+              .collection(FIRESTORE_COLLECTION)
+              .where('userId', '==', userId)
+              .orderBy('updatedAt', 'desc')
+              .limit(50)
+              .get();
+
+          return snapshot.docs.map(doc => {
+              const d = doc.data();
+              return {
+                  id: d.projectId,
+                  name: d.projectName ?? 'Untitled Project',
+                  lastModified: d.updatedAt ?? d.lastSaved,
+                  canvasCount: d.canvases?.length ?? 1,
+              };
+          });
+      } catch (e) {
+          console.warn("Could not list cloud projects:", e);
+          return [];
+      }
+  },
+
+  loadProjectCloud: async (userId: string, projectId: string): Promise<MockupState | null> => {
+      if (userId.startsWith('guest_')) return null;
+      try {
+          const doc = await db
+              .collection(FIRESTORE_COLLECTION)
+              .doc(`${userId}_${projectId}`)
+              .get();
+
+          if (!doc.exists) return null;
+          const data = doc.data() as MockupState & { userId: string; updatedAt: number };
+          // Remove Firestore-only fields before returning
+          const { userId: _u, updatedAt: _t, ...projectState } = data;
+          return projectState as MockupState;
+      } catch (e) {
+          console.warn("Could not load cloud project:", e);
+          return null;
+      }
+  },
 };
