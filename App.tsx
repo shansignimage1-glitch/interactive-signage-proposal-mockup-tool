@@ -22,9 +22,10 @@ declare global {
   }
 }
 
-// Placeholder images
-const DEFAULT_BG = 'https://picsum.photos/1920/1080';
-const DEFAULT_FG = 'https://picsum.photos/400/400';
+// Demo images — building facade + a clean SVG sign face
+const DEFAULT_BG = 'https://images.unsplash.com/photo-1486325212027-8081e485255e?w=1920&h=1080&fit=crop&auto=format&q=80';
+// SVG sign face: deep-blue fascia with white channel letters
+const DEFAULT_FG = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='800' height='260'%3E%3Crect width='800' height='260' fill='%231e3a8a'/%3E%3Crect x='8' y='8' width='784' height='244' fill='none' stroke='%2393c5fd' stroke-width='4' rx='2'/%3E%3Ctext x='400' y='138' text-anchor='middle' dominant-baseline='middle' font-family='Arial Black%2CArial%2Csans-serif' font-size='88' font-weight='900' fill='white' letter-spacing='8'%3ESIGN IMAGE%3C/text%3E%3Ctext x='400' y='216' text-anchor='middle' dominant-baseline='middle' font-family='Arial%2Csans-serif' font-size='26' fill='%2393c5fd' letter-spacing='18'%3ESIGNAGE SOLUTIONS%3C/text%3E%3C/svg%3E";
 
 const createDefaultSign = (id: string, cx: number, cy: number, index: number): Sign => ({
   id,
@@ -61,29 +62,39 @@ const createDefaultCanvas = (index: number): Canvas => ({
 export type ToolMode = 'select' | 'draw_line' | 'draw_box';
 
 const DEFAULT_FIELDS: TitleBlockField[] = [
-    { id: '1', label: 'PROJECT TITLE', value: 'PROPOSED SIGNAGE INSTALLATION', section: 'project' },
-    { id: '2', label: 'CLIENT', value: 'ACME Corp', section: 'project' },
-    { id: '3', label: 'ADDRESS', value: '123 Innovation Drive, Tech City', section: 'project' },
-    { id: '4', label: 'DRAWN BY', value: 'J. Doe', section: 'drawing' },
+    { id: '1', label: 'PROJECT TITLE', value: 'FASCIA SIGNAGE PROPOSAL', section: 'project' },
+    { id: '2', label: 'CLIENT', value: 'Sign Image Demo Client', section: 'project' },
+    { id: '3', label: 'ADDRESS', value: '1 Business Park, City Centre', section: 'project' },
+    { id: '4', label: 'DRAWN BY', value: 'Sign Image', section: 'drawing' },
     { id: '5', label: 'CHECKED BY', value: '', section: 'drawing' },
     { id: '6', label: 'DATE', value: new Date().toLocaleDateString(), section: 'drawing' },
     { id: '7', label: 'SCALE', value: 'N.T.S.', section: 'drawing' },
-    { id: '8', label: 'SHEET TITLE', value: '', section: 'sheet' },
-    { id: '9', label: 'SHEET NO.', value: '', section: 'sheet' },
+    { id: '8', label: 'SHEET TITLE', value: 'ELEVATION 1', section: 'sheet' },
+    { id: '9', label: 'SHEET NO.', value: 'A-101', section: 'sheet' },
 ];
 
 const getInitialState = (): MockupState => {
     const initialCanvas = createDefaultCanvas(0);
-    const cx = 1920 / 2;
-    const cy = 1080 / 2;
     const signId = Date.now().toString();
-    initialCanvas.signs.push(createDefaultSign(signId, cx, cy, 0));
+    // Position sign on building with subtle perspective warp — shows off the WebGL feature
+    initialCanvas.signs.push({
+        ...createDefaultSign(signId, 960, 400, 0),
+        corners: [
+            { x: 480, y: 310 },
+            { x: 1440, y: 328 },
+            { x: 1432, y: 508 },
+            { x: 488, y: 490 },
+        ],
+        extrusionAngle: 38,
+        extrusionDepth: 18,
+        sideColor: '#1e3a8a',
+    });
     initialCanvas.activeSignId = signId;
 
     return {
         user: null,
         projectId: `proj_${Date.now()}`,
-        projectName: 'Untitled Project',
+        projectName: 'Sign Image Demo',
         canvases: [initialCanvas],
         activeCanvasId: initialCanvas.id,
         isNightMode: false,
