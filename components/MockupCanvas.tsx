@@ -622,7 +622,6 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
   const activeSign = signs.find(s => s.id === activeSignId);
   const activeSignCenter = activeSign ? { x: (activeSign.corners[0].x + activeSign.corners[1].x + activeSign.corners[2].x + activeSign.corners[3].x) / 4, y: (activeSign.corners[0].y + activeSign.corners[1].y + activeSign.corners[2].y + activeSign.corners[3].y) / 4 } : null;
   const totalScale = baseScale * view.scale;
-  const handleScale = 1 / totalScale;
 
   // Render Title Block Layout Overlay
   const isSheetView = titleBlock.viewMode === 'sheet';
@@ -691,6 +690,10 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
       sceneTx = 0;
       sceneTy = 0;
   }
+
+  // In sheet view the scene div is further scaled by sceneScale, so annotation
+  // strokes/labels must compensate for both transforms to stay constant on screen.
+  const handleScale = 1 / (totalScale * (isSheetView ? sceneScale : 1));
 
   // Filter fields by section
   const projectFields = titleBlock.fields.filter(f => f.section === 'project');
