@@ -595,7 +595,7 @@ const App: React.FC = () => {
                   <div className="w-16 h-16 bg-blue-600 rounded-xl flex items-center justify-center mx-auto mb-6 shadow-lg shadow-blue-900/40">
                       <LogIn className="w-8 h-8 text-white" />
                   </div>
-                  <h1 className="text-3xl font-bold text-white mb-2">Interactive Signage Proposal Mockup Tool (Lit Web Components)</h1>
+                  <h1 className="text-3xl font-bold text-white mb-2">SignagePro</h1>
                   <p className="text-gray-400 mb-8">Sign in to sync your projects and access them from anywhere.</p>
                   
                   {authError && (
