@@ -4,14 +4,17 @@ import 'firebase/compat/auth';
 import 'firebase/compat/firestore';
 import 'firebase/compat/storage';
 
-// TODO: Replace with your actual config from Firebase Console > Project Settings
+// Dedicated project for this app only — do not point this at signimage-cc or any
+// other shared project. That project's Storage/Firestore also serve unrelated
+// business tools (invoicing, staff records, suppliers, quotes), and mixing them
+// caused a real incident (see storage.rules / firestore.rules history).
 const firebaseConfig = {
-  apiKey: "AIzaSyBI6MwVl3eV85X4qh3EGQj8djM3z_yKV7A",
-  authDomain: "signimage-cc.firebaseapp.com",
-  projectId: "signimage-cc",
-  storageBucket: "signimage-cc.firebasestorage.app",
-  messagingSenderId: "1069418454987",
-  appId: "1:1069418454987:web:f5d4840e7d75c3891fa04e"
+  apiKey: "AIzaSyDeUpqPjtmstY-_V5v-fGGtNXn9B4H1vFI",
+  authDomain: "sunny-ship-437805-c5.firebaseapp.com",
+  projectId: "sunny-ship-437805-c5",
+  storageBucket: "sunny-ship-437805-c5.firebasestorage.app",
+  messagingSenderId: "135421174269",
+  appId: "1:135421174269:web:2c4cb3f2404f2093f7f994"
 };
 
 // Initialize Firebase (Singleton pattern)

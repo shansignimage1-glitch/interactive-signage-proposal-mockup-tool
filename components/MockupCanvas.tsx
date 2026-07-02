@@ -712,8 +712,8 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
       onContextMenu={(e) => e.preventDefault()}
       style={{ touchAction: 'none', cursor: (toolMode === 'draw_line' || toolMode === 'draw_box') ? 'crosshair' : 'default', backgroundColor: isSheetView ? '#333' : '#0a0a0a' }} 
     >
-      {/* Zoom Controls ... (kept from previous) */}
-      <div className="absolute top-4 right-4 flex flex-col gap-2 z-50">
+      {/* Zoom Controls — offset below the user profile pill rendered by App at top-right */}
+      <div className="absolute top-20 right-4 flex flex-col gap-2 z-40">
         <button onClick={() => setView(v => ({ ...v, scale: v.scale * 1.2 }))} className="p-2 bg-gray-800 hover:bg-gray-700 text-white rounded shadow border border-gray-600"><ZoomIn className="w-5 h-5" /></button>
         <button onClick={() => setView(v => ({ ...v, scale: v.scale / 1.2 }))} className="p-2 bg-gray-800 hover:bg-gray-700 text-white rounded shadow border border-gray-600"><ZoomOut className="w-5 h-5" /></button>
         <button onClick={() => setView({ scale: 1, x: 0, y: 0 })} className="p-2 bg-gray-800 hover:bg-gray-700 text-white rounded shadow border border-gray-600"><Maximize className="w-5 h-5" /></button>

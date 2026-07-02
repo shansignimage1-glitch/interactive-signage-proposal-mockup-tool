@@ -303,10 +303,9 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
           updateActiveSign({ image: template.image, name: template.name });
       } 
       else {
-          addSign();
           const id = Date.now().toString();
-          const cx = 1920 / 2; 
-          const cy = 1080 / 2;
+          const cx = activeCanvas.backgroundSize.width / 2;
+          const cy = activeCanvas.backgroundSize.height / 2;
           const aspect = template.width / template.height;
           const w = 300;
           const h = w / aspect;
@@ -923,32 +922,27 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
                        </button>
                    </div>
                    <div className="space-y-2">
-                       {state.titleBlock.revisions.map((rev, idx) => (
+                       {state.titleBlock.revisions.map((rev) => {
+                           const updateRev = (field: 'rev' | 'date' | 'description' | 'drawnBy', value: string) => {
+                               // Immutable update — mutating the row object in place corrupts undo history snapshots
+                               const newRevs = state.titleBlock.revisions.map(r => r.id === rev.id ? { ...r, [field]: value } : r);
+                               updateState({ titleBlock: { ...state.titleBlock, revisions: newRevs } });
+                           };
+                           return (
                            <div key={rev.id} className="grid grid-cols-12 gap-1 text-xs">
-                               <input value={rev.rev} onChange={(e) => {
-                                   const newRevs = [...state.titleBlock.revisions]; newRevs[idx].rev = e.target.value;
-                                   updateState({ titleBlock: { ...state.titleBlock, revisions: newRevs } });
-                               }} className="col-span-1 bg-gray-800 border border-gray-700 rounded px-1 text-center" />
-                               <input value={rev.date} onChange={(e) => {
-                                   const newRevs = [...state.titleBlock.revisions]; newRevs[idx].date = e.target.value;
-                                   updateState({ titleBlock: { ...state.titleBlock, revisions: newRevs } });
-                               }} className="col-span-3 bg-gray-800 border border-gray-700 rounded px-1" />
-                               <input value={rev.description} onChange={(e) => {
-                                   const newRevs = [...state.titleBlock.revisions]; newRevs[idx].description = e.target.value;
-                                   updateState({ titleBlock: { ...state.titleBlock, revisions: newRevs } });
-                               }} className="col-span-6 bg-gray-800 border border-gray-700 rounded px-1" />
+                               <input value={rev.rev} onChange={(e) => updateRev('rev', e.target.value)} className="col-span-1 bg-gray-800 border border-gray-700 rounded px-1 text-center" />
+                               <input value={rev.date} onChange={(e) => updateRev('date', e.target.value)} className="col-span-3 bg-gray-800 border border-gray-700 rounded px-1" />
+                               <input value={rev.description} onChange={(e) => updateRev('description', e.target.value)} className="col-span-6 bg-gray-800 border border-gray-700 rounded px-1" />
                                <div className="col-span-2 flex gap-1">
-                                    <input value={rev.drawnBy} onChange={(e) => {
-                                        const newRevs = [...state.titleBlock.revisions]; newRevs[idx].drawnBy = e.target.value;
-                                        updateState({ titleBlock: { ...state.titleBlock, revisions: newRevs } });
-                                    }} className="w-full bg-gray-800 border border-gray-700 rounded px-1 text-center" />
+                                    <input value={rev.drawnBy} onChange={(e) => updateRev('drawnBy', e.target.value)} className="w-full bg-gray-800 border border-gray-700 rounded px-1 text-center" />
                                     <button onClick={() => {
                                         const newRevs = state.titleBlock.revisions.filter(r => r.id !== rev.id);
                                         updateStateWithHistory({ titleBlock: { ...state.titleBlock, revisions: newRevs } });
                                     }} className="text-red-400 hover:text-red-300"><X className="w-3 h-3" /></button>
                                </div>
                            </div>
-                       ))}
+                           );
+                       })}
                    </div>
                 </div>
 

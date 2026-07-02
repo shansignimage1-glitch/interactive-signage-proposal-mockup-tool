@@ -1,5 +1,5 @@
 
-import { db } from '../firebase';
+import { db, storage } from '../firebase';
 import { MockupState, ProjectMetadata } from '../types';
 
 const FIRESTORE_COLLECTION = 'projects';
@@ -63,6 +63,83 @@ const idbOperation = async <T>(
     });
 };
 
+// --- Cloud Image Upload Helpers ---
+// Firestore documents cap out at 1MB, so base64 images can't be stored inline.
+// Images are uploaded to Firebase Storage (content-addressed by SHA-256 hash)
+// and only their download URL syncs to Firestore. Content-addressing means
+// repeated autosaves of an unchanged image never re-upload it — a cheap
+// getDownloadURL() 404 check replaces the upload entirely.
+
+const hashDataUri = async (dataUri: string): Promise<string> => {
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(dataUri));
+    return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
+};
+
+const dataUriToBlob = (dataUri: string): Blob => {
+    const [header, base64] = dataUri.split(',');
+    const mime = /data:(.*?);base64/.exec(header)?.[1] || 'application/octet-stream';
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return new Blob([bytes], { type: mime });
+};
+
+// Resolves a possibly-base64 image to a stable, hosted URL. Non-data: URLs
+// (already hosted images) pass through untouched.
+const uploadImageIfNeeded = async (userId: string, dataUri: string): Promise<string> => {
+    if (!dataUri || !dataUri.startsWith('data:')) return dataUri;
+
+    const hash = await hashDataUri(dataUri);
+    const ref = storage.ref(`users/${userId}/images/${hash}`);
+
+    try {
+        return await ref.getDownloadURL();
+    } catch {
+        // Not uploaded yet
+        await ref.put(dataUriToBlob(dataUri));
+        return await ref.getDownloadURL();
+    }
+};
+
+// Recovers the storage path's last segment (the content hash) from a Firebase
+// Storage download URL — the inverse of the `users/{userId}/images/{hash}` path
+// used above. Used to figure out which uploaded images are still referenced.
+const extractImageHash = (url: string): string | null => {
+    const match = /\/o\/(.+?)\?/.exec(url);
+    if (!match) return null;
+    return decodeURIComponent(match[1]).split('/').pop() ?? null;
+};
+
+// Deletes any image under this user's Storage folder that's no longer
+// referenced by any of their remaining cloud projects. Images are shared
+// (content-addressed) across all of a user's projects, so this is the only
+// safe time to delete one — never on every save, only after something that
+// can orphan a reference (a project delete).
+const pruneOrphanedImages = async (userId: string): Promise<void> => {
+    const snapshot = await db.collection(FIRESTORE_COLLECTION).where('userId', '==', userId).get();
+
+    const referenced = new Set<string>();
+    const track = (url?: string | null) => {
+        const hash = url ? extractImageHash(url) : null;
+        if (hash) referenced.add(hash);
+    };
+
+    snapshot.docs.forEach(doc => {
+        const d = doc.data();
+        track(d.titleBlock?.logoImage);
+        (d.canvases ?? []).forEach((canvas: any) => {
+            track(canvas.backgroundImage);
+            (canvas.signs ?? []).forEach((sign: any) => track(sign.image));
+        });
+    });
+
+    const { items } = await storage.ref(`users/${userId}/images`).listAll();
+    await Promise.all(items.map(item => {
+        if (referenced.has(item.name)) return Promise.resolve();
+        return item.delete().catch(e => console.warn(`Failed to prune orphaned image ${item.name}:`, e));
+    }));
+};
+
 export const StorageService = {
   
   // --- Local Project Management (IndexedDB) ---
@@ -98,6 +175,19 @@ export const StorageService = {
 
   // --- Cloud Sync (Firestore) ---
 
+  // Without this, a project deleted locally kept living in Firestore forever —
+  // and could even reappear, since login loads the most-recently-updated cloud
+  // project. Image cleanup is best-effort and never blocks the delete itself.
+  deleteProjectCloud: async (userId: string, projectId: string): Promise<void> => {
+      if (userId.startsWith('guest_')) return;
+      try {
+          await db.collection(FIRESTORE_COLLECTION).doc(`${userId}_${projectId}`).delete();
+      } catch (e) {
+          console.warn("Could not delete cloud project:", e);
+      }
+      await pruneOrphanedImages(userId).catch(e => console.warn("Orphaned image prune failed:", e));
+  },
+
   saveProject: async (userId: string, state: MockupState): Promise<'cloud' | 'local' | 'error'> => {
       // Always save to local first
       try {
@@ -111,19 +201,36 @@ export const StorageService = {
       if (userId.startsWith('guest_')) return 'local';
 
       try {
-          // Strip base64 image data from the cloud copy — only URL-based images sync.
-          // Large base64 blobs exceed Firestore's 1MB document limit.
+          // Upload base64 images to Storage — Firestore only gets the resulting URL.
+          // Uploads are deduped per-save (and across saves, via content hash) so an
+          // unchanged image is never re-uploaded on every autosave debounce.
+          const uploadCache = new Map<string, Promise<string>>();
+          const resolveImage = (dataUri: string): Promise<string> => {
+              if (!dataUri || !dataUri.startsWith('data:')) return Promise.resolve(dataUri);
+              if (!uploadCache.has(dataUri)) {
+                  uploadCache.set(dataUri, uploadImageIfNeeded(userId, dataUri).catch(e => {
+                      console.warn("Image upload failed, image will be blank in cloud copy:", e);
+                      return '';
+                  }));
+              }
+              return uploadCache.get(dataUri)!;
+          };
+
+          const canvases = await Promise.all(state.canvases.map(async canvas => ({
+              ...canvas,
+              backgroundImage: await resolveImage(canvas.backgroundImage),
+              signs: await Promise.all(canvas.signs.map(async sign => ({
+                  ...sign,
+                  image: await resolveImage(sign.image),
+              }))),
+          })));
+
+          const logoImage = state.titleBlock.logoImage ? await resolveImage(state.titleBlock.logoImage) : null;
+
           const cloudState = {
               ...state,
-              canvases: state.canvases.map(canvas => ({
-                  ...canvas,
-                  backgroundImage: canvas.backgroundImage?.startsWith('data:')
-                      ? '' : canvas.backgroundImage,
-                  signs: canvas.signs.map(sign => ({
-                      ...sign,
-                      image: sign.image?.startsWith('data:') ? '' : sign.image,
-                  })),
-              })),
+              canvases,
+              titleBlock: { ...state.titleBlock, logoImage },
           };
 
           await db
@@ -145,10 +252,13 @@ export const StorageService = {
   listProjectsCloud: async (userId: string): Promise<ProjectMetadata[]> => {
       if (userId.startsWith('guest_')) return [];
       try {
+          // No orderBy — combining `where` with `orderBy` on a different field
+          // requires a composite Firestore index to be deployed first, and fails
+          // silently (empty list) until that index exists. Sorting client-side
+          // needs only the automatic single-field index Firestore always has.
           const snapshot = await db
               .collection(FIRESTORE_COLLECTION)
               .where('userId', '==', userId)
-              .orderBy('updatedAt', 'desc')
               .limit(50)
               .get();
 
@@ -160,7 +270,7 @@ export const StorageService = {
                   lastModified: d.updatedAt ?? d.lastSaved,
                   canvasCount: d.canvases?.length ?? 1,
               };
-          });
+          }).sort((a, b) => (b.lastModified ?? 0) - (a.lastModified ?? 0));
       } catch (e) {
           console.warn("Could not list cloud projects:", e);
           return [];

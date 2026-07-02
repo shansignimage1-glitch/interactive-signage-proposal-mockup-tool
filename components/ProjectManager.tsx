@@ -70,6 +70,12 @@ const ProjectManager: React.FC<ProjectManagerProps> = ({ isOpen, onClose, curren
         e.stopPropagation();
         if (confirm("Are you sure you want to delete this project? This cannot be undone.")) {
             await StorageService.deleteProjectLocal(id);
+            // Also remove the cloud copy (and any images only it referenced) — otherwise
+            // a "deleted" project keeps living in Firestore/Storage and can resurface
+            // on the next login, which loads the most-recently-updated cloud project.
+            if (currentState.user && !currentState.user.uid.startsWith('guest_')) {
+                await StorageService.deleteProjectCloud(currentState.user.uid, id);
+            }
             loadProjects();
         }
     };

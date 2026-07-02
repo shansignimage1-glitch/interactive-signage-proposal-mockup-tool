@@ -1,13 +1,14 @@
 
-import React, { useState, useCallback, useRef, useEffect } from 'react';
-import { GoogleGenAI } from "@google/genai";
+import React, { useState, useCallback, useRef, useEffect, Suspense } from 'react';
 import { auth, googleProvider } from './firebase';
 
 import ControlsPanel from './components/ControlsPanel';
 import MockupCanvas from './components/MockupCanvas';
-import CleanupTool from './components/CleanupTool';
-import Assistant from './components/Assistant';
-import ProjectManager from './components/ProjectManager';
+// Lazy-loaded: these pull in @google/genai / extra UI chrome that most sessions
+// never touch, so they shouldn't sit in the initial bundle.
+const CleanupTool = React.lazy(() => import('./components/CleanupTool'));
+const Assistant = React.lazy(() => import('./components/Assistant'));
+const ProjectManager = React.lazy(() => import('./components/ProjectManager'));
 import { MockupState, AppImages, Point, Sign, Dimension, TitleBlock, TitleBlockField, Canvas } from './types';
 import { hexToRgb } from './utils/math';
 import { TITLE_BLOCK_TEMPLATES } from './data/titleBlockTemplates';
@@ -22,8 +23,10 @@ declare global {
   }
 }
 
+const GUEST_PROJECT_ID_KEY = 'signagepro_guest_project_id';
+
 // Demo images — building facade + a clean SVG sign face
-const DEFAULT_BG = 'https://images.unsplash.com/photo-1486325212027-8081e485255e?w=1920&h=1080&fit=crop&auto=format&q=80';
+const DEFAULT_BG ='https://images.unsplash.com/photo-1486325212027-8081e485255e?w=1920&h=1080&fit=crop&auto=format&q=80';
 // SVG sign face: deep-blue fascia with white channel letters
 const DEFAULT_FG = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='800' height='260'%3E%3Crect width='800' height='260' fill='%231e3a8a'/%3E%3Crect x='8' y='8' width='784' height='244' fill='none' stroke='%2393c5fd' stroke-width='4' rx='2'/%3E%3Ctext x='400' y='138' text-anchor='middle' dominant-baseline='middle' font-family='Arial Black%2CArial%2Csans-serif' font-size='88' font-weight='900' fill='white' letter-spacing='8'%3ESIGN IMAGE%3C/text%3E%3Ctext x='400' y='216' text-anchor='middle' dominant-baseline='middle' font-family='Arial%2Csans-serif' font-size='26' fill='%2393c5fd' letter-spacing='18'%3ESIGNAGE SOLUTIONS%3C/text%3E%3C/svg%3E";
 
@@ -148,7 +151,16 @@ const App: React.FC = () => {
   const stateRef = useRef(state);
   useEffect(() => { stateRef.current = state; }, [state]);
 
-  const handleGuestLogin = useCallback(() => {
+  // Start a fresh session: replace state AND the undo history so undo can
+  // never step back into a pre-login (user: null) state
+  const startSession = useCallback((newState: MockupState) => {
+      setState(newState);
+      setHistory([newState]);
+      setHistoryIndex(0);
+      historyIndexRef.current = 0;
+  }, []);
+
+  const handleGuestLogin = useCallback(async () => {
       const guestId = 'guest_' + Date.now();
       const guestUser = {
           uid: guestId,
@@ -157,15 +169,21 @@ const App: React.FC = () => {
           photoURL: null
       };
 
-      const newState = { 
-        ...getInitialState(),
-        user: guestUser,
-        isOnline: false
-      };
-      
-      setState(newState);
+      // Resume the same local project across guest sessions instead of minting a
+      // fresh projectId every login — otherwise autosave quietly accumulates a new
+      // "Sign Image Demo" copy in IndexedDB every time Guest is clicked.
+      const existingProjectId = localStorage.getItem(GUEST_PROJECT_ID_KEY);
+      const existingProject = existingProjectId ? await StorageService.loadProjectLocal(existingProjectId) : null;
+
+      const newState: MockupState = existingProject
+        ? { ...existingProject, user: guestUser, isOnline: false }
+        : { ...getInitialState(), user: guestUser, isOnline: false };
+
+      localStorage.setItem(GUEST_PROJECT_ID_KEY, newState.projectId);
+
+      startSession(newState);
       setIsAuthLoading(false);
-  }, []);
+  }, [startSession]);
 
   // --- Auth & Data Loading ---
   useEffect(() => {
@@ -183,13 +201,13 @@ const App: React.FC = () => {
           const latest = projects.sort((a, b) => (b.lastModified ?? 0) - (a.lastModified ?? 0))[0];
           const loaded = await StorageService.loadProjectCloud(user.uid, latest.id);
           if (loaded) {
-            setState({ ...loaded, user, isOnline: navigator.onLine, isSyncing: false });
+            startSession({ ...loaded, user, isOnline: navigator.onLine, isSyncing: false });
             setIsAuthLoading(false);
             return;
           }
         }
         // No cloud project — start fresh
-        setState({ ...getInitialState(), user, isOnline: navigator.onLine });
+        startSession({ ...getInitialState(), user, isOnline: navigator.onLine });
       } else {
         // Not signed in — show login screen
         setState(getInitialState());
@@ -197,7 +215,7 @@ const App: React.FC = () => {
       setIsAuthLoading(false);
     });
     return () => unsubscribe();
-  }, []);
+  }, [startSession]);
 
   const handleLogin = async () => {
     setAuthError(null);
@@ -287,7 +305,8 @@ const App: React.FC = () => {
   const undo = useCallback(() => {
       if (historyIndex > 0) {
           const prevState = history[historyIndex - 1];
-          setState(prevState);
+          // Keep the live session user — history snapshots must never log the user out
+          setState(s => ({ ...prevState, user: s.user }));
           setHistoryIndex(prev => prev - 1);
       }
   }, [history, historyIndex]);
@@ -295,17 +314,19 @@ const App: React.FC = () => {
   const redo = useCallback(() => {
       if (historyIndex < history.length - 1) {
           const nextState = history[historyIndex + 1];
-          setState(nextState);
+          setState(s => ({ ...nextState, user: s.user }));
           setHistoryIndex(prev => prev + 1);
       }
   }, [history, historyIndex]);
 
+  // Compute the new state eagerly (from stateRef) instead of inside the setState
+  // updater — updaters must be pure, and StrictMode double-invokes them, which
+  // pushed every change onto the history stack twice.
   const updateStateWithHistory = useCallback((updates: Partial<MockupState>) => {
-      setState(prev => {
-          const newState = { ...prev, ...updates };
-          addToHistory(newState);
-          return newState;
-      });
+      const newState = { ...stateRef.current, ...updates };
+      stateRef.current = newState;
+      setState(newState);
+      addToHistory(newState);
   }, [addToHistory]);
 
   const updateActiveCanvas = useCallback((canvasUpdates: Partial<Canvas>) => {
@@ -318,14 +339,14 @@ const App: React.FC = () => {
   }, []);
   
   const updateActiveCanvasWithHistory = useCallback((canvasUpdates: Partial<Canvas>) => {
-      setState(prev => {
-          const newCanvases = prev.canvases.map(c => 
-              c.id === prev.activeCanvasId ? { ...c, ...canvasUpdates } : c
-          );
-          const newState = { ...prev, canvases: newCanvases };
-          addToHistory(newState);
-          return newState;
-      });
+      const prev = stateRef.current;
+      const newCanvases = prev.canvases.map(c =>
+          c.id === prev.activeCanvasId ? { ...c, ...canvasUpdates } : c
+      );
+      const newState = { ...prev, canvases: newCanvases };
+      stateRef.current = newState;
+      setState(newState);
+      addToHistory(newState);
   }, [addToHistory]);
 
 
@@ -651,10 +672,10 @@ const App: React.FC = () => {
                       </div>
                   )}
 
-                  <button 
+                  <button
                       onClick={handleLogin}
-                      className="w-full bg-white hover:bg-gray-100 text-gray-900 font-bold py-3 px-4 rounded-lg transition-colors flex items-center justify-center gap-3 mb-3 opacity-60"
-                      title="Temporarily disabled"
+                      className="w-full bg-white hover:bg-gray-100 text-gray-900 font-bold py-3 px-4 rounded-lg transition-colors flex items-center justify-center gap-3 mb-3"
+                      title="Sign in with your Google account"
                   >
                       <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" className="w-5 h-5" alt="" />
                       Sign in with Google
@@ -747,7 +768,9 @@ const App: React.FC = () => {
           </div>
       )}
 
-      <Assistant isOpen={showAssistant} setIsOpen={setShowAssistant} apiKey={effectiveApiKey} />
+      <Suspense fallback={null}>
+        <Assistant isOpen={showAssistant} setIsOpen={setShowAssistant} apiKey={effectiveApiKey} />
+      </Suspense>
       
       <ControlsPanel
         state={state}
@@ -820,23 +843,27 @@ const App: React.FC = () => {
       </div>
 
       {showProjectManager && (
-          <ProjectManager 
-              isOpen={showProjectManager}
-              onClose={() => setShowProjectManager(false)}
-              currentState={state}
-              onLoadProject={handleProjectLoad}
-              onSaveProject={handleProjectSave}
-          />
+          <Suspense fallback={null}>
+            <ProjectManager
+                isOpen={showProjectManager}
+                onClose={() => setShowProjectManager(false)}
+                currentState={state}
+                onLoadProject={handleProjectLoad}
+                onSaveProject={handleProjectSave}
+            />
+          </Suspense>
       )}
 
       {showCleanupTool && (
-        <CleanupTool 
-           isOpen={showCleanupTool}
-           imageUrl={activeCanvas.backgroundImage}
-           onClose={() => setShowCleanupTool(false)}
-           onSave={handleCleanupSave}
-           apiKey={effectiveApiKey}
-        />
+        <Suspense fallback={null}>
+          <CleanupTool
+             isOpen={showCleanupTool}
+             imageUrl={activeCanvas.backgroundImage}
+             onClose={() => setShowCleanupTool(false)}
+             onSave={handleCleanupSave}
+             apiKey={effectiveApiKey}
+          />
+        </Suspense>
       )}
     </div>
   );

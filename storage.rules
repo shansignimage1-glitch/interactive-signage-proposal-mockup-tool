@@ -1,0 +1,20 @@
+rules_version = '2';
+
+// This project (sunny-ship-437805-c5) is dedicated to this app only — unlike
+// the shared signimage-cc project, these rules are safe to own and deploy
+// from this repo without risk to any other app.
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    // Users can only read/write images under their own folder
+    match /users/{userId}/{allPaths=**} {
+      allow read, write: if request.auth != null
+                         && request.auth.uid == userId;
+    }
+
+    // Deny everything else by default
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
