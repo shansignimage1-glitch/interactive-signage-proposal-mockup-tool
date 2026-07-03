@@ -3,14 +3,33 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // Users can only read/write their own project documents
+    // Users can only read/write their own project documents.
+    // NOTE: the ownership field must be `userId` (top-level), because
+    // listProjectsCloud queries `where('userId','==',uid)` — Firestore can
+    // only prove a list query against rules that reference the same field.
     match /projects/{projectId} {
-      allow read, write: if request.auth != null
-                         && request.auth.uid == resource.data.user.uid;
+      allow read, update, delete: if request.auth != null
+                                  && request.auth.uid == resource.data.userId;
 
       // Allow creating a new project owned by the authenticated user
       allow create: if request.auth != null
-                    && request.auth.uid == request.resource.data.user.uid;
+                    && request.auth.uid == request.resource.data.userId;
+    }
+
+    // Shared sign library: any signed-in user can browse; only the app owner
+    // can publish or remove templates.
+    match /library/{templateId} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null
+                   && request.auth.token.email == 'shansignimage1@gmail.com';
+    }
+
+    // Personal sign libraries: each user manages only their own templates.
+    match /userLibrary/{templateId} {
+      allow read, update, delete: if request.auth != null
+                                  && resource.data.ownerUid == request.auth.uid;
+      allow create: if request.auth != null
+                    && request.resource.data.ownerUid == request.auth.uid;
     }
 
     // Deny everything else by default

@@ -41,6 +41,17 @@ export const SIGN_TYPES: { value: SignType; label: string }[] = [
   { value: 'awning', label: 'Awning / Canopy' },
 ];
 
+// A distinct visual element (letter, logo mark, border) isolated from the
+// sign's flat artwork, carrying its own extrusion depth. Contours live in
+// sign-image pixel space and are simplified before persisting.
+export interface SignElement {
+  id: string;
+  name: string;          // "Element 1", editable later
+  contours: Point[][];   // sign-image px space, simplified outlines
+  depth: number;         // extrusion depth in sign-image px
+  enabled: boolean;
+}
+
 export interface Sign {
   id: string;
   name: string;
@@ -53,6 +64,10 @@ export interface Sign {
   opacity: number;
   blendMode: string;
   sideColor: string;
+
+  // Per-element variable extrusion (undefined/empty = classic single-slab)
+  elements?: SignElement[];
+  elementsSourceSize?: Size; // image dims detection ran against (guards image swaps)
 }
 
 export interface Dimension {
@@ -63,6 +78,22 @@ export interface Dimension {
   end: Point;
   text: string; // e.g. "200cm"
   color: string;
+  autoMeasured?: boolean; // true = label computed from calibration; cleared on hand-edit
+}
+
+// --- Measurement / Calibration ---
+
+export type MeasureUnit = 'mm' | 'cm' | 'm' | 'in' | 'ft';
+export type UnitSystem = 'metric' | 'imperial';
+
+// A reference line drawn over a known-size object in the background photo.
+// The scale factor (mm per image pixel) is always derived from this, never stored:
+// mmPerPx = toMm(realValue, unit) / distance(start, end)
+export interface Calibration {
+  start: Point;      // image-space px
+  end: Point;
+  realValue: number; // e.g. 85.6
+  unit: MeasureUnit; // e.g. 'mm'
 }
 
 export interface Revision {
@@ -135,6 +166,9 @@ export interface Canvas {
   dimensions: Dimension[];
   activeDimensionId: string | null;
 
+  // Real-world scale reference for this view's photo (null/undefined = not calibrated)
+  calibration?: Calibration | null;
+
   // Sheet Specifics
   sheetTitle: string; 
   sheetNumber: string; 
@@ -162,6 +196,7 @@ export interface MockupState {
   // Project Settings
   isNightMode: boolean;
   showDimensions: boolean;
+  unitSystem: UnitSystem; // display units for calibrated measurements
   titleBlock: TitleBlock;
   savedTemplates: TitleBlockTemplate[]; 
   notes: string; // Project General Notes
@@ -197,6 +232,10 @@ export const BLEND_MODES = [
 
 // --- Library Types ---
 
+// Where a library template lives: bundled with the app, the shared company
+// catalog (admin-curated, Firestore), or the user's personal cloud library.
+export type TemplateSource = 'builtin' | 'shared' | 'personal';
+
 export interface SignTemplate {
   id: string;
   name: string;
@@ -204,6 +243,12 @@ export interface SignTemplate {
   image: string; // URL
   width: number; // Suggested width in relative units (mm)
   height: number; // Suggested height in relative units (mm)
+
+  // Cloud library metadata (absent on builtin templates)
+  source?: TemplateSource;
+  docId?: string;       // Firestore doc id (for delete)
+  storagePath?: string; // Firebase Storage path of the image (for delete)
+  ownerUid?: string;    // personal templates only
 }
 
 export interface Brand {
@@ -214,3 +259,12 @@ export interface Brand {
 }
 
 export type CloudProvider = 'google_drive' | 'dropbox' | 'onedrive';
+
+// --- Cloud Drive Storage ---
+
+// Images stored in a user's own cloud drive are persisted in project JSON as
+// opaque refs (e.g. "gdrive://<fileId>") instead of https URLs; the
+// AssetResolver materializes them back into data URIs at load time.
+export const GDRIVE_REF_PREFIX = 'gdrive://';
+
+export type ConnectorStatus = 'disconnected' | 'connected' | 'expired';

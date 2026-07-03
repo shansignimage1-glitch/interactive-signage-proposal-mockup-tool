@@ -1,6 +1,8 @@
 
 import React, { useRef, useState, useEffect } from 'react';
-import { BLEND_MODES, MockupState, Sign, Point, Dimension, SignTemplate, ReferenceImage, TitleBlockField, Canvas, PaperSize, Orientation, SIGN_TYPES, SignType } from '../types';
+import { BLEND_MODES, MockupState, Sign, Point, Dimension, SignTemplate, ReferenceImage, TitleBlockField, Canvas, PaperSize, Orientation, SIGN_TYPES, SignType, UnitSystem } from '../types';
+import { distance } from '../utils/math';
+import { getMmPerPx, formatLength, toMm, measureLine, measureBox } from '../utils/measure';
 import { Upload, Download, Sun, Moon, Move3d, Palette, Image as ImageIcon, Plus, Trash2, Layers, Eye, Copy, Box, Minus, Maximize, Ruler, ArrowRight, ArrowDown, Scissors, Check, X, Eraser, Loader2, Square, PenTool, MousePointer2, Mic, EyeOff, Undo2, Redo2, Layout, FileText, Settings, Briefcase, User, Calendar, MapPin, Notebook, Camera, Library, Sparkles, PencilLine, Grid, Save, ChevronDown, ChevronRight, Monitor, Printer, FolderOpen } from 'lucide-react';
 import ImageUploader from './ImageUploader';
 import SignLibrary from './SignLibrary';
@@ -13,7 +15,8 @@ interface ControlsPanelProps {
   updateState: (updates: Partial<MockupState>) => void;
   updateStateWithHistory: (updates: Partial<MockupState>) => void;
   updateActiveCanvas: (updates: Partial<Canvas>) => void;
-  
+  updateActiveCanvasWithHistory: (updates: Partial<Canvas>) => void;
+
   updateActiveSign: (updates: Partial<Sign>) => void;
   updateSignById: (id: string, updates: Partial<Sign>) => void;
   addSign: () => void;
@@ -39,6 +42,7 @@ interface ControlsPanelProps {
   setIsCropping: (v: boolean) => void;
 
   onOpenCleanup: () => void;
+  onOpenElementStudio: () => void;
 
   undo: () => void;
   redo: () => void;
@@ -56,6 +60,7 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
   updateState,
   updateStateWithHistory,
   updateActiveCanvas,
+  updateActiveCanvasWithHistory,
   updateActiveSign,
   updateSignById,
   addSign,
@@ -81,6 +86,7 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
   setIsCropping,
 
   onOpenCleanup,
+  onOpenElementStudio,
   undo,
   redo,
   canUndo,
@@ -106,6 +112,9 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
   const [isViewMenuOpen, setIsViewMenuOpen] = useState(false);
   
   const [activeTab, setActiveTab] = useState<'editor' | 'page' | 'notes'>('editor');
+
+  // Target real-world width input for the "Set width" sign-sizing control
+  const [targetWidth, setTargetWidth] = useState('');
   
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>, callback: (f: File) => void) => {
     if (e.target.files && e.target.files[0]) {
@@ -229,7 +238,8 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
           const c2: Point = { x: cx + halfW, y: cy + halfH };
           const c3: Point = { x: cx - halfW, y: cy + halfH };
 
-          updateActiveSign({ image: dataUrl, corners: [c0, c1, c2, c3] });
+          // New artwork invalidates detected element contours
+          updateActiveSign({ image: dataUrl, corners: [c0, c1, c2, c3], elements: undefined, elementsSourceSize: undefined });
         };
         img.src = dataUrl;
     } else if (uploadTarget === 'reference') {
@@ -245,7 +255,8 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
         img.onload = () => {
              updateActiveCanvas({
                  backgroundImage: dataUrl,
-                 backgroundSize: { width: img.width, height: img.height }
+                 backgroundSize: { width: img.width, height: img.height },
+                 calibration: null // new photo (uploader may also resize) — old scale invalid
              });
         };
         img.src = dataUrl;
@@ -300,8 +311,8 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
           });
       } 
       else if (activeCanvas.activeSignId) {
-          updateActiveSign({ image: template.image, name: template.name });
-      } 
+          updateActiveSign({ image: template.image, name: template.name, elements: undefined, elementsSourceSize: undefined });
+      }
       else {
           const id = Date.now().toString();
           const cx = activeCanvas.backgroundSize.width / 2;
@@ -386,6 +397,47 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
   };
 
   const activeSign = activeCanvas.signs.find(s => s.id === activeCanvas.activeSignId);
+
+  // --- Measurement / Calibration ---
+  const calibration = activeCanvas.calibration ?? null;
+  const mmPerPx = calibration ? getMmPerPx(calibration) : null;
+
+  const setUnitSystem = (system: UnitSystem) => {
+      // Re-label every auto-measured dimension across all views in the new units
+      const newCanvases = state.canvases.map(c => {
+          if (!c.calibration) return c;
+          return {
+              ...c,
+              dimensions: c.dimensions.map(d => d.autoMeasured ? {
+                  ...d,
+                  text: d.variant === 'box'
+                      ? measureBox(d.start, d.end, c.calibration!, system)
+                      : measureLine(d.start, d.end, c.calibration!, system)
+              } : d)
+          };
+      });
+      updateState({ unitSystem: system, canvases: newCanvases });
+  };
+
+  // Average opposite edges: corners can be perspective-warped, so no single
+  // "width" exists — the average is the honest approximation for a flat sign
+  const signSizePx = activeSign ? {
+      w: (distance(activeSign.corners[0], activeSign.corners[1]) + distance(activeSign.corners[3], activeSign.corners[2])) / 2,
+      h: (distance(activeSign.corners[0], activeSign.corners[3]) + distance(activeSign.corners[1], activeSign.corners[2])) / 2
+  } : null;
+
+  const applySignWidth = () => {
+      if (!activeSign || !signSizePx || !mmPerPx) return;
+      const v = parseFloat(targetWidth);
+      if (!isFinite(v) || v <= 0) return;
+      const targetMm = toMm(v, state.unitSystem === 'metric' ? 'm' : 'ft');
+      const scale = targetMm / (signSizePx.w * mmPerPx);
+      const c = activeSign.corners;
+      const center = { x: (c[0].x + c[1].x + c[2].x + c[3].x) / 4, y: (c[0].y + c[1].y + c[2].y + c[3].y) / 4 };
+      const newCorners = c.map(p => ({ x: center.x + (p.x - center.x) * scale, y: center.y + (p.y - center.y) * scale })) as [Point, Point, Point, Point];
+      updateActiveSign({ corners: newCorners });
+      setTargetWidth('');
+  };
 
   return (
     <>
@@ -572,18 +624,42 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
                     <h2 className="text-sm font-semibold text-gray-300 uppercase tracking-wider flex items-center gap-2">
                         <Ruler className="w-4 h-4" /> Dimensions
                     </h2>
-                    <button
-                        onClick={() => updateState({ showDimensions: !state.showDimensions })}
-                        className={`p-1.5 rounded transition-colors ${state.showDimensions ? 'text-blue-400 bg-blue-900/20' : 'text-gray-500 hover:text-gray-300'}`}
-                    >
-                        {state.showDimensions ? <Eye className="w-4 h-4" /> : <EyeOff className="w-4 h-4" />}
-                    </button>
+                    <div className="flex items-center gap-1">
+                        <button
+                            onClick={() => setUnitSystem(state.unitSystem === 'metric' ? 'imperial' : 'metric')}
+                            className="px-2 py-1 rounded text-[10px] font-bold text-gray-400 hover:text-white bg-gray-800 border border-gray-700 transition-colors"
+                            title={`Switch to ${state.unitSystem === 'metric' ? 'imperial (ft/in)' : 'metric (m/cm)'} units`}
+                        >
+                            {state.unitSystem === 'metric' ? 'm · cm' : 'ft · in'}
+                        </button>
+                        <button
+                            onClick={() => updateState({ showDimensions: !state.showDimensions })}
+                            className={`p-1.5 rounded transition-colors ${state.showDimensions ? 'text-blue-400 bg-blue-900/20' : 'text-gray-500 hover:text-gray-300'}`}
+                        >
+                            {state.showDimensions ? <Eye className="w-4 h-4" /> : <EyeOff className="w-4 h-4" />}
+                        </button>
+                    </div>
                 </div>
                 <div className="flex bg-gray-800 p-1 rounded-lg border border-gray-700">
                     <button onClick={() => setToolMode('select')} className={`flex-1 flex items-center justify-center p-2 rounded gap-2 text-xs transition-colors ${toolMode === 'select' ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white'}`}><MousePointer2 className="w-4 h-4" /> Select</button>
                     <button onClick={() => setToolMode('draw_line')} className={`flex-1 flex items-center justify-center p-2 rounded gap-2 text-xs transition-colors ${toolMode === 'draw_line' ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white'}`}><PenTool className="w-4 h-4" /> Line</button>
                     <button onClick={() => setToolMode('draw_box')} className={`flex-1 flex items-center justify-center p-2 rounded gap-2 text-xs transition-colors ${toolMode === 'draw_box' ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white'}`}><Square className="w-4 h-4" /> Box</button>
+                    <button onClick={() => setToolMode('calibrate')} className={`flex-1 flex items-center justify-center p-2 rounded gap-2 text-xs transition-colors ${toolMode === 'calibrate' ? 'bg-amber-600 text-white' : 'text-gray-400 hover:text-white'}`} title="Draw over a known-size object to set the real-world scale"><Ruler className="w-4 h-4" /> Scale</button>
                 </div>
+                {calibration && mmPerPx ? (
+                    <div className="flex items-center justify-between text-xs bg-amber-500/10 border border-amber-500/30 rounded-lg px-2 py-1.5">
+                        <span className="text-amber-300 font-mono truncate">
+                            1px ≈ {mmPerPx >= 10 ? `${(mmPerPx / 10).toFixed(1)}cm` : `${mmPerPx.toFixed(1)}mm`} · ref {calibration.realValue}{calibration.unit}
+                        </span>
+                        <button onClick={() => updateActiveCanvasWithHistory({ calibration: null })} className="text-amber-400 hover:text-red-400 ml-2 flex-shrink-0" title="Clear scale">
+                            <X className="w-3.5 h-3.5" />
+                        </button>
+                    </div>
+                ) : (
+                    <p className="text-[10px] text-gray-500 leading-snug">
+                        No scale set — use the <strong className="text-gray-400">Scale</strong> tool to trace a known-size object (door, brick, card) and measurements will calculate automatically.
+                    </p>
+                )}
                 {activeCanvas.dimensions.length > 0 && state.showDimensions && (
                     <div className="space-y-2 max-h-32 overflow-y-auto pr-1 custom-scrollbar">
                         {activeCanvas.dimensions.map(dim => (
@@ -644,6 +720,47 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
                               </button>
                          </div>
                           
+                          {/* Per-element 3D extrusion */}
+                          <button
+                              onClick={onOpenElementStudio}
+                              className="w-full flex items-center justify-center gap-2 p-3 bg-purple-600/20 border border-purple-500/40 hover:bg-purple-600/30 text-purple-300 rounded-lg transition-colors"
+                              title="Detect the sign's letters/logo and give each its own extrusion depth"
+                          >
+                              <Box className="w-4 h-4" />
+                              <span className="text-xs font-medium">3D Elements</span>
+                              {activeSign.elements && activeSign.elements.length > 0 && (
+                                  <span className="text-[10px] bg-purple-500/30 border border-purple-400/40 rounded-full px-1.5 py-0.5 font-mono">
+                                      {activeSign.elements.filter(e => e.enabled).length}
+                                  </span>
+                              )}
+                          </button>
+
+                          {/* Real-world size (requires calibration) */}
+                          {mmPerPx && signSizePx && (
+                              <div className="bg-amber-500/5 border border-amber-500/20 rounded-lg p-3 space-y-2">
+                                  <div className="flex justify-between items-center text-xs">
+                                      <span className="text-gray-400">Actual size</span>
+                                      <span className="text-amber-300 font-mono">
+                                          {formatLength(signSizePx.w * mmPerPx, state.unitSystem)} × {formatLength(signSizePx.h * mmPerPx, state.unitSystem)}
+                                      </span>
+                                  </div>
+                                  <div className="flex gap-2 items-center">
+                                      <label className="text-[10px] text-gray-500 uppercase flex-shrink-0">Set width ({state.unitSystem === 'metric' ? 'm' : 'ft'})</label>
+                                      <input
+                                          type="number"
+                                          min="0"
+                                          step="any"
+                                          value={targetWidth}
+                                          onChange={(e) => setTargetWidth(e.target.value)}
+                                          onKeyDown={(e) => e.key === 'Enter' && applySignWidth()}
+                                          placeholder="e.g. 3"
+                                          className="flex-1 min-w-0 bg-gray-900 border border-gray-600 rounded px-2 py-1 text-xs text-white focus:border-amber-500 outline-none"
+                                      />
+                                      <button onClick={applySignWidth} className="text-xs bg-amber-600/80 hover:bg-amber-500 text-white px-2 py-1 rounded transition-colors">Apply</button>
+                                  </div>
+                              </div>
+                          )}
+
                           {/* Sign Type Selector */}
                           <div>
                               <label className="text-xs text-gray-400 mb-1 block">Sign Type</label>
@@ -1071,11 +1188,13 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
         onImageReady={handleImageReady}
       />
       
-      <SignLibrary 
+      <SignLibrary
           isOpen={isLibraryOpen}
           onClose={() => setIsLibraryOpen(false)}
           onSelect={handleLibrarySelect}
           activeDimension={activeDimension}
+          user={state.user}
+          activeSign={activeCanvas.signs.find(s => s.id === activeCanvas.activeSignId) ?? null}
       />
 
       {/* Template Library Modal */}

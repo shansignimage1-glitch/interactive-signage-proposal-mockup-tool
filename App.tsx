@@ -9,8 +9,13 @@ import MockupCanvas from './components/MockupCanvas';
 const CleanupTool = React.lazy(() => import('./components/CleanupTool'));
 const Assistant = React.lazy(() => import('./components/Assistant'));
 const ProjectManager = React.lazy(() => import('./components/ProjectManager'));
-import { MockupState, AppImages, Point, Sign, Dimension, TitleBlock, TitleBlockField, Canvas } from './types';
-import { hexToRgb } from './utils/math';
+const ElementStudio = React.lazy(() => import('./components/ElementStudio'));
+const DriveSettings = React.lazy(() => import('./components/DriveSettings'));
+import { MockupState, AppImages, Point, Sign, Dimension, TitleBlock, TitleBlockField, Canvas, Calibration, MeasureUnit, SignElement, Size, ConnectorStatus } from './types';
+import { getActiveConnector, setConnectorUid, connectors } from './services/driveConnectors';
+import { distance } from './utils/math';
+import { measureLine, measureBox, getMmPerPx } from './utils/measure';
+import CalibrationModal from './components/CalibrationModal';
 import { TITLE_BLOCK_TEMPLATES } from './data/titleBlockTemplates';
 import { StorageService } from './services/StorageService';
 import { Wifi, WifiOff, RefreshCw, LogIn, LogOut, Loader2, AlertTriangle, User as UserIcon, HardDrive, Database, KeyRound, X as XIcon } from 'lucide-react';
@@ -62,7 +67,7 @@ const createDefaultCanvas = (index: number): Canvas => ({
     sheetNumber: `A-${100 + index + 1}`
 });
 
-export type ToolMode = 'select' | 'draw_line' | 'draw_box';
+export type ToolMode = 'select' | 'draw_line' | 'draw_box' | 'calibrate';
 
 const DEFAULT_FIELDS: TitleBlockField[] = [
     { id: '1', label: 'PROJECT TITLE', value: 'FASCIA SIGNAGE PROPOSAL', section: 'project' },
@@ -102,6 +107,7 @@ const getInitialState = (): MockupState => {
         activeCanvasId: initialCanvas.id,
         isNightMode: false,
         showDimensions: true,
+        unitSystem: 'metric',
         titleBlock: {
             enabled: false,
             viewMode: 'canvas',
@@ -139,11 +145,17 @@ const App: React.FC = () => {
   useEffect(() => { historyIndexRef.current = historyIndex; }, [historyIndex]);
 
   const [toolMode, setToolMode] = useState<ToolMode>('select');
+  // Reference line drawn in calibrate mode, awaiting its real-world length via modal
+  const [pendingCalibration, setPendingCalibration] = useState<{ start: Point; end: Point } | null>(null);
   const [isCropping, setIsCropping] = useState(false);
   const [showCleanupTool, setShowCleanupTool] = useState(false);
+  const [showElementStudio, setShowElementStudio] = useState(false);
   const [showAssistant, setShowAssistant] = useState(false);
   const [showProjectManager, setShowProjectManager] = useState(false);
   const [showApiKeyModal, setShowApiKeyModal] = useState(false);
+  const [showDriveSettings, setShowDriveSettings] = useState(false);
+  const [driveStatus, setDriveStatus] = useState<ConnectorStatus>('disconnected');
+  const [driveNeedsReconnect, setDriveNeedsReconnect] = useState(false);
   const [geminiKey, setGeminiKey] = useState<string>(() => localStorage.getItem('gemini_api_key') ?? '');
   const effectiveApiKey = geminiKey.trim() || process.env.API_KEY;
   
@@ -151,9 +163,16 @@ const App: React.FC = () => {
   const stateRef = useRef(state);
   useEffect(() => { stateRef.current = state; }, [state]);
 
+  // Projects saved before newer fields existed need defaults filled in on load
+  const normalizeState = (s: MockupState): MockupState => ({
+      ...s,
+      unitSystem: s.unitSystem ?? 'metric',
+  });
+
   // Start a fresh session: replace state AND the undo history so undo can
   // never step back into a pre-login (user: null) state
-  const startSession = useCallback((newState: MockupState) => {
+  const startSession = useCallback((state: MockupState) => {
+      const newState = normalizeState(state);
       setState(newState);
       setHistory([newState]);
       setHistoryIndex(0);
@@ -185,6 +204,26 @@ const App: React.FC = () => {
       setIsAuthLoading(false);
   }, [startSession]);
 
+  // iPad/iOS Safari blocks auth popups and partitions storage, so the popup
+  // handshake never completes there. Detect those browsers and use the redirect
+  // flow instead (see handleLogin).
+  const prefersRedirectSignIn = () => {
+    const ua = navigator.userAgent || '';
+    const iOS = /iPad|iPhone|iPod/.test(ua) ||
+      (navigator.maxTouchPoints > 1 && /Macintosh/.test(ua)); // iPadOS 13+ reports as Mac
+    const safari = /Safari/.test(ua) && !/Chrome|CriOS|FxiOS|Edg/.test(ua);
+    return iOS || safari;
+  };
+
+  // Surface any error from a completed redirect sign-in (e.g. unauthorized
+  // domain). On success, onAuthStateChanged below picks up the user.
+  useEffect(() => {
+    auth.getRedirectResult().catch((err: any) => {
+      setAuthError(err?.message ?? 'Sign-in failed after returning from Google.');
+      setIsAuthLoading(false);
+    });
+  }, []);
+
   // --- Auth & Data Loading ---
   useEffect(() => {
     const unsubscribe = auth.onAuthStateChanged(async (firebaseUser) => {
@@ -195,11 +234,19 @@ const App: React.FC = () => {
           email: firebaseUser.email,
           photoURL: firebaseUser.photoURL,
         };
+        // Scope drive-connector caches to this user and reflect connection state
+        setConnectorUid(user.uid);
+        setDriveStatus(getActiveConnector() ? 'connected' : 'disconnected');
         // Try to load the most recent project from cloud, fall back to local
         const projects = await StorageService.listProjectsCloud(user.uid);
         if (projects.length > 0) {
           const latest = projects.sort((a, b) => (b.lastModified ?? 0) - (a.lastModified ?? 0))[0];
-          const loaded = await StorageService.loadProjectCloud(user.uid, latest.id);
+          const loaded = await StorageService.loadProjectCloud(user.uid, latest.id, ({ needsReconnect }) => {
+            if (needsReconnect) {
+              setDriveNeedsReconnect(true);
+              setDriveStatus('expired');
+            }
+          });
           if (loaded) {
             startSession({ ...loaded, user, isOnline: navigator.onLine, isSyncing: false });
             setIsAuthLoading(false);
@@ -210,6 +257,7 @@ const App: React.FC = () => {
         startSession({ ...getInitialState(), user, isOnline: navigator.onLine });
       } else {
         // Not signed in — show login screen
+        setConnectorUid(null);
         setState(getInitialState());
       }
       setIsAuthLoading(false);
@@ -217,13 +265,60 @@ const App: React.FC = () => {
     return () => unsubscribe();
   }, [startSession]);
 
+  // Re-open the current project after the user reconnects their drive, so
+  // unresolved gdrive:// refs get another chance to materialize.
+  const handleDriveReconnect = async () => {
+    const gdrive = connectors.find(c => c.id === 'google_drive')!;
+    try {
+      await gdrive.connect(); // user gesture — popup allowed
+      setDriveStatus('connected');
+      setDriveNeedsReconnect(false);
+      const current = stateRef.current;
+      if (current.user && !current.user.uid.startsWith('guest_')) {
+        const reloaded = await StorageService.loadProjectCloud(current.user.uid, current.projectId);
+        if (reloaded) {
+          startSession({ ...reloaded, user: current.user, isOnline: navigator.onLine, isSyncing: false });
+        }
+      }
+    } catch (e) {
+      console.warn('Drive reconnect failed:', e);
+    }
+  };
+
   const handleLogin = async () => {
     setAuthError(null);
+
+    // iOS/Safari: go straight to redirect — popups don't work there.
+    if (prefersRedirectSignIn()) {
+      try {
+        await auth.signInWithRedirect(googleProvider);
+      } catch (err: any) {
+        setAuthError(err?.message ?? 'Sign-in failed. Please try again.');
+      }
+      return;
+    }
+
+    // Everywhere else: try the popup, but fall back to redirect if it's blocked
+    // or unsupported (some in-app/embedded browsers).
     try {
       await auth.signInWithPopup(googleProvider);
       // onAuthStateChanged above handles the rest
     } catch (err: any) {
-      setAuthError(err.message ?? 'Sign-in failed. Please try again.');
+      const code = err?.code ?? '';
+      const popupFailed =
+        code === 'auth/popup-blocked' ||
+        code === 'auth/popup-closed-by-user' ||
+        code === 'auth/cancelled-popup-request' ||
+        code === 'auth/operation-not-supported-in-this-environment';
+      if (popupFailed) {
+        try {
+          await auth.signInWithRedirect(googleProvider);
+        } catch (err2: any) {
+          setAuthError(err2?.message ?? 'Sign-in failed. Please try again.');
+        }
+        return;
+      }
+      setAuthError(err?.message ?? 'Sign-in failed. Please try again.');
     }
   };
 
@@ -455,7 +550,12 @@ const App: React.FC = () => {
       const dx = Math.abs(end.x - start.x);
       const dy = Math.abs(end.y - start.y);
       const type = dx > dy ? 'horizontal' : 'vertical';
-      const newDim: Dimension = { id, variant, type, start, end, text: '...', color: '#ffffff' };
+      // With a calibration set, the label is computed from real-world scale
+      const cal = activeCanvas.calibration;
+      const text = cal
+          ? (variant === 'box' ? measureBox(start, end, cal, state.unitSystem) : measureLine(start, end, cal, state.unitSystem))
+          : '...';
+      const newDim: Dimension = { id, variant, type, start, end, text, color: '#ffffff', autoMeasured: !!cal };
       updateActiveCanvasWithHistory({
           dimensions: [...activeCanvas.dimensions, newDim],
           activeDimensionId: id,
@@ -465,11 +565,67 @@ const App: React.FC = () => {
       setToolMode('select');
   };
 
+  // --- Calibration Handlers ---
+  const handleCalibrateComplete = (start: Point, end: Point) => {
+      setPendingCalibration({ start, end });
+  };
+
+  const confirmCalibration = (realValue: number, unit: MeasureUnit, reapply: boolean) => {
+      if (!pendingCalibration || !activeCanvas) return;
+      const calibration: Calibration = { ...pendingCalibration, realValue, unit };
+      let newDims = activeCanvas.dimensions;
+      if (reapply) {
+          newDims = activeCanvas.dimensions.map(d => ({
+              ...d,
+              text: d.variant === 'box'
+                  ? measureBox(d.start, d.end, calibration, state.unitSystem)
+                  : measureLine(d.start, d.end, calibration, state.unitSystem),
+              autoMeasured: true
+          }));
+      }
+      updateActiveCanvasWithHistory({ calibration, dimensions: newDims });
+      setPendingCalibration(null);
+      setToolMode('select');
+  };
+
+  const cancelCalibration = () => {
+      setPendingCalibration(null);
+      setToolMode('select');
+  };
+
+  // --- Per-Element Extrusion (Element Studio) ---
+  const applySignElements = (elements: SignElement[] | undefined, sourceSize: Size | undefined) => {
+      const prev = stateRef.current;
+      const canvas = prev.canvases.find(c => c.id === prev.activeCanvasId);
+      if (!canvas || !canvas.activeSignId) return;
+      const newSigns = canvas.signs.map(s =>
+          s.id === canvas.activeSignId ? { ...s, elements, elementsSourceSize: sourceSize } : s
+      );
+      updateActiveCanvasWithHistory({ signs: newSigns });
+      setShowElementStudio(false);
+  };
+
   const updateDimension = useCallback((id: string, updates: Partial<Dimension>) => {
     setState(prev => {
         const canvas = prev.canvases.find(c => c.id === prev.activeCanvasId);
         if (!canvas) return prev;
-        const newDims = canvas.dimensions.map(d => d.id === id ? { ...d, ...updates } : d);
+        const newDims = canvas.dimensions.map(d => {
+            if (d.id !== id) return d;
+            const next = { ...d, ...updates };
+            // A plain text update (no autoMeasured flag alongside) is the user
+            // hand-typing a label — stop auto-measuring this dimension
+            if (updates.text !== undefined && updates.autoMeasured === undefined) {
+                next.autoMeasured = false;
+            }
+            // Endpoint drags recompute the label live from the calibration scale
+            const geometryChanged = updates.start !== undefined || updates.end !== undefined;
+            if (geometryChanged && next.autoMeasured && canvas.calibration) {
+                next.text = next.variant === 'box'
+                    ? measureBox(next.start, next.end, canvas.calibration, prev.unitSystem)
+                    : measureLine(next.start, next.end, canvas.calibration, prev.unitSystem);
+            }
+            return next;
+        });
         const newCanvas = { ...canvas, dimensions: newDims };
         return {
             ...prev,
@@ -501,7 +657,8 @@ const App: React.FC = () => {
           img.onload = () => {
              updateActiveCanvas({
                  backgroundImage: e.target!.result as string,
-                 backgroundSize: { width: img.width, height: img.height }
+                 backgroundSize: { width: img.width, height: img.height },
+                 calibration: null // new photo, old scale no longer applies
              });
           }
           img.src = e.target.result;
@@ -510,7 +667,8 @@ const App: React.FC = () => {
            setState(prev => ({ ...prev, titleBlock: { ...prev.titleBlock, logoImage: e.target!.result as string } }));
         } else {
            if (activeCanvas?.activeSignId) {
-             updateActiveSign({ image: e.target.result as string });
+             // New artwork invalidates detected element contours
+             updateActiveSign({ image: e.target.result as string, elements: undefined, elementsSourceSize: undefined });
            }
         }
       }
@@ -529,11 +687,19 @@ const App: React.FC = () => {
         start: { x: dim.start.x - cropOffset.x, y: dim.start.y - cropOffset.y },
         end: { x: dim.end.x - cropOffset.x, y: dim.end.y - cropOffset.y }
     }));
+    // Crop cuts pixels without resampling, so the calibration scale stays valid —
+    // its line just shifts by the crop offset like everything else
+    const newCalibration = activeCanvas.calibration ? {
+        ...activeCanvas.calibration,
+        start: { x: activeCanvas.calibration.start.x - cropOffset.x, y: activeCanvas.calibration.start.y - cropOffset.y },
+        end: { x: activeCanvas.calibration.end.x - cropOffset.x, y: activeCanvas.calibration.end.y - cropOffset.y }
+    } : activeCanvas.calibration;
     updateActiveCanvasWithHistory({
         backgroundImage: newImageUrl,
         backgroundSize: newSize,
         signs: newSigns,
-        dimensions: newDims
+        dimensions: newDims,
+        calibration: newCalibration
     });
     setIsCropping(false);
   };
@@ -541,9 +707,12 @@ const App: React.FC = () => {
   const handleCleanupSave = (newImageUrl: string) => {
       const img = new Image();
       img.onload = () => {
+          // The AI cleanup pipeline can resize the image (max-dim cap), so the
+          // old pixel scale is no longer trustworthy — require recalibration
           updateActiveCanvas({
               backgroundImage: newImageUrl,
-              backgroundSize: { width: img.width, height: img.height }
+              backgroundSize: { width: img.width, height: img.height },
+              calibration: null
           });
           setShowCleanupTool(false);
       };
@@ -608,7 +777,7 @@ const App: React.FC = () => {
       // Ensure user context is preserved if needed, though loaded state should have data
       // We might want to keep the current session user info if the loaded project was anonymous
       const mergedState = {
-          ...loadedState,
+          ...normalizeState(loadedState),
           user: state.user // Keep current user
       };
       setState(mergedState);
@@ -723,12 +892,23 @@ const App: React.FC = () => {
                   <Database className="w-3 h-3" /> Saved Locally
               </div>
           )}
+          {driveNeedsReconnect && (
+              <div className="bg-amber-600/95 text-white px-3 py-1 rounded-full text-xs font-bold flex items-center gap-2 shadow-lg backdrop-blur pointer-events-auto">
+                  <HardDrive className="w-3 h-3" /> Some images are in your Google Drive
+                  <button onClick={handleDriveReconnect} className="underline hover:text-amber-100">Reconnect</button>
+              </div>
+          )}
       </div>
 
       {/* User Profile / Logout (Top Right) */}
       <div className="absolute top-4 right-4 z-50 flex items-center gap-3 bg-gray-900/80 backdrop-blur p-1 pr-3 rounded-full border border-gray-700">
           <img src={state.user.photoURL || 'https://via.placeholder.com/32'} className="w-8 h-8 rounded-full border border-gray-600" alt="User" />
           <span className="text-xs font-medium text-gray-300 hidden md:block">{state.user.displayName}</span>
+          {!state.user.uid.startsWith('guest_') && (
+              <button onClick={() => setShowDriveSettings(true)} className={`p-1.5 rounded-full transition-colors ${driveStatus === 'connected' ? 'text-green-400 hover:bg-green-500/20' : driveStatus === 'expired' ? 'text-amber-400 hover:bg-amber-500/20' : 'text-gray-400 hover:bg-blue-500/20 hover:text-blue-400'}`} title={driveStatus === 'connected' ? 'Cloud drive connected' : 'Connect your cloud drive'}>
+                  <HardDrive className="w-4 h-4" />
+              </button>
+          )}
           <button onClick={() => setShowApiKeyModal(true)} className={`p-1.5 rounded-full transition-colors ${geminiKey.trim() ? 'text-green-400 hover:bg-green-500/20' : 'text-yellow-400 hover:bg-yellow-500/20'}`} title={geminiKey.trim() ? 'Gemini API Key set (your key)' : 'Set your Gemini API Key'}>
               <KeyRound className="w-4 h-4" />
           </button>
@@ -768,6 +948,16 @@ const App: React.FC = () => {
           </div>
       )}
 
+      {/* Calibration: real-world length entry for the drawn reference line */}
+      {pendingCalibration && (
+          <CalibrationModal
+              pixelLength={distance(pendingCalibration.start, pendingCalibration.end)}
+              existingDimensionCount={activeCanvas.dimensions.length}
+              onConfirm={confirmCalibration}
+              onCancel={cancelCalibration}
+          />
+      )}
+
       <Suspense fallback={null}>
         <Assistant isOpen={showAssistant} setIsOpen={setShowAssistant} apiKey={effectiveApiKey} />
       </Suspense>
@@ -778,6 +968,7 @@ const App: React.FC = () => {
         updateState={updateState}
         updateStateWithHistory={updateStateWithHistory}
         updateActiveCanvas={updateActiveCanvas}
+        updateActiveCanvasWithHistory={updateActiveCanvasWithHistory}
         updateActiveSign={updateActiveSign}
         updateSignById={updateSignById}
         addSign={addSign}
@@ -803,6 +994,7 @@ const App: React.FC = () => {
         setIsCropping={setIsCropping}
 
         onOpenCleanup={() => setShowCleanupTool(true)}
+        onOpenElementStudio={() => setShowElementStudio(true)}
 
         undo={undo}
         redo={redo}
@@ -830,6 +1022,8 @@ const App: React.FC = () => {
 
            toolMode={toolMode}
            onDrawComplete={handleDrawComplete}
+           calibration={activeCanvas.calibration ?? null}
+           onCalibrateComplete={handleCalibrateComplete}
            updateSignById={updateSignById}
            setActiveSign={setActiveSign}
            updateDimension={updateDimension}
@@ -865,6 +1059,42 @@ const App: React.FC = () => {
           />
         </Suspense>
       )}
+
+      {showDriveSettings && (
+        <Suspense fallback={null}>
+          <DriveSettings
+             isOpen={showDriveSettings}
+             onClose={() => setShowDriveSettings(false)}
+             onStatusChange={(status) => {
+                 setDriveStatus(status);
+                 if (status === 'connected') setDriveNeedsReconnect(false);
+             }}
+          />
+        </Suspense>
+      )}
+
+      {showElementStudio && (() => {
+          const studioSign = activeCanvas.signs.find(s => s.id === activeCanvas.activeSignId);
+          if (!studioSign) return null;
+          // Real quad width in mm when this view is calibrated — lets the
+          // Studio express element depths in real units (channel-letter returns)
+          const mmPerBgPx = activeCanvas.calibration ? getMmPerPx(activeCanvas.calibration) : null;
+          const sc = studioSign.corners;
+          const quadWidthMm = mmPerBgPx
+              ? ((distance(sc[0], sc[1]) + distance(sc[3], sc[2])) / 2) * mmPerBgPx
+              : null;
+          return (
+            <Suspense fallback={null}>
+              <ElementStudio
+                  sign={studioSign}
+                  quadWidthMm={quadWidthMm}
+                  unitSystem={state.unitSystem}
+                  onApply={applySignElements}
+                  onClose={() => setShowElementStudio(false)}
+              />
+            </Suspense>
+          );
+      })()}
     </div>
   );
 };

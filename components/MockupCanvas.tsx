@@ -1,7 +1,9 @@
 
 import React, { useEffect, useRef, useState, useCallback } from 'react';
-import { AppImages, MockupState, Point, Sign, Dimension, TitleBlock, Revision, PaperSize, Orientation } from '../types';
-import { hexToRgb, isPointInPolygon, distance } from '../utils/math';
+import { AppImages, MockupState, Point, Sign, Dimension, TitleBlock, Revision, PaperSize, Orientation, Calibration } from '../types';
+import { hexToRgb, isPointInPolygon, distance, computeHomography } from '../utils/math';
+import { measureLine, measureBox } from '../utils/measure';
+import { buildElementMask } from '../utils/elementDetection';
 import { ZoomIn, ZoomOut, Maximize, Check, X } from 'lucide-react';
 import { ToolMode } from '../App';
 import { TITLE_BLOCK_TEMPLATES } from '../data/titleBlockTemplates';
@@ -20,6 +22,8 @@ interface MockupCanvasProps {
   
   toolMode: ToolMode;
   onDrawComplete: (start: Point, end: Point, variant: 'linear' | 'box') => void;
+  calibration: Calibration | null;
+  onCalibrateComplete: (start: Point, end: Point) => void;
   updateSignById: (id: string, updates: Partial<Sign>) => void;
   setActiveSign: (id: string | null) => void;
   updateDimension: (id: string, updates: Partial<Dimension>) => void;
@@ -52,11 +56,13 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
     activeSignId,
     dimensions,
     activeDimensionId,
-    state, 
+    state,
     titleBlock,
     toolMode,
     onDrawComplete,
-    updateSignById, 
+    calibration,
+    onCalibrateComplete,
+    updateSignById,
     setActiveSign, 
     updateDimension,
     setActiveDimension,
@@ -100,6 +106,29 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
     attribPosition: number;
     attribTexCoord: number;
   } | null>(null);
+
+  // --- Per-element extrusion (homography program) ---
+  const elemProgramRef = useRef<WebGLProgram | null>(null);
+  const elemLocsRef = useRef<{
+    H: WebGLUniformLocation | null;
+    resolution: WebGLUniformLocation | null;
+    extrude: WebGLUniformLocation | null;
+    signSize: WebGLUniformLocation | null;
+    color: WebGLUniformLocation | null;
+    mode: WebGLUniformLocation | null;
+    image: WebGLUniformLocation | null;
+    mask: WebGLUniformLocation | null;
+    aPos: number;
+    aTop: number;
+    aShade: number;
+  } | null>(null);
+  // Static per-sign element geometry: rebuilt only when contours/image change
+  // (an elementsVersion string), NEVER during corner drags or depth tweaks.
+  const elementCacheRef = useRef<Map<string, {
+    version: string;
+    faceBuffer: WebGLBuffer;
+    elements: Map<string, { sideBuffer: WebGLBuffer; sideVertexCount: number; maskTexture: WebGLTexture }>;
+  }>>(new Map());
 
   const [activeHandle, setActiveHandle] = useState<number | null>(null); 
   const [hoveredHandle, setHoveredHandle] = useState<number | null>(null);
@@ -361,6 +390,70 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
       0, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 1
     ]), gl.STATIC_DRAW);
+
+    // --- Second program: per-element extrusion via homography ---
+    // Geometry lives in sign-image px space in static buffers; the vertex
+    // shader maps it through u_H every frame, so corner drags only update
+    // uniforms — no CPU tessellation, no buffer re-uploads.
+    const elemVs = createShader(gl.VERTEX_SHADER, `
+      attribute vec2 a_pos;      // sign-image px
+      attribute float a_top;     // 0 = base plane, 1 = extruded top
+      attribute float a_shade;
+      uniform mat3 u_H;          // sign-image px -> background-image px homography
+      uniform vec2 u_resolution;
+      uniform vec2 u_extrude;    // direction * depth (background px), post-divide
+      uniform vec2 u_signSize;
+      varying vec2 v_uv;
+      varying float v_shade;
+      void main() {
+        vec3 p = u_H * vec3(a_pos, 1.0);
+        vec2 img = p.xy / p.z + a_top * u_extrude;
+        vec2 clip = (img / u_resolution) * 2.0 - 1.0;
+        gl_Position = vec4(clip * vec2(1, -1), 0, 1);
+        v_uv = a_pos / u_signSize;
+        v_shade = a_shade;
+      }
+    `);
+    const elemFs = createShader(gl.FRAGMENT_SHADER, `
+      precision mediump float;
+      uniform sampler2D u_image;
+      uniform sampler2D u_mask;
+      uniform vec4 u_color;
+      uniform int u_mode;        // 0 = flat side wall, 1 = masked texture face
+      varying vec2 v_uv;
+      varying float v_shade;
+      void main() {
+        if (u_mode == 1) {
+          vec4 tex = texture2D(u_image, v_uv);
+          float m = texture2D(u_mask, v_uv).a;
+          gl_FragColor = vec4(tex.rgb, tex.a * m * u_color.a);
+        } else {
+          gl_FragColor = vec4(u_color.rgb * v_shade, u_color.a);
+        }
+      }
+    `);
+    if (elemVs && elemFs) {
+      const elemProgram = gl.createProgram()!;
+      gl.attachShader(elemProgram, elemVs);
+      gl.attachShader(elemProgram, elemFs);
+      gl.linkProgram(elemProgram);
+      if (gl.getProgramParameter(elemProgram, gl.LINK_STATUS)) {
+        elemProgramRef.current = elemProgram;
+        elemLocsRef.current = {
+          H: gl.getUniformLocation(elemProgram, 'u_H'),
+          resolution: gl.getUniformLocation(elemProgram, 'u_resolution'),
+          extrude: gl.getUniformLocation(elemProgram, 'u_extrude'),
+          signSize: gl.getUniformLocation(elemProgram, 'u_signSize'),
+          color: gl.getUniformLocation(elemProgram, 'u_color'),
+          mode: gl.getUniformLocation(elemProgram, 'u_mode'),
+          image: gl.getUniformLocation(elemProgram, 'u_image'),
+          mask: gl.getUniformLocation(elemProgram, 'u_mask'),
+          aPos: gl.getAttribLocation(elemProgram, 'a_pos'),
+          aTop: gl.getAttribLocation(elemProgram, 'a_top'),
+          aShade: gl.getAttribLocation(elemProgram, 'a_shade'),
+        };
+      }
+    }
   }, [setCanvasRef]);
 
   useEffect(() => {
@@ -400,6 +493,81 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
            setTexturesLoaded(n => n + 1);
         };
       }
+    });
+  }, [signs]);
+
+  // Build/evict static per-element geometry. Keyed by an elementsVersion that
+  // covers ONLY contours + image — depth and enabled changes are uniforms at
+  // draw time, so slider tweaks and corner drags never rebuild buffers.
+  useEffect(() => {
+    const gl = glRef.current;
+    if (!gl) return;
+    const cache = elementCacheRef.current;
+
+    const destroyEntry = (entry: { faceBuffer: WebGLBuffer; elements: Map<string, { sideBuffer: WebGLBuffer; sideVertexCount: number; maskTexture: WebGLTexture }> }) => {
+      gl.deleteBuffer(entry.faceBuffer);
+      entry.elements.forEach(el => { gl.deleteBuffer(el.sideBuffer); gl.deleteTexture(el.maskTexture); });
+    };
+
+    const liveIds = new Set(signs.filter(s => s.elements?.length && s.elementsSourceSize).map(s => s.id));
+    cache.forEach((entry, id) => {
+      if (!liveIds.has(id)) { destroyEntry(entry); cache.delete(id); }
+    });
+
+    signs.forEach(sign => {
+      if (!sign.elements?.length || !sign.elementsSourceSize) return;
+      const version = `${sign.image}|${sign.elementsSourceSize.width}x${sign.elementsSourceSize.height}|` +
+        JSON.stringify(sign.elements.map(e => ({ i: e.id, c: e.contours })));
+      const existing = cache.get(sign.id);
+      if (existing?.version === version) return;
+      if (existing) { destroyEntry(existing); cache.delete(sign.id); }
+
+      const { width: w, height: h } = sign.elementsSourceSize;
+
+      // Face quad: full sign area at a_top=1 so u_extrude pops it forward;
+      // the per-element mask texture limits it to the element's shape
+      const faceBuffer = gl.createBuffer()!;
+      gl.bindBuffer(gl.ARRAY_BUFFER, faceBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+        0, 0, 1, 1,   w, 0, 1, 1,   0, h, 1, 1,
+        0, h, 1, 1,   w, 0, 1, 1,   w, h, 1, 1,
+      ]), gl.STATIC_DRAW);
+
+      const elements = new Map<string, { sideBuffer: WebGLBuffer; sideVertexCount: number; maskTexture: WebGLTexture }>();
+      const lightX = Math.SQRT1_2, lightY = -Math.SQRT1_2;
+
+      sign.elements.forEach(el => {
+        const pts = el.contours[0] ?? [];
+        if (pts.length < 3) return;
+
+        // Side-wall TRIANGLE_STRIP: each contour point at base (a_top 0) and
+        // extruded top (a_top 1), with per-segment normal shading baked in
+        const verts: number[] = [];
+        for (let i = 0; i <= pts.length; i++) {
+          const p = pts[i % pts.length];
+          const nxt = pts[(i + 1) % pts.length];
+          let nx = nxt.y - p.y, ny = -(nxt.x - p.x);
+          const len = Math.hypot(nx, ny) || 1;
+          nx /= len; ny /= len;
+          const shade = 0.68 + 0.32 * Math.abs(nx * lightX + ny * lightY);
+          verts.push(p.x, p.y, 0, shade, p.x, p.y, 1, shade);
+        }
+        const sideBuffer = gl.createBuffer()!;
+        gl.bindBuffer(gl.ARRAY_BUFFER, sideBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(verts), gl.STATIC_DRAW);
+
+        const maskCanvas = buildElementMask(el.contours, sign.elementsSourceSize!);
+        const maskTexture = gl.createTexture()!;
+        gl.bindTexture(gl.TEXTURE_2D, maskTexture);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, maskCanvas);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+
+        elements.set(el.id, { sideBuffer, sideVertexCount: verts.length / 4, maskTexture });
+      });
+
+      cache.set(sign.id, { version, faceBuffer, elements });
     });
   }, [signs]);
 
@@ -472,6 +640,76 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
           gl.bindTexture(gl.TEXTURE_2D, tex);
           drawQuad(c[0], c[1], c[2], c[3], [1,1,1, sign.opacity], true);
       }
+
+      // --- Per-element variable extrusion pass ---
+      const elemCache = elementCacheRef.current.get(sign.id);
+      const elemProgram = elemProgramRef.current;
+      const eLocs = elemLocsRef.current;
+      const activeElements = sign.elements?.filter(e => e.enabled) ?? [];
+      if (elemCache && elemProgram && eLocs && activeElements.length && sign.elementsSourceSize && tex) {
+        const { width: sw, height: sh } = sign.elementsSourceSize;
+        gl.useProgram(elemProgram);
+
+        // Homography: sign-image px -> background-image px (the quad's plane).
+        // Recomputed per render (an 8x8 solve, microseconds) — the geometry
+        // itself never leaves the GPU.
+        const Hm = computeHomography(
+          [{ x: 0, y: 0 }, { x: sw, y: 0 }, { x: sw, y: sh }, { x: 0, y: sh }],
+          c
+        );
+        gl.uniformMatrix3fv(eLocs.H, false, [Hm[0], Hm[3], Hm[6], Hm[1], Hm[4], Hm[7], Hm[2], Hm[5], Hm[8]]);
+        gl.uniform2f(eLocs.resolution, gl.canvas.width, gl.canvas.height);
+        gl.uniform2f(eLocs.signSize, sw, sh);
+        gl.uniform1i(eLocs.image, 0);
+        gl.uniform1i(eLocs.mask, 1);
+
+        const rad2 = (sign.extrusionAngle * Math.PI) / 180;
+        // Converts element depths (sign-image px) to background px on the quad
+        const pxScale = ((distance(c[0], c[1]) + distance(c[3], c[2])) / 2) / sw;
+
+        const setAttribs = (buffer: WebGLBuffer) => {
+          gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+          gl.enableVertexAttribArray(eLocs.aPos);
+          gl.vertexAttribPointer(eLocs.aPos, 2, gl.FLOAT, false, 16, 0);
+          gl.enableVertexAttribArray(eLocs.aTop);
+          gl.vertexAttribPointer(eLocs.aTop, 1, gl.FLOAT, false, 16, 8);
+          gl.enableVertexAttribArray(eLocs.aShade);
+          gl.vertexAttribPointer(eLocs.aShade, 1, gl.FLOAT, false, 16, 12);
+        };
+
+        [...activeElements].sort((a, b) => a.depth - b.depth).forEach(elDef => {
+          const geo = elemCache.elements.get(elDef.id);
+          if (!geo) return;
+          const off = elDef.depth * pxScale;
+          // Elements rise TOWARD the viewer — opposite the slab's receding sides
+          gl.uniform2f(eLocs.extrude, -Math.cos(rad2) * off, -Math.sin(rad2) * off);
+
+          // Side walls
+          gl.uniform1i(eLocs.mode, 0);
+          gl.uniform4f(eLocs.color, rgb[0], rgb[1], rgb[2], sign.opacity);
+          setAttribs(geo.sideBuffer);
+          gl.drawArrays(gl.TRIANGLE_STRIP, 0, geo.sideVertexCount);
+
+          // Masked face, popped forward by the same offset
+          gl.uniform1i(eLocs.mode, 1);
+          gl.uniform4f(eLocs.color, 1, 1, 1, sign.opacity);
+          gl.activeTexture(gl.TEXTURE0);
+          gl.bindTexture(gl.TEXTURE_2D, tex);
+          gl.activeTexture(gl.TEXTURE1);
+          gl.bindTexture(gl.TEXTURE_2D, geo.maskTexture);
+          setAttribs(elemCache.faceBuffer);
+          gl.drawArrays(gl.TRIANGLES, 0, 6);
+          gl.activeTexture(gl.TEXTURE0);
+        });
+
+        // Restore classic-program state for subsequent signs
+        gl.disableVertexAttribArray(eLocs.aTop);
+        gl.disableVertexAttribArray(eLocs.aShade);
+        gl.useProgram(program);
+        gl.bindBuffer(gl.ARRAY_BUFFER, texBuffer);
+        gl.enableVertexAttribArray(uniforms.attribTexCoord);
+        gl.vertexAttribPointer(uniforms.attribTexCoord, 2, gl.FLOAT, false, 0, 0);
+      }
     });
 
   }, [signs, texturesLoaded, images.backgroundSize]);
@@ -520,7 +758,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
 
       if (e.button === 2) { if (isDrawing) { setIsDrawing(false); drawingStart.current = null; drawingCurrent.current = null; return; } }
       const pos = getMousePos(e);
-      if (toolMode === 'draw_line') { e.preventDefault(); e.stopPropagation(); if (!isDrawing) { e.currentTarget.setPointerCapture(e.pointerId); setIsDrawing(true); drawingStart.current = pos; drawingCurrent.current = pos; setActiveSign(null); setActiveDimension(''); } else { if (drawingStart.current) { onDrawComplete(drawingStart.current, pos, 'linear'); } setIsDrawing(false); drawingStart.current = null; drawingCurrent.current = null; } return; }
+      if (toolMode === 'draw_line' || toolMode === 'calibrate') { e.preventDefault(); e.stopPropagation(); if (!isDrawing) { e.currentTarget.setPointerCapture(e.pointerId); setIsDrawing(true); drawingStart.current = pos; drawingCurrent.current = pos; setActiveSign(null); setActiveDimension(''); } else { if (drawingStart.current) { if (toolMode === 'calibrate') { onCalibrateComplete(drawingStart.current, pos); } else { onDrawComplete(drawingStart.current, pos, 'linear'); } } setIsDrawing(false); drawingStart.current = null; drawingCurrent.current = null; } return; }
       if (toolMode === 'draw_box') { e.preventDefault(); e.stopPropagation(); e.currentTarget.setPointerCapture(e.pointerId); setIsDrawing(true); drawingStart.current = pos; drawingCurrent.current = pos; setActiveSign(null); setActiveDimension(''); return; }
       
       let hitFound = false;
@@ -586,7 +824,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
         const dCurr = drawingCurrent.current;
         if (dStart && dCurr) {
             if (toolMode === 'draw_box') { onDrawComplete(dStart, dCurr, 'box'); setIsDrawing(false); drawingStart.current = null; drawingCurrent.current = null; } 
-            else if (toolMode === 'draw_line') { const worldDist = distance(dStart, dCurr); const screenDist = worldDist * (baseScale * view.scale); if (screenDist > 10) { onDrawComplete(dStart, dCurr, 'linear'); setIsDrawing(false); drawingStart.current = null; drawingCurrent.current = null; } }
+            else if (toolMode === 'draw_line' || toolMode === 'calibrate') { const worldDist = distance(dStart, dCurr); const screenDist = worldDist * (baseScale * view.scale); if (screenDist > 10) { if (toolMode === 'calibrate') { onCalibrateComplete(dStart, dCurr); } else { onDrawComplete(dStart, dCurr, 'linear'); } setIsDrawing(false); drawingStart.current = null; drawingCurrent.current = null; } }
         }
     }
     
@@ -710,7 +948,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
       onPointerUp={handleContainerPointerUp}
       onPointerLeave={handleContainerPointerUp}
       onContextMenu={(e) => e.preventDefault()}
-      style={{ touchAction: 'none', cursor: (toolMode === 'draw_line' || toolMode === 'draw_box') ? 'crosshair' : 'default', backgroundColor: isSheetView ? '#333' : '#0a0a0a' }} 
+      style={{ touchAction: 'none', cursor: (toolMode === 'draw_line' || toolMode === 'draw_box' || toolMode === 'calibrate') ? 'crosshair' : 'default', backgroundColor: isSheetView ? '#333' : '#0a0a0a' }}
     >
       {/* Zoom Controls — offset below the user profile pill rendered by App at top-right */}
       <div className="absolute top-20 right-4 flex flex-col gap-2 z-40">
@@ -907,13 +1145,61 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
                             );
                         }
                     })}
-                    {isDrawing && drawingStart.current && drawingCurrent.current && (
+                    {isDrawing && drawingStart.current && drawingCurrent.current && (() => {
+                        // Non-null: guarded by the render condition above (refs don't narrow into closures)
+                        const dStart = drawingStart.current!;
+                        const dCurr = drawingCurrent.current!;
+                        const isCalibrating = toolMode === 'calibrate';
+                        const previewColor = isCalibrating ? '#f59e0b' : '#3b82f6';
+                        // Live measurement readout: px length while calibrating,
+                        // real-world length when drawing with a calibration set
+                        const label = isCalibrating
+                            ? `${Math.round(distance(dStart, dCurr))}px`
+                            : calibration
+                                ? (toolMode === 'draw_box'
+                                    ? measureBox(dStart, dCurr, calibration, state.unitSystem)
+                                    : measureLine(dStart, dCurr, calibration, state.unitSystem))
+                                : null;
+                        return (
                         <g className="pointer-events-none">
                             {toolMode === 'draw_box' ? (
-                                <rect x={Math.min(drawingStart.current.x, drawingCurrent.current.x)} y={Math.min(drawingStart.current.y, drawingCurrent.current.y)} width={Math.abs(drawingCurrent.current.x - drawingStart.current.x)} height={Math.abs(drawingCurrent.current.y - drawingStart.current.y)} fill="rgba(59, 130, 246, 0.2)" stroke="#3b82f6" strokeWidth={2 * handleScale} strokeDasharray="4 2" />
+                                <rect x={Math.min(dStart.x, dCurr.x)} y={Math.min(dStart.y, dCurr.y)} width={Math.abs(dCurr.x - dStart.x)} height={Math.abs(dCurr.y - dStart.y)} fill="rgba(59, 130, 246, 0.2)" stroke="#3b82f6" strokeWidth={2 * handleScale} strokeDasharray="4 2" />
                             ) : (
-                                <line x1={drawingStart.current.x} y1={drawingStart.current.y} x2={drawingCurrent.current.x} y2={drawingCurrent.current.y} stroke="#3b82f6" strokeWidth={2 * handleScale} />
+                                <line x1={dStart.x} y1={dStart.y} x2={dCurr.x} y2={dCurr.y} stroke={previewColor} strokeWidth={2 * handleScale} />
                             )}
+                            {label && (
+                                <text
+                                    x={(dStart.x + dCurr.x) / 2}
+                                    y={(dStart.y + dCurr.y) / 2 - 10 * handleScale}
+                                    textAnchor="middle"
+                                    fill={previewColor}
+                                    stroke="#000000"
+                                    strokeWidth={3 * handleScale}
+                                    style={{ paintOrder: 'stroke', fontWeight: 700 }}
+                                    fontSize={13 * handleScale}
+                                    fontFamily="monospace"
+                                >{label}</text>
+                            )}
+                        </g>
+                        );
+                    })()}
+                    {/* Stored calibration reference line (editor view only) */}
+                    {calibration && !isSheetView && (
+                        <g className="pointer-events-none">
+                            <line x1={calibration.start.x} y1={calibration.start.y} x2={calibration.end.x} y2={calibration.end.y} stroke="#f59e0b" strokeWidth={1.5 * handleScale} strokeDasharray={`${6 * handleScale} ${3 * handleScale}`} />
+                            <rect x={calibration.start.x - 3 * handleScale} y={calibration.start.y - 3 * handleScale} width={6 * handleScale} height={6 * handleScale} fill="#f59e0b" />
+                            <rect x={calibration.end.x - 3 * handleScale} y={calibration.end.y - 3 * handleScale} width={6 * handleScale} height={6 * handleScale} fill="#f59e0b" />
+                            <text
+                                x={(calibration.start.x + calibration.end.x) / 2}
+                                y={(calibration.start.y + calibration.end.y) / 2 - 8 * handleScale}
+                                textAnchor="middle"
+                                fill="#f59e0b"
+                                stroke="#000000"
+                                strokeWidth={3 * handleScale}
+                                style={{ paintOrder: 'stroke', fontWeight: 700 }}
+                                fontSize={11 * handleScale}
+                                fontFamily="monospace"
+                            >REF {calibration.realValue}{calibration.unit}</text>
                         </g>
                     )}
                     {activeSign && activeSignCenter && (
