@@ -3,7 +3,7 @@ import React, { useRef, useState, useEffect } from 'react';
 import { BLEND_MODES, MockupState, Sign, Point, Dimension, SignTemplate, ReferenceImage, TitleBlockField, Canvas, PaperSize, Orientation, SIGN_TYPES, SignType, UnitSystem } from '../types';
 import { distance } from '../utils/math';
 import { getMmPerPx, formatLength, toMm, measureLine, measureBox } from '../utils/measure';
-import { Upload, Download, Sun, Moon, Move3d, Palette, Image as ImageIcon, Plus, Trash2, Layers, Eye, Copy, Box, Minus, Maximize, Ruler, ArrowRight, ArrowDown, Scissors, Check, X, Eraser, Loader2, Square, PenTool, MousePointer2, Hand, Mic, EyeOff, Undo2, Redo2, Layout, FileText, Settings, Briefcase, User, Calendar, MapPin, Notebook, Camera, Library, Sparkles, PencilLine, Grid, Save, ChevronDown, ChevronRight, Monitor, Printer, FolderOpen, HardDrive } from 'lucide-react';
+import { Upload, Download, Sun, Moon, Move3d, Palette, Image as ImageIcon, Plus, Trash2, Layers, Eye, Copy, Box, Minus, Maximize, Ruler, ArrowRight, ArrowDown, ArrowLeft, ArrowUp, Scissors, Check, X, Eraser, Loader2, Square, PenTool, MousePointer2, Hand, Mic, EyeOff, Undo2, Redo2, Layout, FileText, Settings, Briefcase, User, Calendar, MapPin, Notebook, Camera, Library, Sparkles, PencilLine, Grid, Save, ChevronDown, ChevronRight, Monitor, Printer, FolderOpen, HardDrive } from 'lucide-react';
 import ImageUploader from './ImageUploader';
 import SignLibrary from './SignLibrary';
 import { ToolMode } from '../App';
@@ -117,6 +117,7 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
 
   // Target real-world width input for the "Set width" sign-sizing control
   const [targetWidth, setTargetWidth] = useState('');
+  const [nudgeStep, setNudgeStep] = useState<1 | 5>(1);
   
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>, callback: (f: File) => void) => {
     if (e.target.files && e.target.files[0]) {
@@ -444,6 +445,15 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
       setTargetWidth('');
   };
 
+  const nudgeActiveSign = (dx: number, dy: number) => {
+      if (!activeSign) return;
+      const signs = activeCanvas.signs.map(sign => sign.id === activeSign.id ? {
+          ...sign,
+          corners: sign.corners.map(point => ({ x: point.x + dx, y: point.y + dy })) as [Point, Point, Point, Point]
+      } : sign);
+      updateActiveCanvasWithHistory({ signs });
+  };
+
   return (
     <>
       <div className="w-full lg:w-80 h-[45%] lg:h-full bg-gray-900 border-t lg:border-t-0 lg:border-r border-gray-700 flex flex-col shadow-xl z-20">
@@ -716,8 +726,8 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
                  <h2 className="text-sm font-semibold text-gray-300 uppercase tracking-wider">Properties</h2>
                  {activeSign && (
                     <div className="space-y-4 animate-in fade-in duration-200">
-                         <div className="flex gap-2">
-                             <button onClick={() => setIsLibraryOpen(true)} className="flex-1 flex items-center justify-center p-3 bg-gray-800 rounded-lg hover:bg-gray-700 border border-gray-600 transition-colors group gap-2">
+                          <div className="flex gap-2">
+                              <button onClick={() => setIsLibraryOpen(true)} className="flex-1 flex items-center justify-center p-3 bg-gray-800 rounded-lg hover:bg-gray-700 border border-gray-600 transition-colors group gap-2">
                                 <Library className="w-4 h-4 text-gray-400 group-hover:text-blue-400" />
                                 <span className="text-xs text-gray-300">Library</span>
                               </button>
@@ -725,8 +735,40 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
                                 <Upload className="w-4 h-4 text-gray-400 group-hover:text-green-400" />
                                 <span className="text-xs text-gray-300">Upload</span>
                               </button>
-                         </div>
-                          
+                          </div>
+
+                          <div className="bg-blue-500/5 border border-blue-500/20 rounded-lg p-3 space-y-3">
+                              <div className="flex items-center justify-between gap-3">
+                                  <div>
+                                      <div className="text-xs font-medium text-blue-200">Fine position</div>
+                                      <div className="text-[10px] text-gray-500">Pinch to zoom, drag the sign, then nudge into place.</div>
+                                  </div>
+                                  <div className="flex rounded-md overflow-hidden border border-gray-600 flex-shrink-0">
+                                      {([1, 5] as const).map(step => (
+                                          <button
+                                              key={step}
+                                              type="button"
+                                              aria-label={`${step} pixel nudge step`}
+                                              aria-pressed={nudgeStep === step}
+                                              onClick={() => setNudgeStep(step)}
+                                              className={`min-h-9 px-2 text-[10px] font-mono ${nudgeStep === step ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-400 hover:bg-gray-700'}`}
+                                          >{step}px</button>
+                                      ))}
+                                  </div>
+                              </div>
+                              <div className="grid grid-cols-3 gap-1.5 w-[142px] mx-auto">
+                                  <span />
+                                  <button type="button" aria-label="Nudge sign up" onClick={() => nudgeActiveSign(0, -nudgeStep)} className="min-h-11 rounded-md bg-gray-800 border border-gray-600 text-gray-200 hover:bg-blue-600 active:bg-blue-500 flex items-center justify-center"><ArrowUp className="w-4 h-4" /></button>
+                                  <span />
+                                  <button type="button" aria-label="Nudge sign left" onClick={() => nudgeActiveSign(-nudgeStep, 0)} className="min-h-11 rounded-md bg-gray-800 border border-gray-600 text-gray-200 hover:bg-blue-600 active:bg-blue-500 flex items-center justify-center"><ArrowLeft className="w-4 h-4" /></button>
+                                  <div className="min-h-11 rounded-md bg-gray-900 border border-gray-700 text-[10px] text-gray-500 flex items-center justify-center font-mono">{nudgeStep}px</div>
+                                  <button type="button" aria-label="Nudge sign right" onClick={() => nudgeActiveSign(nudgeStep, 0)} className="min-h-11 rounded-md bg-gray-800 border border-gray-600 text-gray-200 hover:bg-blue-600 active:bg-blue-500 flex items-center justify-center"><ArrowRight className="w-4 h-4" /></button>
+                                  <span />
+                                  <button type="button" aria-label="Nudge sign down" onClick={() => nudgeActiveSign(0, nudgeStep)} className="min-h-11 rounded-md bg-gray-800 border border-gray-600 text-gray-200 hover:bg-blue-600 active:bg-blue-500 flex items-center justify-center"><ArrowDown className="w-4 h-4" /></button>
+                                  <span />
+                              </div>
+                          </div>
+
                           {/* Per-element 3D extrusion */}
                           <button
                               onClick={onOpenElementStudio}

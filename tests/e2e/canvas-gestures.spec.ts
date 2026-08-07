@@ -6,8 +6,9 @@ const dispatchTouch = async (
   pointerId: number,
   x: number,
   y: number,
+  target = '#export-target',
 ) => {
-  await page.locator('#export-target').evaluate((element, event) => {
+  await page.locator(target).first().evaluate((element, event) => {
     element.dispatchEvent(new PointerEvent(event.type, {
       bubbles: true,
       cancelable: true,
@@ -56,7 +57,7 @@ test('touch gestures pan and pinch the canvas without changing project coordinat
   expect(afterPan.y - beforePan.y).toBeCloseTo(55, 0);
 
   await page.getByRole('button', { name: 'Fit canvas to screen' }).click();
-  await page.getByRole('button', { name: 'Select' }).click();
+  await page.getByRole('button', { name: 'Select', exact: true }).click();
   const beforeEmptyPan = await transform(page);
   await dispatchTouch(page, 'pointerdown', 1, bounds!.x + 20, bounds!.y + 20);
   await dispatchTouch(page, 'pointermove', 1, bounds!.x + 65, bounds!.y + 50);
@@ -78,4 +79,58 @@ test('touch gestures pan and pinch the canvas without changing project coordinat
   const afterPinch = await transform(page);
   expect(afterPinch.scale).toBeGreaterThan(beforePinch.scale * 1.8);
   expect(afterPinch.y).toBeGreaterThan(beforePinch.y);
+});
+
+test('sign controls have iPad-sized targets and move on the first drag', async ({ page }) => {
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Continue as Guest' }).click();
+  await page.getByRole('button', { name: 'Select', exact: true }).click();
+  await page.evaluate(() => {
+    Element.prototype.setPointerCapture = () => undefined;
+    Element.prototype.releasePointerCapture = () => undefined;
+    Element.prototype.hasPointerCapture = () => false;
+  });
+
+  const cornerHandle = page.getByTestId('sign-corner-handle-0');
+  const moveHandle = page.getByTestId('sign-move-handle');
+  await expect(cornerHandle).toBeVisible();
+  const cornerBounds = await cornerHandle.boundingBox();
+  expect(cornerBounds).not.toBeNull();
+  expect(cornerBounds!.width).toBeGreaterThanOrEqual(44);
+  expect(cornerBounds!.height).toBeGreaterThanOrEqual(44);
+
+  const moveBounds = await moveHandle.boundingBox();
+  expect(moveBounds).not.toBeNull();
+  const signCenter = {
+    x: moveBounds!.x + moveBounds!.width / 2,
+    y: moveBounds!.y + moveBounds!.height / 2,
+  };
+
+  // Deselect, then prove that the very first touch-and-drag both selects and
+  // moves the sign. The old interaction required a separate selection tap.
+  const surfaceBounds = await page.locator('#export-target').boundingBox();
+  expect(surfaceBounds).not.toBeNull();
+  await dispatchTouch(page, 'pointerdown', 1, surfaceBounds!.x + 12, surfaceBounds!.y + 12);
+  await dispatchTouch(page, 'pointerup', 1, surfaceBounds!.x + 12, surfaceBounds!.y + 12);
+  await expect(moveHandle).toHaveCount(0);
+
+  const signHitTarget = '[data-testid^="sign-hit-area-"]';
+  await dispatchTouch(page, 'pointerdown', 1, signCenter.x, signCenter.y, signHitTarget);
+  await dispatchTouch(page, 'pointermove', 1, signCenter.x + 48, signCenter.y + 30, signHitTarget);
+  await dispatchTouch(page, 'pointerup', 1, signCenter.x + 48, signCenter.y + 30, signHitTarget);
+  await expect(moveHandle).toBeVisible();
+
+  const movedBounds = await moveHandle.boundingBox();
+  expect(movedBounds).not.toBeNull();
+  const movedCenter = {
+    x: movedBounds!.x + movedBounds!.width / 2,
+    y: movedBounds!.y + movedBounds!.height / 2,
+  };
+  expect(movedCenter.x - signCenter.x).toBeCloseTo(48, 0);
+  expect(movedCenter.y - signCenter.y).toBeCloseTo(30, 0);
+
+  await page.getByRole('button', { name: '5 pixel nudge step' }).click();
+  const beforeNudge = await moveHandle.boundingBox();
+  await page.getByRole('button', { name: 'Nudge sign right' }).click();
+  await expect.poll(async () => (await moveHandle.boundingBox())!.x).toBeGreaterThan(beforeNudge!.x);
 });

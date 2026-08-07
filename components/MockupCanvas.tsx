@@ -38,7 +38,11 @@ interface MockupCanvasProps {
   onCancelCrop: () => void;
 }
 
-const SCALE_HANDLE_OFFSET = 30; 
+const SCALE_HANDLE_OFFSET = 72;
+const SIGN_CORNER_HIT_SIZE = 52;
+const SIGN_CORNER_VISUAL_SIZE = 18;
+const SIGN_MOVE_HIT_SIZE = 60;
+const SIGN_MOVE_VISUAL_SIZE = 30;
 
 // Paper Dimensions in Millimeters
 const PAPER_DIMENSIONS_MM: Record<PaperSize, { width: number, height: number }> = {
@@ -147,11 +151,17 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
     elements: Map<string, { sideBuffer: WebGLBuffer; sideVertexCount: number; maskTexture: WebGLTexture }>;
   }>>(new Map());
 
-  const [activeHandle, setActiveHandle] = useState<number | null>(null); 
+  const [activeHandle, setActiveHandleState] = useState<number | null>(null);
+  const activeHandleRef = useRef<number | null>(null);
+  const setActiveHandle = useCallback((handle: number | null) => {
+    activeHandleRef.current = handle;
+    setActiveHandleState(handle);
+  }, []);
   const [hoveredHandle, setHoveredHandle] = useState<number | null>(null);
 
   const startMousePos = useRef<Point>({ x: 0, y: 0 });
   const startCornersRef = useRef<[Point, Point, Point, Point] | null>(null);
+  const dragSignIdRef = useRef<string | null>(null);
   const startDimRef = useRef<{ start: Point, end: Point } | null>(null);
   const lastPanPos = useRef<Point>({ x: 0, y: 0 });
 
@@ -346,6 +356,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
     };
     setActiveHandle(null);
     startCornersRef.current = null;
+    dragSignIdRef.current = null;
     startDimRef.current = null;
     if (isDrawing || drawingStart.current) {
       setIsDrawing(false);
@@ -487,14 +498,15 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
   };
 
   const handleContainerPointerMove = (e: React.PointerEvent) => {
-    if (activeHandle === -99) {
+    const interactionHandle = activeHandleRef.current;
+    if (interactionHandle === -99) {
         const dx = e.clientX - lastPanPos.current.x;
         const dy = e.clientY - lastPanPos.current.y;
         lastPanPos.current = { x: e.clientX, y: e.clientY };
         scheduleView({ ...viewRef.current, x: viewRef.current.x + dx, y: viewRef.current.y + dy });
         return;
     }
-    if (isCropping && activeHandle === -10 && cropRect) {
+    if (isCropping && interactionHandle === -10 && cropRect) {
         const m = getMousePos(e);
         const containerSize = getContainerSize(); // Should be image size in crop mode
         if (cropDragMode === 'move') {
@@ -511,7 +523,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
   };
 
   const handleContainerPointerUp = (e: React.PointerEvent) => {
-      if (activeHandle === -99) setIsNavigating(false);
+      if (activeHandleRef.current === -99) setIsNavigating(false);
       setActiveHandle(null);
       if (containerRef.current?.hasPointerCapture(e.pointerId)) {
         containerRef.current.releasePointerCapture(e.pointerId);
@@ -950,8 +962,12 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
 
     if (activeSignId) {
         const activeSign = signs.find(s => s.id === activeSignId);
-        if (activeSign) startCornersRef.current = [...activeSign.corners];
+        if (activeSign) {
+            startCornersRef.current = [...activeSign.corners];
+            dragSignIdRef.current = activeSign.id;
+        }
     } else if (activeDimensionId) {
+        dragSignIdRef.current = null;
         const activeDim = dimensions.find(d => d.id === activeDimensionId);
         if (activeDim) {
              startDimRef.current = { start: { ...activeDim.start }, end: { ...activeDim.end } };
@@ -970,6 +986,19 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
     }
     setActiveHandle(index);
     setHoveredHandle(null);
+  };
+
+  const beginSignBodyDrag = (sign: Sign, e: React.PointerEvent) => {
+      if (isCropping || toolMode !== 'select' || titleBlock.viewMode === 'sheet' || e.button !== 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      e.currentTarget.setPointerCapture(e.pointerId);
+      setActiveSign(sign.id);
+      startMousePos.current = getMousePos(e);
+      startCornersRef.current = [...sign.corners];
+      dragSignIdRef.current = sign.id;
+      setActiveHandle(4);
+      setHoveredHandle(null);
   };
 
   const handleCanvasPointerDown = (e: React.PointerEvent) => {
@@ -991,15 +1020,23 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
       
       let hitFound = false;
       if (state.showDimensions) { for (const dim of dimensions) { let isHit = false; if (dim.variant === 'box') { const x = Math.min(dim.start.x, dim.end.x); const y = Math.min(dim.start.y, dim.end.y); const w = Math.abs(dim.end.x - dim.start.x); const h = Math.abs(dim.end.y - dim.start.y); if (pos.x >= x && pos.x <= x + w && pos.y >= y && pos.y <= y + h) isHit = true; } else { const xMin = Math.min(dim.start.x, dim.end.x) - 10; const xMax = Math.max(dim.start.x, dim.end.x) + 10; const yMin = Math.min(dim.start.y, dim.end.y) - 10; const yMax = Math.max(dim.start.y, dim.end.y) + 10; if (pos.x >= xMin && pos.x <= xMax && pos.y >= yMin && pos.y <= yMax) isHit = true; } if (isHit) { setActiveDimension(dim.id); if (dim.id === activeDimensionId) { e.currentTarget.setPointerCapture(e.pointerId); startMousePos.current = pos; startDimRef.current = { start: { ...dim.start }, end: { ...dim.end } }; setActiveHandle(2); } hitFound = true; return; } } }
-      if (!hitFound) { for (let i = signs.length - 1; i >= 0; i--) { const sign = signs[i]; if (isPointInPolygon(pos, sign.corners)) { setActiveSign(sign.id); if (sign.id === activeSignId) { e.currentTarget.setPointerCapture(e.pointerId); startMousePos.current = pos; startCornersRef.current = [...sign.corners]; setActiveHandle(4); } return; } } }
-      if (!hitFound) { setActiveSign(null); setActiveDimension(''); }
+      if (!hitFound) {
+        for (let i = signs.length - 1; i >= 0; i--) {
+          const sign = signs[i];
+          if (!isPointInPolygon(pos, sign.corners)) continue;
+          beginSignBodyDrag(sign, e);
+          return;
+        }
+      }
+      if (!hitFound) { dragSignIdRef.current = null; setActiveSign(null); setActiveDimension(''); }
   };
 
   const handlePointerMove = (e: React.PointerEvent) => {
     if (isCropping) return;
     
     // If we are dragging a handle, handle it here and stop propagation
-    if (activeHandle !== null) {
+    const interactionHandle = activeHandleRef.current;
+    if (interactionHandle !== null) {
         e.preventDefault();
         e.stopPropagation();
         
@@ -1007,37 +1044,38 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
         const dx = pos.x - startMousePos.current.x;
         const dy = pos.y - startMousePos.current.y;
         
-        if (activeSignId && startCornersRef.current) {
-            const activeSign = signs.find(s => s.id === activeSignId);
+        const dragSignId = dragSignIdRef.current ?? activeSignId;
+        if (dragSignId && startCornersRef.current) {
+            const activeSign = signs.find(s => s.id === dragSignId);
             if (!activeSign) return;
             const startCorners = startCornersRef.current;
-            if (activeHandle < 4) { 
+            if (interactionHandle < 4) {
                 const newCorners = [...activeSign.corners] as [Point, Point, Point, Point]; 
-                newCorners[activeHandle] = pos; 
-                updateSignById(activeSignId, { corners: newCorners }); 
+                newCorners[interactionHandle] = pos;
+                updateSignById(dragSignId, { corners: newCorners });
             } 
-            else if (activeHandle === 4) { 
+            else if (interactionHandle === 4) {
                 const movedCorners = startCorners.map(p => ({ x: p.x + dx, y: p.y + dy })) as [Point, Point, Point, Point]; 
-                updateSignById(activeSignId, { corners: movedCorners }); 
+                updateSignById(dragSignId, { corners: movedCorners });
             } 
-            else if (activeHandle === 5) { 
+            else if (interactionHandle === 5) {
                 const center = { x: (startCorners[0].x + startCorners[2].x) / 2, y: (startCorners[0].y + startCorners[2].y) / 2 }; 
                 const distStart = distance(center, startMousePos.current); 
                 const distCurr = distance(center, pos); 
                 if (distStart < 1) return; 
                 const scale = distCurr / distStart; 
                 const newCorners = startCorners.map(p => ({ x: center.x + (p.x - center.x) * scale, y: center.y + (p.y - center.y) * scale })) as [Point, Point, Point, Point]; 
-                updateSignById(activeSignId, { corners: newCorners }); 
+                updateSignById(dragSignId, { corners: newCorners });
             }
         } else if (activeDimensionId && startDimRef.current) {
             const activeDim = dimensions.find(d => d.id === activeDimensionId);
             if (!activeDim) return;
             const start = startDimRef.current.start;
             const end = startDimRef.current.end;
-            if (activeHandle === 0) { updateDimension(activeDimensionId, { start: { x: start.x + dx, y: start.y + dy } }); } 
-            else if (activeHandle === 1) { updateDimension(activeDimensionId, { end: { x: end.x + dx, y: end.y + dy } }); } 
-            else if (activeHandle === 2) { updateDimension(activeDimensionId, { start: { x: start.x + dx, y: start.y + dy }, end: { x: end.x + dx, y: end.y + dy } }); } 
-            else if (activeHandle >= 10) { const targets = boxDragTargetsRef.current; const newStart = { ...start }; const newEnd = { ...end }; if (targets.x === 'start') newStart.x += dx; else if (targets.x === 'end') newEnd.x += dx; if (targets.y === 'start') newStart.y += dy; else if (targets.y === 'end') newEnd.y += dy; updateDimension(activeDimensionId, { start: newStart, end: newEnd }); }
+            if (interactionHandle === 0) { updateDimension(activeDimensionId, { start: { x: start.x + dx, y: start.y + dy } }); }
+            else if (interactionHandle === 1) { updateDimension(activeDimensionId, { end: { x: end.x + dx, y: end.y + dy } }); }
+            else if (interactionHandle === 2) { updateDimension(activeDimensionId, { start: { x: start.x + dx, y: start.y + dy }, end: { x: end.x + dx, y: end.y + dy } }); }
+            else if (interactionHandle >= 10) { const targets = boxDragTargetsRef.current; const newStart = { ...start }; const newEnd = { ...end }; if (targets.x === 'start') newStart.x += dx; else if (targets.x === 'end') newEnd.x += dx; if (targets.y === 'start') newStart.y += dy; else if (targets.y === 'end') newEnd.y += dy; updateDimension(activeDimensionId, { start: newStart, end: newEnd }); }
         }
         return;
     }
@@ -1062,11 +1100,11 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
     }
     
     // Only stop propagation if we were dragging a handle
-    if (activeHandle !== null) {
+    if (activeHandleRef.current !== null) {
         e.stopPropagation();
     }
     
-    setActiveHandle(null); startCornersRef.current = null; startDimRef.current = null;
+    setActiveHandle(null); startCornersRef.current = null; dragSignIdRef.current = null; startDimRef.current = null;
   };
 
   const handleCanvasPointerCancel = (e: React.PointerEvent) => {
@@ -1075,6 +1113,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
     drawingCurrent.current = null;
     setActiveHandle(null);
     startCornersRef.current = null;
+    dragSignIdRef.current = null;
     startDimRef.current = null;
     if (e.currentTarget.hasPointerCapture(e.pointerId)) e.currentTarget.releasePointerCapture(e.pointerId);
   };
@@ -1334,6 +1373,17 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
             <>
                 <svg className="absolute inset-0 z-20 w-full h-full overflow-visible pointer-events-none" viewBox={`0 0 ${images.backgroundSize.width} ${images.backgroundSize.height}`}>
                     {planePoints.length > 0 && <g><polyline points={planePoints.map(p => `${p.x},${p.y}`).join(' ')} fill="none" stroke="#f59e0b" strokeWidth={3 * handleScale} strokeDasharray="6 3"/>{planePoints.map((p, i) => <g key={i}><circle cx={p.x} cy={p.y} r={7 * handleScale} fill="#f59e0b"/><text x={p.x + 10 * handleScale} y={p.y} fill="white" fontSize={14 * handleScale}>{i + 1}</text></g>)}</g>}
+                    {toolMode === 'select' && signs.map(sign => (
+                        <polygon
+                            key={`hit-${sign.id}`}
+                            data-canvas-object
+                            data-testid={`sign-hit-area-${sign.id}`}
+                            points={sign.corners.map(point => `${point.x},${point.y}`).join(' ')}
+                            fill="transparent"
+                            pointerEvents="all"
+                            onPointerDown={(event) => beginSignBodyDrag(sign, event)}
+                        />
+                    ))}
                     {state.showDimensions && dimensions.map(dim => {
                         const isActive = dim.id === activeDimensionId;
                         const dimColor = dim.color || '#ffffff';
@@ -1474,17 +1524,25 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
                         {activeSign.corners.map((p, i) => {
                         const isActive = activeHandle === i;
                         return (
-                        <div key={i} data-canvas-object className={`absolute rounded-full border-2 transition-all duration-150 cursor-move pointer-events-auto flex items-center justify-center ${isActive ? 'bg-blue-100 border-blue-600 shadow-[0_0_15px_rgba(59,130,246,1)]' : 'bg-white border-blue-500 hover:bg-blue-50 shadow-md'}`} style={{ left: p.x, top: p.y, width: '16px', height: '16px', transform: `translate(-50%, -50%) scale(${isActive ? 1.25 * handleScale : handleScale})`, zIndex: isActive ? 50 : 30, touchAction: 'none' }}
+                        <div key={i} data-canvas-object data-testid={`sign-corner-handle-${i}`} role="button" aria-label={`Move sign corner ${i + 1}`} title={`Drag corner ${i + 1} to match the building perspective`} className="absolute cursor-move pointer-events-auto flex items-center justify-center" style={{ left: p.x, top: p.y, width: SIGN_CORNER_HIT_SIZE, height: SIGN_CORNER_HIT_SIZE, transform: `translate(-50%, -50%) scale(${handleScale})`, zIndex: isActive ? 50 : 30, touchAction: 'none' }}
                                  onPointerDown={handlePointerDown(i)} onPointerMove={handlePointerMove} onPointerUp={handlePointerUp} 
-                                 onPointerEnter={() => setHoveredHandle(i)} onPointerLeave={() => setHoveredHandle(null)} />
+                                 onPointerEnter={() => setHoveredHandle(i)} onPointerLeave={() => setHoveredHandle(null)}>
+                            <div aria-hidden="true" className={`rounded-full border-2 transition-transform duration-100 ${isActive ? 'bg-blue-100 border-blue-600 shadow-[0_0_15px_rgba(59,130,246,1)] scale-125' : 'bg-white border-blue-500 shadow-md'}`} style={{ width: SIGN_CORNER_VISUAL_SIZE, height: SIGN_CORNER_VISUAL_SIZE }} />
+                        </div>
                         );
                         })}
-                        <div data-canvas-object className={`absolute rounded-full border-2 flex items-center justify-center cursor-move transition-all duration-150 backdrop-blur-sm pointer-events-auto ${activeHandle === 4 ? 'bg-white/40 border-white shadow-[0_0_20px_rgba(255,255,255,0.8)]' : 'bg-white/20 border-white/50 hover:bg-white/30 shadow-lg'}`} style={{ left: activeSignCenter.x, top: activeSignCenter.y, width: '32px', height: '32px', transform: `translate(-50%, -50%) scale(${activeHandle === 4 ? 1.1 * handleScale : handleScale})`, zIndex: activeHandle === 4 ? 40 : 25, touchAction: 'none' }}
+                        <div data-canvas-object data-testid="sign-move-handle" role="button" aria-label="Move sign" title="Drag to move the whole sign" className="absolute flex items-center justify-center cursor-move pointer-events-auto" style={{ left: activeSignCenter.x, top: activeSignCenter.y, width: SIGN_MOVE_HIT_SIZE, height: SIGN_MOVE_HIT_SIZE, transform: `translate(-50%, -50%) scale(${handleScale})`, zIndex: activeHandle === 4 ? 40 : 25, touchAction: 'none' }}
                              onPointerDown={handlePointerDown(4)} onPointerMove={handlePointerMove} onPointerUp={handlePointerUp} 
-                             onPointerEnter={() => setHoveredHandle(4)} onPointerLeave={() => setHoveredHandle(null)}><div className={`w-1 h-1 rounded-full transition-colors ${activeHandle === 4 ? 'bg-blue-400' : 'bg-white'}`} style={{ transform: `scale(${totalScale})`}} /></div>
-                        <div data-canvas-object className={`absolute rounded-sm border-2 flex items-center justify-center cursor-ew-resize transition-all duration-150 pointer-events-auto ${activeHandle === 5 ? 'bg-blue-100 border-blue-600 shadow-[0_0_15px_rgba(59,130,246,1)]' : 'bg-white border-blue-500 hover:bg-blue-50 shadow-md'}`} style={{ left: activeSignCenter.x + SCALE_HANDLE_OFFSET * handleScale, top: activeSignCenter.y, width: '16px', height: '16px', transform: `translate(-50%, -50%) scale(${activeHandle === 5 ? 1.25 * handleScale : handleScale})`, zIndex: activeHandle === 5 ? 40 : 25, touchAction: 'none' }}
+                             onPointerEnter={() => setHoveredHandle(4)} onPointerLeave={() => setHoveredHandle(null)}>
+                            <div aria-hidden="true" className={`rounded-full border-2 backdrop-blur-sm flex items-center justify-center transition-transform duration-100 ${activeHandle === 4 ? 'bg-white/50 border-white shadow-[0_0_20px_rgba(255,255,255,0.8)] scale-110' : 'bg-white/20 border-white/60 shadow-lg'}`} style={{ width: SIGN_MOVE_VISUAL_SIZE, height: SIGN_MOVE_VISUAL_SIZE }}>
+                                <div className={`w-1.5 h-1.5 rounded-full ${activeHandle === 4 ? 'bg-blue-400' : 'bg-white'}`} />
+                            </div>
+                        </div>
+                        <div data-canvas-object data-testid="sign-scale-handle" role="button" aria-label="Resize sign" title="Drag to resize the whole sign" className="absolute flex items-center justify-center cursor-ew-resize pointer-events-auto" style={{ left: activeSignCenter.x + SCALE_HANDLE_OFFSET * handleScale, top: activeSignCenter.y, width: SIGN_CORNER_HIT_SIZE, height: SIGN_CORNER_HIT_SIZE, transform: `translate(-50%, -50%) scale(${handleScale})`, zIndex: activeHandle === 5 ? 40 : 25, touchAction: 'none' }}
                              onPointerDown={handlePointerDown(5)} onPointerMove={handlePointerMove} onPointerUp={handlePointerUp} 
-                             onPointerEnter={() => setHoveredHandle(5)} onPointerLeave={() => setHoveredHandle(null)} />
+                             onPointerEnter={() => setHoveredHandle(5)} onPointerLeave={() => setHoveredHandle(null)}>
+                            <div aria-hidden="true" className={`rounded-sm border-2 transition-transform duration-100 ${activeHandle === 5 ? 'bg-blue-100 border-blue-600 shadow-[0_0_15px_rgba(59,130,246,1)] scale-125' : 'bg-white border-blue-500 shadow-md'}`} style={{ width: SIGN_CORNER_VISUAL_SIZE, height: SIGN_CORNER_VISUAL_SIZE }} />
+                        </div>
                         </>
                     )}
                 </div>
