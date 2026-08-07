@@ -24,6 +24,10 @@ export default defineConfig(() => {
           },
           workbox: {
             navigateFallback: '/index.html',
+            // Firebase's same-origin Safari redirect helper must always reach
+            // Vercel's reverse proxy. Never let the PWA navigation fallback
+            // replace /__/auth/handler with the SignagePro app shell.
+            navigateFallbackDenylist: [/^\/__\/auth\//],
             globPatterns: ['**/*.{js,css,html,svg,png,woff2}'],
             maximumFileSizeToCacheInBytes: 1_500_000,
             cleanupOutdatedCaches: true,
