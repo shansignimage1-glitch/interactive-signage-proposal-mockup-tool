@@ -5,9 +5,15 @@ import { getStorage } from 'firebase/storage';
 
 // Dedicated project for this app only. Never point this configuration at the
 // shared signimage-cc project used by unrelated business applications.
+const productionHost = 'signage-proposal-mockup-tool.vercel.app';
+const isProductionOrigin = typeof window !== 'undefined' && window.location.hostname === productionHost;
+
 const firebaseConfig = {
   apiKey: 'AIzaSyDeUpqPjtmstY-_V5v-fGGtNXn9B4H1vFI',
-  authDomain: 'sunny-ship-437805-c5.firebaseapp.com',
+  // Safari blocks the third-party storage used by Firebase redirect auth when
+  // the helper lives on firebaseapp.com. Production proxies /__/auth/* through
+  // Vercel, so the helper and the app share one origin on iPad/iPhone.
+  authDomain: isProductionOrigin ? productionHost : 'sunny-ship-437805-c5.firebaseapp.com',
   projectId: 'sunny-ship-437805-c5',
   storageBucket: 'sunny-ship-437805-c5.firebasestorage.app',
   messagingSenderId: '135421174269',

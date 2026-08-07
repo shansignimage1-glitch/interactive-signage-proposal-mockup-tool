@@ -1,7 +1,7 @@
 
 import React, { useState, useCallback, useRef, useEffect, Suspense } from 'react';
 import { auth, googleProvider } from './firebase';
-import { getIdTokenResult, onAuthStateChanged, signInWithPopup, signOut } from 'firebase/auth';
+import { getIdTokenResult, getRedirectResult, onAuthStateChanged, signInWithPopup, signInWithRedirect, signOut } from 'firebase/auth';
 
 import ControlsPanel from './components/ControlsPanel';
 import MockupCanvas from './components/MockupCanvas';
@@ -200,6 +200,23 @@ const App: React.FC = () => {
       setIsAuthLoading(false);
   }, [startSession]);
 
+  const prefersRedirectSignIn = () => {
+    const ua = navigator.userAgent || '';
+    const iOS = /iPad|iPhone|iPod/.test(ua) ||
+      (navigator.maxTouchPoints > 1 && /Macintosh/.test(ua));
+    const safari = /Safari/.test(ua) && !/Chrome|CriOS|FxiOS|Edg/.test(ua);
+    return iOS || safari;
+  };
+
+  // Complete the same-origin redirect started on Safari/iPad. In production,
+  // Vercel transparently proxies the Firebase helper under /__/auth/*.
+  useEffect(() => {
+    getRedirectResult(auth).catch((err: any) => {
+      setAuthError(err?.message ?? 'Sign-in failed after returning from Google.');
+      setIsAuthLoading(false);
+    });
+  }, []);
+
   // --- Auth & Data Loading ---
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
@@ -269,10 +286,15 @@ const App: React.FC = () => {
 
   const handleLogin = async () => {
     setAuthError(null);
-    // Firebase redirect auth relies on cross-origin helper storage hosted at
-    // firebaseapp.com. Safari 16.1+ partitions that storage when this app is on
-    // Vercel, causing auth/internal-error after Google redirects back. Firebase's
-    // supported fix for non-Firebase hosting is popup auth from this user tap.
+    if (prefersRedirectSignIn()) {
+      try {
+        await signInWithRedirect(auth, googleProvider);
+      } catch (err: any) {
+        setAuthError(err?.message ?? 'Sign-in failed. Please try again.');
+      }
+      return;
+    }
+
     try {
       await signInWithPopup(auth, googleProvider);
       // onAuthStateChanged above handles the rest
@@ -280,7 +302,11 @@ const App: React.FC = () => {
       const code = err?.code ?? '';
       if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') return;
       if (code === 'auth/popup-blocked' || code === 'auth/operation-not-supported-in-this-environment') {
-        setAuthError('Google sign-in was blocked. In Safari, allow pop-ups for this website and try again.');
+        try {
+          await signInWithRedirect(auth, googleProvider);
+        } catch (redirectError: any) {
+          setAuthError(redirectError?.message ?? 'Sign-in failed. Please try again.');
+        }
       } else {
         setAuthError(err?.message ?? 'Sign-in failed. Please try again.');
       }
