@@ -28,6 +28,16 @@ import { captureElement } from './utils/exportCapture';
 import { optimizeImageFile } from './services/imageProcessing';
 
 const GUEST_PROJECT_ID_KEY = 'signagepro_guest_project_id';
+const AUTH_BOOT_TIMEOUT_MS = 20_000;
+
+const withTimeout = <T,>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> =>
+  new Promise<T>((resolve, reject) => {
+    const timer = window.setTimeout(() => reject(new Error(`${label} timed out`)), timeoutMs);
+    promise.then(
+      value => { window.clearTimeout(timer); resolve(value); },
+      error => { window.clearTimeout(timer); reject(error); },
+    );
+  });
 const DEFAULT_AVATAR = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='32' height='32'%3E%3Crect width='32' height='32' rx='16' fill='%23374151'/%3E%3Ccircle cx='16' cy='12' r='5' fill='%239ca3af'/%3E%3Cpath d='M7 29c1-7 5-10 9-10s8 3 9 10' fill='%239ca3af'/%3E%3C/svg%3E";
 
 // Demo images — building facade + a clean SVG sign face
@@ -219,46 +229,89 @@ const App: React.FC = () => {
 
   // --- Auth & Data Loading ---
   useEffect(() => {
+    let cancelled = false;
+
     const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
-      if (firebaseUser) {
-        const token = await getIdTokenResult(firebaseUser);
+      try {
+        if (!firebaseUser) {
+          // Not signed in — show login screen
+          setConnectorUid(null);
+          setState(getInitialState());
+          return;
+        }
+
+        // Token claims are useful for admin UI but must never prevent ordinary
+        // users from entering the app when Safari temporarily stalls a request.
+        let isAdmin = false;
+        try {
+          const token = await withTimeout(getIdTokenResult(firebaseUser), 8_000, 'Authentication token');
+          isAdmin = token.claims.admin === true;
+        } catch (error) {
+          reportWarning('auth-bootstrap', 'Could not load token claims; continuing as a standard user', { error: String(error) });
+        }
+
+        if (cancelled) return;
         const user = {
           uid: firebaseUser.uid,
           displayName: firebaseUser.displayName,
           email: firebaseUser.email,
           photoURL: firebaseUser.photoURL,
-          isAdmin: token.claims.admin === true,
+          isAdmin,
         };
         // Scope drive-connector caches to this user and reflect connection state
         setConnectorUid(user.uid);
         setDriveStatus(getActiveConnector() ? 'connected' : 'disconnected');
         // Try to load the most recent project from cloud, fall back to local
-        const projects = await StorageService.listProjectsCloud(user.uid);
+        const projects = await withTimeout(
+          StorageService.listProjectsCloud(user.uid),
+          10_000,
+          'Cloud project list',
+        );
         if (projects.length > 0) {
           const latest = projects.sort((a, b) => (b.lastModified ?? 0) - (a.lastModified ?? 0))[0];
-          const loaded = await StorageService.loadProjectCloud(user.uid, latest.id, ({ needsReconnect, failedRefs }) => {
-            if (needsReconnect) {
-              setDriveNeedsReconnect(true);
-              setDriveReconnectProvider(failedRefs[0] ? getConnectorForRef(failedRefs[0])?.id ?? null : null);
-              setDriveStatus('expired');
-            }
-          });
+          const loaded = await withTimeout(
+            StorageService.loadProjectCloud(user.uid, latest.id, ({ needsReconnect, failedRefs }) => {
+              if (needsReconnect) {
+                setDriveNeedsReconnect(true);
+                setDriveReconnectProvider(failedRefs[0] ? getConnectorForRef(failedRefs[0])?.id ?? null : null);
+                setDriveStatus('expired');
+              }
+            }),
+            AUTH_BOOT_TIMEOUT_MS,
+            'Cloud project load',
+          );
+          if (cancelled) return;
           if (loaded) {
             startSession({ ...loaded, user, isOnline: navigator.onLine, isSyncing: false });
-            setIsAuthLoading(false);
             return;
           }
         }
         // No cloud project — start fresh
         startSession({ ...getInitialState(), user, isOnline: navigator.onLine });
-      } else {
-        // Not signed in — show login screen
-        setConnectorUid(null);
-        setState(getInitialState());
+      } catch (error) {
+        reportError('auth-bootstrap', error, { uid: firebaseUser?.uid });
+        // A cloud/Drive outage must not trap an authenticated user behind the
+        // loading screen. Open a usable local session and let autosave retry.
+        if (firebaseUser && !cancelled) {
+          const user = {
+            uid: firebaseUser.uid,
+            displayName: firebaseUser.displayName,
+            email: firebaseUser.email,
+            photoURL: firebaseUser.photoURL,
+            isAdmin: false,
+          };
+          startSession({ ...getInitialState(), user, isOnline: navigator.onLine, isSyncing: false });
+          setSyncStatus('error');
+          notify('Signed in. Cloud projects are taking too long to load; you can continue working and retry sync.', 'warning');
+        }
+      } finally {
+        if (!cancelled) setIsAuthLoading(false);
       }
-      setIsAuthLoading(false);
     });
-    return () => unsubscribe();
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
   }, [startSession]);
 
   // Re-open the current project after the user reconnects their drive, so
