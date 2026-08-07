@@ -47,7 +47,10 @@ export function enforceRateLimit(uid: string, action: string, max: number, windo
 }
 
 export function requireApiKey(): string {
-  const key = process.env.GEMINI_API_KEY;
+  // Environment values copied from text editors or PowerShell can contain a
+  // UTF-8 byte-order mark. Undici rejects that invisible U+FEFF character in
+  // the x-goog-api-key header before the request ever reaches Gemini.
+  const key = process.env.GEMINI_API_KEY?.replace(/^\uFEFF/, '').trim();
   if (!key) throw new Error('SERVER_CONFIG');
   return key;
 }
