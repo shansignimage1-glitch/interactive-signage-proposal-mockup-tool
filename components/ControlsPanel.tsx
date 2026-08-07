@@ -3,7 +3,7 @@ import React, { useRef, useState, useEffect } from 'react';
 import { BLEND_MODES, MockupState, Sign, Point, Dimension, SignTemplate, ReferenceImage, TitleBlockField, Canvas, PaperSize, Orientation, SIGN_TYPES, SignType, UnitSystem } from '../types';
 import { distance } from '../utils/math';
 import { getMmPerPx, formatLength, toMm, measureLine, measureBox } from '../utils/measure';
-import { Upload, Download, Sun, Moon, Move3d, Palette, Image as ImageIcon, Plus, Trash2, Layers, Eye, Copy, Box, Minus, Maximize, Ruler, ArrowRight, ArrowDown, Scissors, Check, X, Eraser, Loader2, Square, PenTool, MousePointer2, Mic, EyeOff, Undo2, Redo2, Layout, FileText, Settings, Briefcase, User, Calendar, MapPin, Notebook, Camera, Library, Sparkles, PencilLine, Grid, Save, ChevronDown, ChevronRight, Monitor, Printer, FolderOpen, HardDrive } from 'lucide-react';
+import { Upload, Download, Sun, Moon, Move3d, Palette, Image as ImageIcon, Plus, Trash2, Layers, Eye, Copy, Box, Minus, Maximize, Ruler, ArrowRight, ArrowDown, Scissors, Check, X, Eraser, Loader2, Square, PenTool, MousePointer2, Hand, Mic, EyeOff, Undo2, Redo2, Layout, FileText, Settings, Briefcase, User, Calendar, MapPin, Notebook, Camera, Library, Sparkles, PencilLine, Grid, Save, ChevronDown, ChevronRight, Monitor, Printer, FolderOpen, HardDrive } from 'lucide-react';
 import ImageUploader from './ImageUploader';
 import SignLibrary from './SignLibrary';
 import { ToolMode } from '../App';
@@ -645,8 +645,9 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
                         </button>
                     </div>
                 </div>
-                <div className="flex bg-gray-800 p-1 rounded-lg border border-gray-700">
+                <div className="grid grid-cols-3 gap-1 bg-gray-800 p-1 rounded-lg border border-gray-700">
                     <button onClick={() => setToolMode('select')} className={`flex-1 flex items-center justify-center p-2 rounded gap-2 text-xs transition-colors ${toolMode === 'select' ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white'}`}><MousePointer2 className="w-4 h-4" /> Select</button>
+                    <button onClick={() => setToolMode('pan')} className={`flex-1 flex items-center justify-center p-2 rounded gap-2 text-xs transition-colors ${toolMode === 'pan' ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white'}`} title="Drag to move the view; pinch with two fingers to zoom"><Hand className="w-4 h-4" /> Pan</button>
                     <button onClick={() => setToolMode('draw_line')} className={`flex-1 flex items-center justify-center p-2 rounded gap-2 text-xs transition-colors ${toolMode === 'draw_line' ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white'}`}><PenTool className="w-4 h-4" /> Line</button>
                     <button onClick={() => setToolMode('draw_box')} className={`flex-1 flex items-center justify-center p-2 rounded gap-2 text-xs transition-colors ${toolMode === 'draw_box' ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white'}`}><Square className="w-4 h-4" /> Box</button>
                     <button onClick={() => setToolMode('calibrate')} className={`flex-1 flex items-center justify-center p-2 rounded gap-2 text-xs transition-colors ${toolMode === 'calibrate' ? 'bg-amber-600 text-white' : 'text-gray-400 hover:text-white'}`} title="Draw over a known-size object to set the real-world scale"><Ruler className="w-4 h-4" /> Scale</button>

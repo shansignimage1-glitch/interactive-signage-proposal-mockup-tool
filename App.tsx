@@ -78,7 +78,7 @@ const createDefaultCanvas = (index: number): Canvas => ({
     sheetNumber: `A-${100 + index + 1}`
 });
 
-export type ToolMode = 'select' | 'draw_line' | 'draw_box' | 'calibrate' | 'calibrate_plane';
+export type ToolMode = 'select' | 'pan' | 'draw_line' | 'draw_box' | 'calibrate' | 'calibrate_plane';
 
 const DEFAULT_FIELDS: TitleBlockField[] = [
     { id: '1', label: 'PROJECT TITLE', value: 'FASCIA SIGNAGE PROPOSAL', section: 'project' },

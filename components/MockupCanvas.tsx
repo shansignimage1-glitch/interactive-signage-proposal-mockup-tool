@@ -8,6 +8,7 @@ import { reportError } from '../services/monitoring';
 import { ZoomIn, ZoomOut, Maximize, Check, X } from 'lucide-react';
 import { ToolMode } from '../App';
 import { TITLE_BLOCK_TEMPLATES } from '../data/titleBlockTemplates';
+import { clampViewScale, viewForPinch, zoomViewAtPoint, type ViewTransform } from '../utils/viewport';
 
 interface MockupCanvasProps {
   images: AppImages;
@@ -81,8 +82,19 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
   const programRef = useRef<WebGLProgram | null>(null);
   
   // --- Viewport State (Zoom/Pan) ---
-  const [view, setView] = useState({ scale: 0.9, x: 0, y: 0 });
+  const [view, setView] = useState<ViewTransform>({ scale: 0.9, x: 0, y: 0 });
   const [baseScale, setBaseScale] = useState(1);
+  const viewRef = useRef<ViewTransform>(view);
+  const baseScaleRef = useRef(1);
+  const pendingViewRef = useRef<ViewTransform | null>(null);
+  const viewFrameRef = useRef<number | null>(null);
+  const activePointersRef = useRef<Map<number, Point>>(new Map());
+  const touchGestureRef = useRef<
+    | { mode: 'pan'; pointerId: number; start: Point; last: Point; moved: boolean }
+    | { mode: 'pinch'; pointerIds: [number, number]; startView: ViewTransform; startCentroid: Point; startDistance: number }
+    | null
+  >(null);
+  const [isNavigating, setIsNavigating] = useState(false);
 
   // Crop State
   const [cropRect, setCropRect] = useState<{ x: number, y: number, w: number, h: number } | null>(null);
@@ -170,6 +182,51 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
     }
   }, [titleBlock.viewMode, titleBlock.paperSize, titleBlock.orientation, images.backgroundSize]);
 
+  const applyView = useCallback((next: ViewTransform) => {
+    viewRef.current = next;
+    setView(next);
+  }, []);
+
+  // Pointer events can arrive faster than React should render. Keep the latest
+  // transform in a ref and commit at most once per animation frame.
+  const scheduleView = useCallback((next: ViewTransform) => {
+    viewRef.current = next;
+    pendingViewRef.current = next;
+    if (viewFrameRef.current !== null) return;
+    viewFrameRef.current = window.requestAnimationFrame(() => {
+      viewFrameRef.current = null;
+      const pending = pendingViewRef.current;
+      pendingViewRef.current = null;
+      if (pending) setView(pending);
+    });
+  }, []);
+
+  useEffect(() => () => {
+    if (viewFrameRef.current !== null) window.cancelAnimationFrame(viewFrameRef.current);
+  }, []);
+
+  const viewportSize = useCallback(() => {
+    const rect = containerRef.current?.getBoundingClientRect();
+    return { width: rect?.width ?? 0, height: rect?.height ?? 0 };
+  }, []);
+
+  const screenPoint = useCallback((clientX: number, clientY: number): Point => {
+    const rect = containerRef.current?.getBoundingClientRect();
+    return { x: clientX - (rect?.left ?? 0), y: clientY - (rect?.top ?? 0) };
+  }, []);
+
+  const zoomAt = useCallback((point: Point, requestedScale: number) => {
+    const next = zoomViewAtPoint(
+      viewRef.current,
+      requestedScale,
+      point,
+      viewportSize(),
+      getContainerSize(),
+      baseScaleRef.current,
+    );
+    applyView(next);
+  }, [applyView, getContainerSize, viewportSize]);
+
   // Escape to Cancel Drawing
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -196,14 +253,15 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
     const scale = Math.min(scaleX, scaleY) * 0.90; 
 
     setBaseScale(scale);
+    baseScaleRef.current = scale;
     
     // Reset view position and zoom
-    setView(v => ({ scale: 1, x: 0, y: 0 }));
+    applyView({ scale: 1, x: 0, y: 0 });
 
     if (titleBlock.viewMode === 'canvas') {
         setCropRect({ x: 0, y: 0, w: contentW, h: contentH });
     }
-  }, [getContainerSize, titleBlock.viewMode]);
+  }, [applyView, getContainerSize, titleBlock.viewMode]);
 
   // Re-fit when view mode or paper size changes
   useEffect(() => {
@@ -241,9 +299,10 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
     const cx = rect.width / 2;
     const cy = rect.height / 2;
     
-    const totalScale = baseScale * view.scale;
-    const offsetX = view.x;
-    const offsetY = view.y;
+    const currentView = viewRef.current;
+    const totalScale = baseScaleRef.current * currentView.scale;
+    const offsetX = currentView.x;
+    const offsetY = currentView.y;
     
     // World coordinates relative to the center of the container object (Image or Paper)
     const worldX = (screenX - cx - offsetX) / totalScale + containerSize.width / 2;
@@ -252,20 +311,161 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
     return { x: worldX, y: worldY };
   };
 
+  const isEditableAt = (world: Point, target: EventTarget | null): boolean => {
+    if (target instanceof Element && target.closest('[data-canvas-object], input, button, select, textarea')) return true;
+    if (signs.some(sign => isPointInPolygon(world, sign.corners))) return true;
+
+    const hitSlop = 14 / Math.max(0.01, baseScaleRef.current * viewRef.current.scale);
+    return state.showDimensions && dimensions.some(dim => {
+      if (dim.variant === 'box') {
+        const x = Math.min(dim.start.x, dim.end.x) - hitSlop;
+        const y = Math.min(dim.start.y, dim.end.y) - hitSlop;
+        const width = Math.abs(dim.end.x - dim.start.x) + hitSlop * 2;
+        const height = Math.abs(dim.end.y - dim.start.y) + hitSlop * 2;
+        return world.x >= x && world.x <= x + width && world.y >= y && world.y <= y + height;
+      }
+      const minX = Math.min(dim.start.x, dim.end.x) - hitSlop;
+      const maxX = Math.max(dim.start.x, dim.end.x) + hitSlop;
+      const minY = Math.min(dim.start.y, dim.end.y) - hitSlop;
+      const maxY = Math.max(dim.start.y, dim.end.y) + hitSlop;
+      return world.x >= minX && world.x <= maxX && world.y >= minY && world.y <= maxY;
+    });
+  };
+
+  const beginPinch = () => {
+    const pointers = [...activePointersRef.current.entries()];
+    if (pointers.length < 2) return;
+    const [[firstId, first], [secondId, second]] = pointers;
+    const centroid = { x: (first.x + second.x) / 2, y: (first.y + second.y) / 2 };
+    touchGestureRef.current = {
+      mode: 'pinch',
+      pointerIds: [firstId, secondId],
+      startView: { ...viewRef.current },
+      startCentroid: centroid,
+      startDistance: Math.max(1, distance(first, second)),
+    };
+    setActiveHandle(null);
+    startCornersRef.current = null;
+    startDimRef.current = null;
+    if (isDrawing || drawingStart.current) {
+      setIsDrawing(false);
+      drawingStart.current = null;
+      drawingCurrent.current = null;
+    }
+    if (toolMode === 'calibrate_plane') setPlanePoints(points => points.slice(0, -1));
+    setIsNavigating(true);
+  };
+
+  const handleTouchPointerDownCapture = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.pointerType !== 'touch') return;
+    if (e.target instanceof Element && e.target.closest('[data-canvas-ui]')) return;
+
+    const point = screenPoint(e.clientX, e.clientY);
+    activePointersRef.current.set(e.pointerId, point);
+
+    if (activePointersRef.current.size >= 2) {
+      e.preventDefault();
+      e.stopPropagation();
+      beginPinch();
+      for (const pointerId of activePointersRef.current.keys()) {
+        try { e.currentTarget.setPointerCapture(pointerId); } catch { /* pointer may already have ended */ }
+      }
+      return;
+    }
+
+    if (isCropping) return;
+    const shouldPan = toolMode === 'pan' ||
+      (toolMode === 'select' && !isEditableAt(getMousePos(e), e.target));
+    if (!shouldPan) return;
+
+    e.preventDefault();
+    e.stopPropagation();
+    try { e.currentTarget.setPointerCapture(e.pointerId); } catch { /* best effort */ }
+    touchGestureRef.current = { mode: 'pan', pointerId: e.pointerId, start: point, last: point, moved: false };
+    setIsNavigating(true);
+  };
+
+  const handleTouchPointerMoveCapture = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.pointerType !== 'touch' || !activePointersRef.current.has(e.pointerId)) return;
+    const point = screenPoint(e.clientX, e.clientY);
+    activePointersRef.current.set(e.pointerId, point);
+    const gesture = touchGestureRef.current;
+    if (!gesture) return;
+
+    e.preventDefault();
+    e.stopPropagation();
+    if (gesture.mode === 'pan') {
+      if (gesture.pointerId !== e.pointerId) return;
+      const dx = point.x - gesture.last.x;
+      const dy = point.y - gesture.last.y;
+      gesture.last = point;
+      gesture.moved = gesture.moved || distance(gesture.start, point) > 4;
+      scheduleView({ ...viewRef.current, x: viewRef.current.x + dx, y: viewRef.current.y + dy });
+      return;
+    }
+
+    const [firstId, secondId] = gesture.pointerIds;
+    const first = activePointersRef.current.get(firstId);
+    const second = activePointersRef.current.get(secondId);
+    if (!first || !second) return;
+    const centroid = { x: (first.x + second.x) / 2, y: (first.y + second.y) / 2 };
+    scheduleView(viewForPinch(
+      gesture.startView,
+      gesture.startCentroid,
+      centroid,
+      gesture.startDistance,
+      distance(first, second),
+      viewportSize(),
+      getContainerSize(),
+      baseScaleRef.current,
+    ));
+  };
+
+  const finishTouchPointer = (e: React.PointerEvent<HTMLDivElement>, cancelled: boolean) => {
+    if (e.pointerType !== 'touch') return;
+    const gesture = touchGestureRef.current;
+    activePointersRef.current.delete(e.pointerId);
+    if (!gesture) return;
+
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) e.currentTarget.releasePointerCapture(e.pointerId);
+
+    if (gesture.mode === 'pinch' && activePointersRef.current.size >= 2) {
+      beginPinch();
+      return;
+    }
+
+    if (gesture.mode === 'pinch' && activePointersRef.current.size === 1) {
+      const [pointerId, point] = [...activePointersRef.current.entries()][0];
+      touchGestureRef.current = { mode: 'pan', pointerId, start: point, last: point, moved: true };
+      return;
+    }
+
+    if (gesture.mode === 'pan' && gesture.pointerId === e.pointerId && !cancelled && !gesture.moved && toolMode === 'select') {
+      setActiveSign(null);
+      setActiveDimension('');
+    }
+    touchGestureRef.current = null;
+    if (activePointersRef.current.size === 0) setIsNavigating(false);
+  };
+
   const handleWheel = (e: React.WheelEvent) => {
     if (isCropping) return; 
     e.preventDefault();
-    const zoomIntensity = 0.001;
-    const newScale = Math.min(Math.max(0.1, view.scale - e.deltaY * zoomIntensity), 10);
-    setView(v => ({ ...v, scale: newScale }));
+    const point = screenPoint(e.clientX, e.clientY);
+    const newScale = clampViewScale(viewRef.current.scale * Math.exp(-e.deltaY * 0.0015));
+    zoomAt(point, newScale);
   };
 
   const handleContainerPointerDown = (e: React.PointerEvent) => {
-    if (e.button === 1 || e.buttons === 4 || e.shiftKey) {
+    if (e.target instanceof Element && e.target.closest('[data-canvas-ui]')) return;
+    if (toolMode === 'pan' || e.button === 1 || e.buttons === 4 || e.shiftKey) {
         e.preventDefault();
         containerRef.current?.setPointerCapture(e.pointerId);
         lastPanPos.current = { x: e.clientX, y: e.clientY };
-        setActiveHandle(-99); 
+        setActiveHandle(-99);
+        setIsNavigating(true);
         return;
     }
     if (isCropping && cropRect) {
@@ -291,7 +491,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
         const dx = e.clientX - lastPanPos.current.x;
         const dy = e.clientY - lastPanPos.current.y;
         lastPanPos.current = { x: e.clientX, y: e.clientY };
-        setView(v => ({ ...v, x: v.x + dx, y: v.y + dy }));
+        scheduleView({ ...viewRef.current, x: viewRef.current.x + dx, y: viewRef.current.y + dy });
         return;
     }
     if (isCropping && activeHandle === -10 && cropRect) {
@@ -311,8 +511,19 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
   };
 
   const handleContainerPointerUp = (e: React.PointerEvent) => {
+      if (activeHandle === -99) setIsNavigating(false);
       setActiveHandle(null);
-      containerRef.current?.releasePointerCapture(e.pointerId);
+      if (containerRef.current?.hasPointerCapture(e.pointerId)) {
+        containerRef.current.releasePointerCapture(e.pointerId);
+      }
+  };
+
+  const zoomFromCenter = (factor: number) => {
+    const viewport = viewportSize();
+    zoomAt(
+      { x: viewport.width / 2, y: viewport.height / 2 },
+      viewRef.current.scale * factor,
+    );
   };
 
   useEffect(() => {
@@ -764,6 +975,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
   const handleCanvasPointerDown = (e: React.PointerEvent) => {
       if (isCropping) return;
       if (titleBlock.viewMode === 'sheet') return; // Disable interaction in sheet view
+      if (toolMode === 'pan') return; // Let the outer viewport handler pan instead of selecting content
 
       if (e.button === 2) { if (isDrawing) { setIsDrawing(false); drawingStart.current = null; drawingCurrent.current = null; return; } }
       const pos = getMousePos(e);
@@ -855,6 +1067,16 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
     }
     
     setActiveHandle(null); startCornersRef.current = null; startDimRef.current = null;
+  };
+
+  const handleCanvasPointerCancel = (e: React.PointerEvent) => {
+    setIsDrawing(false);
+    drawingStart.current = null;
+    drawingCurrent.current = null;
+    setActiveHandle(null);
+    startCornersRef.current = null;
+    startDimRef.current = null;
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) e.currentTarget.releasePointerCapture(e.pointerId);
   };
 
   const confirmCrop = () => {
@@ -959,18 +1181,22 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
       ref={containerRef} 
       className="w-full h-full flex items-center justify-center overflow-hidden relative select-none"
       onWheel={handleWheel}
+      onPointerDownCapture={handleTouchPointerDownCapture}
+      onPointerMoveCapture={handleTouchPointerMoveCapture}
+      onPointerUpCapture={(e) => finishTouchPointer(e, false)}
+      onPointerCancelCapture={(e) => finishTouchPointer(e, true)}
       onPointerDown={handleContainerPointerDown}
       onPointerMove={handleContainerPointerMove}
       onPointerUp={handleContainerPointerUp}
-      onPointerLeave={handleContainerPointerUp}
+      onPointerCancel={handleContainerPointerUp}
       onContextMenu={(e) => e.preventDefault()}
-      style={{ touchAction: 'none', cursor: (toolMode === 'draw_line' || toolMode === 'draw_box' || toolMode === 'calibrate' || toolMode === 'calibrate_plane') ? 'crosshair' : 'default', backgroundColor: isSheetView ? '#333' : '#0a0a0a' }}
+      style={{ touchAction: 'none', cursor: isNavigating ? 'grabbing' : toolMode === 'pan' ? 'grab' : (toolMode === 'draw_line' || toolMode === 'draw_box' || toolMode === 'calibrate' || toolMode === 'calibrate_plane') ? 'crosshair' : 'default', backgroundColor: isSheetView ? '#333' : '#0a0a0a' }}
     >
       {/* Zoom Controls — offset below the user profile pill rendered by App at top-right */}
-      <div className="absolute top-20 right-4 flex flex-col gap-2 z-40">
-        <button onClick={() => setView(v => ({ ...v, scale: v.scale * 1.2 }))} className="p-2 bg-gray-800 hover:bg-gray-700 text-white rounded shadow border border-gray-600"><ZoomIn className="w-5 h-5" /></button>
-        <button onClick={() => setView(v => ({ ...v, scale: v.scale / 1.2 }))} className="p-2 bg-gray-800 hover:bg-gray-700 text-white rounded shadow border border-gray-600"><ZoomOut className="w-5 h-5" /></button>
-        <button onClick={() => setView({ scale: 1, x: 0, y: 0 })} className="p-2 bg-gray-800 hover:bg-gray-700 text-white rounded shadow border border-gray-600"><Maximize className="w-5 h-5" /></button>
+      <div data-canvas-ui className="absolute top-20 right-4 flex flex-col gap-2 z-40">
+        <button aria-label="Zoom in" title="Zoom in" onClick={() => zoomFromCenter(1.2)} className="p-3 md:p-2 bg-gray-800 hover:bg-gray-700 text-white rounded shadow border border-gray-600"><ZoomIn className="w-5 h-5" /></button>
+        <button aria-label="Zoom out" title="Zoom out" onClick={() => zoomFromCenter(1 / 1.2)} className="p-3 md:p-2 bg-gray-800 hover:bg-gray-700 text-white rounded shadow border border-gray-600"><ZoomOut className="w-5 h-5" /></button>
+        <button aria-label="Fit canvas to screen" title="Fit canvas to screen" onClick={fitToContainer} className="p-3 md:p-2 bg-gray-800 hover:bg-gray-700 text-white rounded shadow border border-gray-600"><Maximize className="w-5 h-5" /></button>
       </div>
 
       {/* Main Canvas Wrapper */}
@@ -985,10 +1211,11 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
             boxShadow: isSheetView ? '0 0 20px rgba(0,0,0,0.5)' : 'none',
             backgroundColor: '#fff' 
         }}
-        className={`relative shadow-2xl origin-center transition-transform duration-75 ease-out`}
+        className="relative shadow-2xl origin-center"
         onPointerDown={!isCropping ? handleCanvasPointerDown : undefined} 
         onPointerMove={!isCropping ? handlePointerMove : undefined}
         onPointerUp={!isCropping ? handlePointerUp : undefined}
+        onPointerCancel={!isCropping ? handleCanvasPointerCancel : undefined}
       >
         {/* Title Block Sidebar Overlay (Only in Sheet Mode) */}
         {isSheetView && (
@@ -1117,7 +1344,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
                             const w = Math.abs(dim.end.x - dim.start.x);
                             const h = Math.abs(dim.end.y - dim.start.y);
                             return (
-                                <g key={dim.id} className="pointer-events-auto" style={{ cursor: 'move' }}>
+                                <g key={dim.id} data-canvas-object className="pointer-events-auto" style={{ cursor: 'move' }}>
                                     <rect x={minX} y={minY} width={w} height={h} fill={isActive ? "rgba(59, 130, 246, 0.2)" : "rgba(255, 255, 255, 0.1)"} stroke={dimColor} strokeWidth={strokeWidth} strokeDasharray="4 2" />
                                     {isActive && !isSheetView && toolMode === 'select' && (
                                         <>
@@ -1145,7 +1372,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
                             };
 
                             return (
-                                <g key={dim.id} className="pointer-events-auto" style={{ cursor: 'move' }}>
+                                <g key={dim.id} data-canvas-object className="pointer-events-auto" style={{ cursor: 'move' }}>
                                     <line x1={dim.start.x} y1={dim.start.y} x2={dim.end.x} y2={dim.end.y} stroke={dimColor} strokeWidth={strokeWidth} />
                                     <path d={drawArrow(dim.start.x, dim.start.y, angle + Math.PI)} fill={dimColor} />
                                     <path d={drawArrow(dim.end.x, dim.end.y, angle)} fill={dimColor} />
@@ -1247,15 +1474,15 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
                         {activeSign.corners.map((p, i) => {
                         const isActive = activeHandle === i;
                         return (
-                            <div key={i} className={`absolute rounded-full border-2 transition-all duration-150 cursor-move pointer-events-auto flex items-center justify-center ${isActive ? 'bg-blue-100 border-blue-600 shadow-[0_0_15px_rgba(59,130,246,1)]' : 'bg-white border-blue-500 hover:bg-blue-50 shadow-md'}`} style={{ left: p.x, top: p.y, width: '16px', height: '16px', transform: `translate(-50%, -50%) scale(${isActive ? 1.25 * handleScale : handleScale})`, zIndex: isActive ? 50 : 30, touchAction: 'none' }} 
+                        <div key={i} data-canvas-object className={`absolute rounded-full border-2 transition-all duration-150 cursor-move pointer-events-auto flex items-center justify-center ${isActive ? 'bg-blue-100 border-blue-600 shadow-[0_0_15px_rgba(59,130,246,1)]' : 'bg-white border-blue-500 hover:bg-blue-50 shadow-md'}`} style={{ left: p.x, top: p.y, width: '16px', height: '16px', transform: `translate(-50%, -50%) scale(${isActive ? 1.25 * handleScale : handleScale})`, zIndex: isActive ? 50 : 30, touchAction: 'none' }}
                                  onPointerDown={handlePointerDown(i)} onPointerMove={handlePointerMove} onPointerUp={handlePointerUp} 
                                  onPointerEnter={() => setHoveredHandle(i)} onPointerLeave={() => setHoveredHandle(null)} />
                         );
                         })}
-                        <div className={`absolute rounded-full border-2 flex items-center justify-center cursor-move transition-all duration-150 backdrop-blur-sm pointer-events-auto ${activeHandle === 4 ? 'bg-white/40 border-white shadow-[0_0_20px_rgba(255,255,255,0.8)]' : 'bg-white/20 border-white/50 hover:bg-white/30 shadow-lg'}`} style={{ left: activeSignCenter.x, top: activeSignCenter.y, width: '32px', height: '32px', transform: `translate(-50%, -50%) scale(${activeHandle === 4 ? 1.1 * handleScale : handleScale})`, zIndex: activeHandle === 4 ? 40 : 25, touchAction: 'none' }} 
+                        <div data-canvas-object className={`absolute rounded-full border-2 flex items-center justify-center cursor-move transition-all duration-150 backdrop-blur-sm pointer-events-auto ${activeHandle === 4 ? 'bg-white/40 border-white shadow-[0_0_20px_rgba(255,255,255,0.8)]' : 'bg-white/20 border-white/50 hover:bg-white/30 shadow-lg'}`} style={{ left: activeSignCenter.x, top: activeSignCenter.y, width: '32px', height: '32px', transform: `translate(-50%, -50%) scale(${activeHandle === 4 ? 1.1 * handleScale : handleScale})`, zIndex: activeHandle === 4 ? 40 : 25, touchAction: 'none' }}
                              onPointerDown={handlePointerDown(4)} onPointerMove={handlePointerMove} onPointerUp={handlePointerUp} 
                              onPointerEnter={() => setHoveredHandle(4)} onPointerLeave={() => setHoveredHandle(null)}><div className={`w-1 h-1 rounded-full transition-colors ${activeHandle === 4 ? 'bg-blue-400' : 'bg-white'}`} style={{ transform: `scale(${totalScale})`}} /></div>
-                        <div className={`absolute rounded-sm border-2 flex items-center justify-center cursor-ew-resize transition-all duration-150 pointer-events-auto ${activeHandle === 5 ? 'bg-blue-100 border-blue-600 shadow-[0_0_15px_rgba(59,130,246,1)]' : 'bg-white border-blue-500 hover:bg-blue-50 shadow-md'}`} style={{ left: activeSignCenter.x + SCALE_HANDLE_OFFSET * handleScale, top: activeSignCenter.y, width: '16px', height: '16px', transform: `translate(-50%, -50%) scale(${activeHandle === 5 ? 1.25 * handleScale : handleScale})`, zIndex: activeHandle === 5 ? 40 : 25, touchAction: 'none' }} 
+                        <div data-canvas-object className={`absolute rounded-sm border-2 flex items-center justify-center cursor-ew-resize transition-all duration-150 pointer-events-auto ${activeHandle === 5 ? 'bg-blue-100 border-blue-600 shadow-[0_0_15px_rgba(59,130,246,1)]' : 'bg-white border-blue-500 hover:bg-blue-50 shadow-md'}`} style={{ left: activeSignCenter.x + SCALE_HANDLE_OFFSET * handleScale, top: activeSignCenter.y, width: '16px', height: '16px', transform: `translate(-50%, -50%) scale(${activeHandle === 5 ? 1.25 * handleScale : handleScale})`, zIndex: activeHandle === 5 ? 40 : 25, touchAction: 'none' }}
                              onPointerDown={handlePointerDown(5)} onPointerMove={handlePointerMove} onPointerUp={handlePointerUp} 
                              onPointerEnter={() => setHoveredHandle(5)} onPointerLeave={() => setHoveredHandle(null)} />
                         </>
