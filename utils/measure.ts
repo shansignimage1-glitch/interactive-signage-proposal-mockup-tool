@@ -1,5 +1,6 @@
 import { Point, Calibration, MeasureUnit, UnitSystem } from '../types';
 import { distance } from './math';
+import { computeHomography } from './math';
 
 // --- Unit conversion ---
 
@@ -19,6 +20,24 @@ export const getMmPerPx = (cal: Calibration): number | null => {
   const px = distance(cal.start, cal.end);
   if (px < 1) return null;
   return toMm(cal.realValue, cal.unit) / px;
+};
+
+const planePoint = (point: Point, cal: Calibration): Point | null => {
+  if (!cal.plane) return null;
+  const { corners, widthMm, heightMm } = cal.plane;
+  const h = computeHomography(corners, [{ x: 0, y: 0 }, { x: widthMm, y: 0 }, { x: widthMm, y: heightMm }, { x: 0, y: heightMm }]);
+  const w = h[6] * point.x + h[7] * point.y + h[8];
+  if (Math.abs(w) < 1e-9) return null;
+  return { x: (h[0] * point.x + h[1] * point.y + h[2]) / w, y: (h[3] * point.x + h[4] * point.y + h[5]) / w };
+};
+
+export const measureDistanceMm = (start: Point, end: Point, cal: Calibration): number | null => {
+  if (cal.plane) {
+    const a = planePoint(start, cal), b = planePoint(end, cal);
+    return a && b ? distance(a, b) : null;
+  }
+  const scale = getMmPerPx(cal);
+  return scale === null ? null : distance(start, end) * scale;
 };
 
 // --- Formatting ---
@@ -46,17 +65,19 @@ export const formatLength = (mm: number, system: UnitSystem): string => {
 // --- Measuring drawn shapes ---
 
 export const measureLine = (start: Point, end: Point, cal: Calibration, system: UnitSystem): string => {
-  const mmPerPx = getMmPerPx(cal);
-  if (mmPerPx === null) return '?';
-  return formatLength(distance(start, end) * mmPerPx, system);
+  const mm = measureDistanceMm(start, end, cal);
+  return mm === null ? '?' : formatLength(mm, system);
 };
 
 // Box dimensions read as "width × height"
 export const measureBox = (start: Point, end: Point, cal: Calibration, system: UnitSystem): string => {
-  const mmPerPx = getMmPerPx(cal);
-  if (mmPerPx === null) return '?';
-  const w = Math.abs(end.x - start.x) * mmPerPx;
-  const h = Math.abs(end.y - start.y) * mmPerPx;
+  if (cal.plane) {
+    const a = planePoint(start, cal), b = planePoint(end, cal);
+    if (!a || !b) return '?';
+    return `${formatLength(Math.abs(b.x - a.x), system)} × ${formatLength(Math.abs(b.y - a.y), system)}`;
+  }
+  const mmPerPx = getMmPerPx(cal); if (mmPerPx === null) return '?';
+  const w = Math.abs(end.x - start.x) * mmPerPx, h = Math.abs(end.y - start.y) * mmPerPx;
   return `${formatLength(w, system)} × ${formatLength(h, system)}`;
 };
 

@@ -1,21 +1,22 @@
 
 import React, { useRef, useState, useEffect, useCallback } from 'react';
-import { GoogleGenAI } from "@google/genai";
 import { X, Check, Undo2, Redo2, Mic, Eraser, Loader2, Brush, Hand, ZoomIn, ZoomOut, Maximize, RotateCcw, Trash2 } from 'lucide-react';
+import { cleanupImage } from '../services/GeminiService';
+import { notify } from '../services/toast';
+import { reportError } from '../services/monitoring';
 
 interface CleanupToolProps {
   isOpen: boolean;
   imageUrl: string;
   onClose: () => void;
   onSave: (newImageUrl: string) => void;
-  apiKey: string | undefined;
 }
 
 // History stack size
 const MAX_HISTORY = 10;
 const MAX_MASK_HISTORY = 20;
 
-const CleanupTool: React.FC<CleanupToolProps> = ({ isOpen, imageUrl, onClose, onSave, apiKey }) => {
+const CleanupTool: React.FC<CleanupToolProps> = ({ isOpen, imageUrl, onClose, onSave }) => {
   const [currentImage, setCurrentImage] = useState<string>(imageUrl);
   const [history, setHistory] = useState<string[]>([imageUrl]);
   const [historyIndex, setHistoryIndex] = useState(0);
@@ -305,7 +306,7 @@ const CleanupTool: React.FC<CleanupToolProps> = ({ isOpen, imageUrl, onClose, on
   // --- Voice Input ---
   const toggleVoice = () => {
     if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
-      alert("Speech recognition is not supported in this browser.");
+      notify('Speech recognition is not supported in this browser.', 'warning');
       return;
     }
 
@@ -332,8 +333,6 @@ const CleanupTool: React.FC<CleanupToolProps> = ({ isOpen, imageUrl, onClose, on
 
   // --- Gemini Generation ---
   const handleGenerate = async () => {
-    if (!apiKey) return alert("API Key missing");
-    
     const maskCanvas = maskCanvasRef.current;
     const imgCanvas = canvasRef.current;
     if (!maskCanvas || !imgCanvas) return;
@@ -380,51 +379,32 @@ const CleanupTool: React.FC<CleanupToolProps> = ({ isOpen, imageUrl, onClose, on
         // We must draw the mask resized as well
         ctx.drawImage(maskCanvas, 0, 0, width, height);
 
-        base64Image = tempCanvas.toDataURL('image/png').split(',')[1];
+        base64Image = tempCanvas.toDataURL('image/jpeg', 0.9).split(',')[1];
         // Updated prompt for better robustness with Gemini 2.5
         finalPrompt = `Look at the image. There is a magenta (pink) colored area painted over an object. Remove the object covered by the magenta color and fill in the background naturally to match the surroundings. ${prompt ? `Additional instruction: ${prompt}` : ''}`;
       } else {
         if (!prompt.trim()) {
             setIsProcessing(false);
-            return alert("Please paint an area to remove or describe what to remove.");
+            notify('Please paint an area to remove or describe what to remove.', 'warning');
+            return;
         }
         // No mask, just prompt based
-        base64Image = tempCanvas.toDataURL('image/png').split(',')[1];
+        base64Image = tempCanvas.toDataURL('image/jpeg', 0.9).split(',')[1];
         finalPrompt = `Remove ${prompt} from the image. Fill the area naturally to match the background.`;
       }
 
-      const ai = new GoogleGenAI({ apiKey });
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash-image',
-        contents: {
-          parts: [
-            { inlineData: { data: base64Image, mimeType: 'image/png' } },
-            { text: finalPrompt }
-          ]
-        }
-      });
-
-      let newImageData = null;
-        if (response.candidates?.[0]?.content?.parts) {
-            for (const part of response.candidates[0].content.parts) {
-                if (part.inlineData) {
-                    newImageData = `data:image/png;base64,${part.inlineData.data}`;
-                    break;
-                }
-            }
-        }
+      const newImageData = await cleanupImage(base64Image, 'image/jpeg', finalPrompt);
 
       if (newImageData) {
         pushHistory(newImageData);
         setPrompt(''); 
       } else {
-        console.warn("API Response:", response);
-        alert("The AI did not return an image. It might have refused the request or encountered an error.");
+        notify('The AI did not return an image. It may have refused the request or encountered an error.', 'error');
       }
 
     } catch (e: any) {
-      console.error(e);
-      alert(`Failed to process image: ${e.message || "Unknown error"}. Try a simpler request or smaller image.`);
+      reportError('ai-cleanup', e);
+      notify(`Failed to process image: ${e.message || "Unknown error"}. Try a simpler request or smaller image.`, 'error');
     } finally {
       setIsProcessing(false);
     }
@@ -439,7 +419,7 @@ const CleanupTool: React.FC<CleanupToolProps> = ({ isOpen, imageUrl, onClose, on
       <div className="bg-gray-900 border-b border-gray-800 p-4 flex items-center justify-between shadow-md z-10">
         <h2 className="text-lg font-semibold text-white flex items-center gap-2">
           <Eraser className="w-5 h-5 text-blue-400" />
-          Magic Clean Up <span className="text-xs font-normal text-gray-500 bg-gray-800 px-2 py-0.5 rounded border border-gray-700">Gemini 2.5</span>
+          Magic Clean Up <span className="text-xs font-normal text-gray-500 bg-gray-800 px-2 py-0.5 rounded border border-gray-700">Secure AI</span>
         </h2>
         <div className="flex gap-2">
            <button onClick={handleUndo} disabled={historyIndex <= 0} className="p-2 text-gray-400 hover:text-white disabled:opacity-30" title="Undo Image">

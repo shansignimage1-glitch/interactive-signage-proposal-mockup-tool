@@ -1,36 +1,28 @@
-import { CloudProvider } from '../../types';
 import { DriveConnector } from './types';
 import { googleDriveConnector, setGoogleDriveUid } from './GoogleDriveConnector';
+import { oneDriveConnector } from './OneDriveConnector';
+import { dropboxConnector } from './DropboxConnector';
 
 export type { DriveConnector } from './types';
 export { DriveAuthError } from './types';
-
-// Placeholder connectors shown as "coming soon" — each needs its own
-// developer-app registration (Azure portal / Dropbox console) before it can
-// be implemented behind this same interface.
-const stub = (id: CloudProvider, label: string): DriveConnector => ({
-    id,
-    label,
-    available: false,
-    isConnected: () => false,
-    connect: async () => { throw new Error(`${label} support is coming soon.`); },
-    disconnect: async () => {},
-    ensureReady: async () => false,
-    uploadImage: async () => { throw new Error(`${label} support is coming soon.`); },
-    fetchImage: async () => { throw new Error(`${label} support is coming soon.`); },
-    deleteImage: async () => {},
-});
+export { getPreferredProvider, setPreferredProvider } from './providerState';
+import { getPreferredProvider, getProviderForRef } from './providerState';
 
 export const connectors: DriveConnector[] = [
     googleDriveConnector,
-    stub('onedrive', 'OneDrive'),
-    stub('dropbox', 'Dropbox'),
+    oneDriveConnector,
+    dropboxConnector,
 ];
 
 /** The connector currently holding the user's images, or null when none is
  *  connected (Firebase Storage fallback applies). */
 export const getActiveConnector = (): DriveConnector | null =>
-    connectors.find(c => c.available && c.isConnected()) ?? null;
+    connectors.find(c => c.id === getPreferredProvider() && c.available && c.isConnected()) ?? null;
+
+export const getConnectorForRef = (ref: string): DriveConnector | null => {
+    const id = getProviderForRef(ref);
+    return id ? connectors.find(connector => connector.id === id) ?? null : null;
+};
 
 /** Scope per-user caches (e.g. the Drive hash→fileId map) to the signed-in uid. */
 export const setConnectorUid = (uid: string | null) => {

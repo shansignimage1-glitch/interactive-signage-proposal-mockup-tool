@@ -1,34 +1,34 @@
 
 import React, { useState, useCallback, useRef, useEffect, Suspense } from 'react';
 import { auth, googleProvider } from './firebase';
+import { getIdTokenResult, getRedirectResult, onAuthStateChanged, signInWithPopup, signInWithRedirect, signOut } from 'firebase/auth';
 
 import ControlsPanel from './components/ControlsPanel';
 import MockupCanvas from './components/MockupCanvas';
-// Lazy-loaded: these pull in @google/genai / extra UI chrome that most sessions
-// never touch, so they shouldn't sit in the initial bundle.
+// Lazy-loaded: these features are only downloaded when opened.
 const CleanupTool = React.lazy(() => import('./components/CleanupTool'));
 const Assistant = React.lazy(() => import('./components/Assistant'));
 const ProjectManager = React.lazy(() => import('./components/ProjectManager'));
 const ElementStudio = React.lazy(() => import('./components/ElementStudio'));
 const DriveSettings = React.lazy(() => import('./components/DriveSettings'));
-import { MockupState, AppImages, Point, Sign, Dimension, TitleBlock, TitleBlockField, Canvas, Calibration, MeasureUnit, SignElement, Size, ConnectorStatus } from './types';
-import { getActiveConnector, setConnectorUid, connectors } from './services/driveConnectors';
+const AccountSettings = React.lazy(() => import('./components/AccountSettings'));
+import { MockupState, AppImages, Point, Sign, Dimension, TitleBlock, TitleBlockField, Canvas, Calibration, MeasureUnit, SignElement, Size, ConnectorStatus, CloudProvider } from './types';
+import { getActiveConnector, getPreferredProvider, setConnectorUid, connectors, getConnectorForRef } from './services/driveConnectors';
 import { distance } from './utils/math';
 import { measureLine, measureBox, getMmPerPx } from './utils/measure';
+import { normalizeProjectState } from './utils/projectMigration';
 import CalibrationModal from './components/CalibrationModal';
+import PerspectiveCalibrationModal from './components/PerspectiveCalibrationModal';
 import { TITLE_BLOCK_TEMPLATES } from './data/titleBlockTemplates';
 import { StorageService } from './services/StorageService';
-import { Wifi, WifiOff, RefreshCw, LogIn, LogOut, Loader2, AlertTriangle, User as UserIcon, HardDrive, Database, KeyRound, X as XIcon } from 'lucide-react';
-
-// Declare globals for UMD libraries
-declare global {
-  interface Window {
-    html2canvas: any;
-    jspdf: any;
-  }
-}
+import { Wifi, WifiOff, RefreshCw, LogIn, LogOut, Loader2, AlertTriangle, User as UserIcon, HardDrive, Database, Settings } from 'lucide-react';
+import { notify } from './services/toast';
+import { reportError, reportWarning } from './services/monitoring';
+import { captureElement } from './utils/exportCapture';
+import { optimizeImageFile } from './services/imageProcessing';
 
 const GUEST_PROJECT_ID_KEY = 'signagepro_guest_project_id';
+const DEFAULT_AVATAR = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='32' height='32'%3E%3Crect width='32' height='32' rx='16' fill='%23374151'/%3E%3Ccircle cx='16' cy='12' r='5' fill='%239ca3af'/%3E%3Cpath d='M7 29c1-7 5-10 9-10s8 3 9 10' fill='%239ca3af'/%3E%3C/svg%3E";
 
 // Demo images — building facade + a clean SVG sign face
 const DEFAULT_BG ='https://images.unsplash.com/photo-1486325212027-8081e485255e?w=1920&h=1080&fit=crop&auto=format&q=80';
@@ -67,7 +67,7 @@ const createDefaultCanvas = (index: number): Canvas => ({
     sheetNumber: `A-${100 + index + 1}`
 });
 
-export type ToolMode = 'select' | 'draw_line' | 'draw_box' | 'calibrate';
+export type ToolMode = 'select' | 'draw_line' | 'draw_box' | 'calibrate' | 'calibrate_plane';
 
 const DEFAULT_FIELDS: TitleBlockField[] = [
     { id: '1', label: 'PROJECT TITLE', value: 'FASCIA SIGNAGE PROPOSAL', section: 'project' },
@@ -136,6 +136,8 @@ const App: React.FC = () => {
   
   // Track sync status beyond just boolean
   const [syncStatus, setSyncStatus] = useState<'synced' | 'local_only' | 'error'>('synced');
+  const [lastCloudSavedAt, setLastCloudSavedAt] = useState<number | null>(null);
+  const [syncConflict, setSyncConflict] = useState(false);
   
   // History for Undo/Redo
   const [history, setHistory] = useState<MockupState[]>([state]);
@@ -147,32 +149,26 @@ const App: React.FC = () => {
   const [toolMode, setToolMode] = useState<ToolMode>('select');
   // Reference line drawn in calibrate mode, awaiting its real-world length via modal
   const [pendingCalibration, setPendingCalibration] = useState<{ start: Point; end: Point } | null>(null);
+  const [pendingPlaneCalibration, setPendingPlaneCalibration] = useState<[Point, Point, Point, Point] | null>(null);
   const [isCropping, setIsCropping] = useState(false);
   const [showCleanupTool, setShowCleanupTool] = useState(false);
   const [showElementStudio, setShowElementStudio] = useState(false);
   const [showAssistant, setShowAssistant] = useState(false);
   const [showProjectManager, setShowProjectManager] = useState(false);
-  const [showApiKeyModal, setShowApiKeyModal] = useState(false);
   const [showDriveSettings, setShowDriveSettings] = useState(false);
+  const [showAccountSettings, setShowAccountSettings] = useState(false);
   const [driveStatus, setDriveStatus] = useState<ConnectorStatus>('disconnected');
   const [driveNeedsReconnect, setDriveNeedsReconnect] = useState(false);
-  const [geminiKey, setGeminiKey] = useState<string>(() => localStorage.getItem('gemini_api_key') ?? '');
-  const effectiveApiKey = geminiKey.trim() || process.env.API_KEY;
+  const [driveReconnectProvider, setDriveReconnectProvider] = useState<CloudProvider | null>(null);
   
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const stateRef = useRef(state);
   useEffect(() => { stateRef.current = state; }, [state]);
 
-  // Projects saved before newer fields existed need defaults filled in on load
-  const normalizeState = (s: MockupState): MockupState => ({
-      ...s,
-      unitSystem: s.unitSystem ?? 'metric',
-  });
-
   // Start a fresh session: replace state AND the undo history so undo can
   // never step back into a pre-login (user: null) state
   const startSession = useCallback((state: MockupState) => {
-      const newState = normalizeState(state);
+      const newState = normalizeProjectState(state);
       setState(newState);
       setHistory([newState]);
       setHistoryIndex(0);
@@ -218,7 +214,7 @@ const App: React.FC = () => {
   // Surface any error from a completed redirect sign-in (e.g. unauthorized
   // domain). On success, onAuthStateChanged below picks up the user.
   useEffect(() => {
-    auth.getRedirectResult().catch((err: any) => {
+    getRedirectResult(auth).catch((err: any) => {
       setAuthError(err?.message ?? 'Sign-in failed after returning from Google.');
       setIsAuthLoading(false);
     });
@@ -226,13 +222,15 @@ const App: React.FC = () => {
 
   // --- Auth & Data Loading ---
   useEffect(() => {
-    const unsubscribe = auth.onAuthStateChanged(async (firebaseUser) => {
+    const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
       if (firebaseUser) {
+        const token = await getIdTokenResult(firebaseUser);
         const user = {
           uid: firebaseUser.uid,
           displayName: firebaseUser.displayName,
           email: firebaseUser.email,
           photoURL: firebaseUser.photoURL,
+          isAdmin: token.claims.admin === true,
         };
         // Scope drive-connector caches to this user and reflect connection state
         setConnectorUid(user.uid);
@@ -241,9 +239,10 @@ const App: React.FC = () => {
         const projects = await StorageService.listProjectsCloud(user.uid);
         if (projects.length > 0) {
           const latest = projects.sort((a, b) => (b.lastModified ?? 0) - (a.lastModified ?? 0))[0];
-          const loaded = await StorageService.loadProjectCloud(user.uid, latest.id, ({ needsReconnect }) => {
+          const loaded = await StorageService.loadProjectCloud(user.uid, latest.id, ({ needsReconnect, failedRefs }) => {
             if (needsReconnect) {
               setDriveNeedsReconnect(true);
+              setDriveReconnectProvider(failedRefs[0] ? getConnectorForRef(failedRefs[0])?.id ?? null : null);
               setDriveStatus('expired');
             }
           });
@@ -268,11 +267,13 @@ const App: React.FC = () => {
   // Re-open the current project after the user reconnects their drive, so
   // unresolved gdrive:// refs get another chance to materialize.
   const handleDriveReconnect = async () => {
-    const gdrive = connectors.find(c => c.id === 'google_drive')!;
+    const connector = connectors.find(c => c.id === (driveReconnectProvider ?? getPreferredProvider()));
+    if (!connector) return;
     try {
-      await gdrive.connect(); // user gesture — popup allowed
+      await connector.connect(); // user gesture — popup/redirect allowed
       setDriveStatus('connected');
       setDriveNeedsReconnect(false);
+      setDriveReconnectProvider(null);
       const current = stateRef.current;
       if (current.user && !current.user.uid.startsWith('guest_')) {
         const reloaded = await StorageService.loadProjectCloud(current.user.uid, current.projectId);
@@ -281,7 +282,8 @@ const App: React.FC = () => {
         }
       }
     } catch (e) {
-      console.warn('Drive reconnect failed:', e);
+      reportError('drive-refresh', e, { provider: connector.id });
+      notify(`Could not reconnect ${connector.label}. Please try again.`, 'error');
     }
   };
 
@@ -291,7 +293,7 @@ const App: React.FC = () => {
     // iOS/Safari: go straight to redirect — popups don't work there.
     if (prefersRedirectSignIn()) {
       try {
-        await auth.signInWithRedirect(googleProvider);
+        await signInWithRedirect(auth, googleProvider);
       } catch (err: any) {
         setAuthError(err?.message ?? 'Sign-in failed. Please try again.');
       }
@@ -301,7 +303,7 @@ const App: React.FC = () => {
     // Everywhere else: try the popup, but fall back to redirect if it's blocked
     // or unsupported (some in-app/embedded browsers).
     try {
-      await auth.signInWithPopup(googleProvider);
+      await signInWithPopup(auth, googleProvider);
       // onAuthStateChanged above handles the rest
     } catch (err: any) {
       const code = err?.code ?? '';
@@ -312,7 +314,7 @@ const App: React.FC = () => {
         code === 'auth/operation-not-supported-in-this-environment';
       if (popupFailed) {
         try {
-          await auth.signInWithRedirect(googleProvider);
+          await signInWithRedirect(auth, googleProvider);
         } catch (err2: any) {
           setAuthError(err2?.message ?? 'Sign-in failed. Please try again.');
         }
@@ -323,7 +325,7 @@ const App: React.FC = () => {
   };
 
   const handleLogout = async () => {
-    await auth.signOut();
+    await signOut(auth);
     setState(getInitialState());
   };
 
@@ -344,18 +346,52 @@ const App: React.FC = () => {
           
           if (result === 'local') {
               setSyncStatus('local_only');
+          } else if (result === 'queued') {
+              setSyncStatus('local_only');
+              notify('Saved offline. Cloud sync will resume when a connection is available.', 'info');
+          } else if (result === 'conflict') {
+              setSyncStatus('error');
+              setSyncConflict(true);
+              notify('This project changed on another device. Choose which copy to keep.', 'warning');
           } else if (result === 'cloud') {
               setSyncStatus('synced');
+              setLastCloudSavedAt(Date.now());
+          } else {
+              setSyncStatus('error');
+              reportWarning('sync', 'Project save returned an error', { projectId: currentState.projectId });
           }
+      }).catch(error => {
+          updateState({ isSyncing: false });
+          setSyncStatus('error');
+          reportError('sync', error, { projectId: currentState.projectId });
       });
   }, [updateState]);
+
+  const keepLocalConflictCopy = async () => {
+      if (!state.user) return;
+      const result = await StorageService.saveProject(state.user.uid, state, false, true);
+      if (result === 'cloud') {
+          setSyncConflict(false); setSyncStatus('synced'); setLastCloudSavedAt(Date.now());
+          notify('This device copy replaced the cloud version.', 'success');
+      }
+  };
+
+  const loadCloudConflictCopy = async () => {
+      if (!state.user) return;
+      const remote = await StorageService.loadProjectCloud(state.user.uid, state.projectId);
+      if (remote) {
+          startSession({ ...remote, user: state.user, isOnline: navigator.onLine, isSyncing: false });
+          setSyncConflict(false); setSyncStatus('synced');
+          notify('Loaded the newer cloud version.', 'success');
+      }
+  };
 
   // Online/Offline Listeners
   useEffect(() => {
       const handleOnline = () => {
           updateState({ isOnline: true });
           if (stateRef.current.user && !stateRef.current.user.uid.startsWith('guest_')) {
-             triggerBackendSync(stateRef.current);
+             void StorageService.flushSyncQueue(stateRef.current.user.uid).finally(() => triggerBackendSync(stateRef.current));
           }
       };
       const handleOffline = () => updateState({ isOnline: false });
@@ -456,7 +492,7 @@ const App: React.FC = () => {
 
   const deleteActiveCanvas = () => {
       if (state.canvases.length <= 1) {
-          alert("Project must have at least one view.");
+          notify('Project must have at least one view.', 'warning');
           return;
       }
       const newCanvases = state.canvases.filter(c => c.id !== state.activeCanvasId);
@@ -593,6 +629,14 @@ const App: React.FC = () => {
       setToolMode('select');
   };
 
+  const confirmPlaneCalibration = (widthMm: number, heightMm: number) => {
+      if (!pendingPlaneCalibration) return;
+      const [start, end] = pendingPlaneCalibration;
+      const calibration: Calibration = { start, end, realValue: widthMm, unit: 'mm', plane: { corners: pendingPlaneCalibration, widthMm, heightMm } };
+      updateActiveCanvasWithHistory({ calibration });
+      setPendingPlaneCalibration(null); setToolMode('select');
+  };
+
   // --- Per-Element Extrusion (Element Studio) ---
   const applySignElements = (elements: SignElement[] | undefined, sourceSize: Size | undefined) => {
       const prev = stateRef.current;
@@ -648,32 +692,32 @@ const App: React.FC = () => {
   }, [updateActiveCanvas]);
 
   // --- Upload Handlers ---
-  const handleImageUpload = (file: File, type: 'background' | 'foreground' | 'logo') => {
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      if (e.target?.result && typeof e.target.result === 'string') {
+  const handleImageUpload = async (file: File, type: 'background' | 'foreground' | 'logo') => {
+    try {
+      const result = await optimizeImageFile(file, type === 'background' ? 4096 : 3072);
         if (type === 'background') {
           const img = new Image();
           img.onload = () => {
              updateActiveCanvas({
-                 backgroundImage: e.target!.result as string,
+                 backgroundImage: result,
                  backgroundSize: { width: img.width, height: img.height },
                  calibration: null // new photo, old scale no longer applies
              });
           }
-          img.src = e.target.result;
+          img.src = result;
         } else if (type === 'logo') {
            // Use functional setState so we never close over a stale titleBlock
-           setState(prev => ({ ...prev, titleBlock: { ...prev.titleBlock, logoImage: e.target!.result as string } }));
+           setState(prev => ({ ...prev, titleBlock: { ...prev.titleBlock, logoImage: result } }));
         } else {
            if (activeCanvas?.activeSignId) {
              // New artwork invalidates detected element contours
-             updateActiveSign({ image: e.target.result as string, elements: undefined, elementsSourceSize: undefined });
+             updateActiveSign({ image: result, elements: undefined, elementsSourceSize: undefined });
            }
         }
-      }
-    };
-    reader.readAsDataURL(file);
+    } catch (error) {
+      reportError('image-import', error, { bytes: file.size, type: file.type });
+      notify(error instanceof Error ? error.message : 'Could not process this image.', 'error');
+    }
   };
 
   const handleCrop = (newImageUrl: string, cropOffset: Point, newSize: { width: number, height: number }) => {
@@ -692,7 +736,8 @@ const App: React.FC = () => {
     const newCalibration = activeCanvas.calibration ? {
         ...activeCanvas.calibration,
         start: { x: activeCanvas.calibration.start.x - cropOffset.x, y: activeCanvas.calibration.start.y - cropOffset.y },
-        end: { x: activeCanvas.calibration.end.x - cropOffset.x, y: activeCanvas.calibration.end.y - cropOffset.y }
+        end: { x: activeCanvas.calibration.end.x - cropOffset.x, y: activeCanvas.calibration.end.y - cropOffset.y },
+        plane: activeCanvas.calibration.plane ? { ...activeCanvas.calibration.plane, corners: activeCanvas.calibration.plane.corners.map(p => ({ x: p.x - cropOffset.x, y: p.y - cropOffset.y })) as [Point, Point, Point, Point] } : undefined
     } : activeCanvas.calibration;
     updateActiveCanvasWithHistory({
         backgroundImage: newImageUrl,
@@ -719,35 +764,20 @@ const App: React.FC = () => {
       img.src = newImageUrl;
   };
   
-  const handleDownload = async () => {
+  const handleDownload = async (destination: 'device' | 'drive' = 'device') => {
     const element = document.getElementById('export-target');
-    if (!element || !window.html2canvas || !window.jspdf) return;
+    if (!element) return;
 
     const prevCursor = document.body.style.cursor;
     document.body.style.cursor = 'wait';
 
     try {
-        const canvas = await window.html2canvas(element, {
-            useCORS: true,
-            allowTaint: true,
-            backgroundColor: null,
-            scale: 2, 
-            logging: false,
-            onclone: (clonedDoc: Document) => {
-                const clonedElement = clonedDoc.getElementById('export-target');
-                if (clonedElement) {
-                    clonedElement.style.transform = 'none';
-                    clonedElement.style.margin = '0';
-                    clonedElement.style.boxShadow = 'none'; 
-                }
-            }
-        });
+        const [{ jsPDF }, canvas] = await Promise.all([import('jspdf'), captureElement(element, 2)]);
 
         const imgData = canvas.toDataURL('image/png');
 
         if (state.titleBlock.viewMode === 'sheet') {
             const { paperSize, orientation } = state.titleBlock;
-            const { jsPDF } = window.jspdf;
             const pdf = new jsPDF({
                 orientation: orientation,
                 unit: 'mm',
@@ -758,16 +788,31 @@ const App: React.FC = () => {
             const pdfHeight = pdf.internal.pageSize.getHeight();
             
             pdf.addImage(imgData, 'PNG', 0, 0, pdfWidth, pdfHeight);
-            pdf.save(`${activeCanvas.sheetNumber || 'presentation'}.pdf`);
+            const fileName = `${activeCanvas.sheetNumber || 'presentation'}.pdf`;
+            if (destination === 'drive') {
+                const connector = getActiveConnector();
+                if (!connector || !(await connector.ensureReady(true))) throw new Error('Connect and select a cloud drive first.');
+                await connector.uploadFile(pdf.output('blob'), fileName);
+                notify(`${fileName} saved to ${connector.label}.`, 'success');
+            } else pdf.save(fileName);
         } else {
-            const link = document.createElement('a');
-            link.href = imgData;
-            link.download = `${activeCanvas.name || 'mockup'}.png`;
-            link.click();
+            const fileName = `${activeCanvas.name || 'mockup'}.png`;
+            if (destination === 'drive') {
+                const connector = getActiveConnector();
+                if (!connector || !(await connector.ensureReady(true))) throw new Error('Connect and select a cloud drive first.');
+                const blob = await (await fetch(imgData)).blob();
+                await connector.uploadFile(blob, fileName);
+                notify(`${fileName} saved to ${connector.label}.`, 'success');
+            } else {
+                const link = document.createElement('a');
+                link.href = imgData;
+                link.download = fileName;
+                link.click();
+            }
         }
     } catch (error) {
-        console.error("Export failed:", error);
-        alert("Export failed. Please check console for details.");
+        reportError('export', error, { destination, projectId: state.projectId });
+        notify(error instanceof Error ? error.message : 'Export failed. Please try again.', 'error');
     } finally {
         document.body.style.cursor = prevCursor;
     }
@@ -777,7 +822,7 @@ const App: React.FC = () => {
       // Ensure user context is preserved if needed, though loaded state should have data
       // We might want to keep the current session user info if the loaded project was anonymous
       const mergedState = {
-          ...normalizeState(loadedState),
+          ...normalizeProjectState(loadedState),
           user: state.user // Keep current user
       };
       setState(mergedState);
@@ -797,11 +842,11 @@ const App: React.FC = () => {
       // Capture a thumbnail from the current canvas
       let thumbnail = undefined;
       const element = document.getElementById('export-target');
-      if (element && window.html2canvas) {
+      if (element) {
            try {
-               const canvas = await window.html2canvas(element, { scale: 0.2, logging: false, useCORS: true });
+               const canvas = await captureElement(element, 0.2);
                thumbnail = canvas.toDataURL('image/jpeg', 0.7);
-           } catch (e) { console.warn("Thumbnail generation failed", e); }
+           } catch (e) { reportWarning('thumbnail', 'Thumbnail generation failed', { error: String(e) }); }
       }
 
       await StorageService.saveProjectLocal(newState, thumbnail);
@@ -886,6 +931,11 @@ const App: React.FC = () => {
                   <RefreshCw className="w-3 h-3 animate-spin" /> Syncing...
               </div>
           )}
+          {lastCloudSavedAt && syncStatus === 'synced' && !state.isSyncing && !state.user.uid.startsWith('guest_') && (
+              <div className="bg-gray-800/90 text-gray-300 px-3 py-1 rounded-full text-xs font-medium shadow-lg backdrop-blur" title={new Date(lastCloudSavedAt).toLocaleString()}>
+                  Cloud saved {new Date(lastCloudSavedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+              </div>
+          )}
           {/* New Status for Local Only Mode due to large payload */}
           {syncStatus === 'local_only' && !state.user.uid.startsWith('guest_') && (
               <div className="bg-green-600/90 text-white px-3 py-1 rounded-full text-xs font-bold flex items-center gap-1 shadow-lg backdrop-blur" title="Project saved to local database.">
@@ -894,59 +944,33 @@ const App: React.FC = () => {
           )}
           {driveNeedsReconnect && (
               <div className="bg-amber-600/95 text-white px-3 py-1 rounded-full text-xs font-bold flex items-center gap-2 shadow-lg backdrop-blur pointer-events-auto">
-                  <HardDrive className="w-3 h-3" /> Some images are in your Google Drive
+                  <HardDrive className="w-3 h-3" /> Some images need {driveReconnectProvider ? connectors.find(c => c.id === driveReconnectProvider)?.label : 'your selected cloud drive'}
                   <button onClick={handleDriveReconnect} className="underline hover:text-amber-100">Reconnect</button>
+              </div>
+          )}
+          {syncConflict && (
+              <div className="bg-red-700/95 text-white px-3 py-1 rounded-full text-xs font-bold flex items-center gap-2 pointer-events-auto">
+                  <AlertTriangle className="w-3 h-3" /> Project changed elsewhere
+                  <button className="underline" onClick={loadCloudConflictCopy}>Load cloud</button>
+                  <button className="underline" onClick={keepLocalConflictCopy}>Keep this device</button>
               </div>
           )}
       </div>
 
       {/* User Profile / Logout (Top Right) */}
       <div className="absolute top-4 right-4 z-50 flex items-center gap-3 bg-gray-900/80 backdrop-blur p-1 pr-3 rounded-full border border-gray-700">
-          <img src={state.user.photoURL || 'https://via.placeholder.com/32'} className="w-8 h-8 rounded-full border border-gray-600" alt="User" />
+          <img src={state.user.photoURL || DEFAULT_AVATAR} className="w-8 h-8 rounded-full border border-gray-600" alt="User" />
           <span className="text-xs font-medium text-gray-300 hidden md:block">{state.user.displayName}</span>
           {!state.user.uid.startsWith('guest_') && (
               <button onClick={() => setShowDriveSettings(true)} className={`p-1.5 rounded-full transition-colors ${driveStatus === 'connected' ? 'text-green-400 hover:bg-green-500/20' : driveStatus === 'expired' ? 'text-amber-400 hover:bg-amber-500/20' : 'text-gray-400 hover:bg-blue-500/20 hover:text-blue-400'}`} title={driveStatus === 'connected' ? 'Cloud drive connected' : 'Connect your cloud drive'}>
                   <HardDrive className="w-4 h-4" />
               </button>
           )}
-          <button onClick={() => setShowApiKeyModal(true)} className={`p-1.5 rounded-full transition-colors ${geminiKey.trim() ? 'text-green-400 hover:bg-green-500/20' : 'text-yellow-400 hover:bg-yellow-500/20'}`} title={geminiKey.trim() ? 'Gemini API Key set (your key)' : 'Set your Gemini API Key'}>
-              <KeyRound className="w-4 h-4" />
-          </button>
+          {!state.user.uid.startsWith('guest_') && <button onClick={() => setShowAccountSettings(true)} className="p-1.5 text-gray-400 hover:bg-gray-700 hover:text-white rounded-full" title="Account and data"><Settings className="w-4 h-4" /></button>}
           <button onClick={handleLogout} className="p-1.5 hover:bg-red-500/20 hover:text-red-400 text-gray-400 rounded-full transition-colors" title="Sign Out">
               <LogOut className="w-4 h-4" />
           </button>
       </div>
-
-      {/* Gemini API Key Modal */}
-      {showApiKeyModal && (
-          <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-[200] flex items-center justify-center p-4" onClick={() => setShowApiKeyModal(false)}>
-              <div className="bg-gray-900 border border-gray-700 rounded-2xl shadow-2xl p-6 w-full max-w-md" onClick={e => e.stopPropagation()}>
-                  <div className="flex items-center justify-between mb-4">
-                      <h2 className="text-white font-bold text-lg flex items-center gap-2"><KeyRound className="w-5 h-5 text-yellow-400" /> Gemini AI Settings</h2>
-                      <button onClick={() => setShowApiKeyModal(false)} className="text-gray-400 hover:text-white"><XIcon className="w-5 h-5" /></button>
-                  </div>
-                  <p className="text-gray-400 text-sm mb-4">
-                      Enter your own <strong className="text-white">Google Gemini API key</strong> to use AI features (Pro Guide &amp; Magic Cleanup) on your own quota. Leave blank to use the shared key (Sign Image account).
-                  </p>
-                  <input
-                      type="password"
-                      placeholder="AIza..."
-                      value={geminiKey}
-                      onChange={e => setGeminiKey(e.target.value)}
-                      className="w-full bg-gray-800 border border-gray-600 text-white px-3 py-2 rounded-lg text-sm font-mono mb-4 focus:outline-none focus:border-blue-500"
-                  />
-                  <div className="flex gap-2">
-                      <button onClick={() => { localStorage.setItem('gemini_api_key', geminiKey.trim()); setShowApiKeyModal(false); }} className="flex-1 bg-blue-600 hover:bg-blue-500 text-white py-2 rounded-lg text-sm font-semibold transition-colors">Save Key</button>
-                      {geminiKey.trim() && (
-                          <button onClick={() => { setGeminiKey(''); localStorage.removeItem('gemini_api_key'); }} className="px-4 bg-gray-700 hover:bg-gray-600 text-red-400 py-2 rounded-lg text-sm transition-colors">Clear</button>
-                      )}
-                  </div>
-                  {!geminiKey.trim() && !process.env.API_KEY && (
-                      <p className="text-red-400 text-xs mt-3 flex items-center gap-1"><AlertTriangle className="w-3 h-3" /> No key available — AI features will be disabled.</p>
-                  )}
-              </div>
-          </div>
-      )}
 
       {/* Calibration: real-world length entry for the drawn reference line */}
       {pendingCalibration && (
@@ -957,9 +981,10 @@ const App: React.FC = () => {
               onCancel={cancelCalibration}
           />
       )}
+      {pendingPlaneCalibration && <PerspectiveCalibrationModal onConfirm={confirmPlaneCalibration} onCancel={() => setPendingPlaneCalibration(null)} />}
 
       <Suspense fallback={null}>
-        <Assistant isOpen={showAssistant} setIsOpen={setShowAssistant} apiKey={effectiveApiKey} />
+        <Assistant isOpen={showAssistant} setIsOpen={setShowAssistant} />
       </Suspense>
       
       <ControlsPanel
@@ -1024,6 +1049,7 @@ const App: React.FC = () => {
            onDrawComplete={handleDrawComplete}
            calibration={activeCanvas.calibration ?? null}
            onCalibrateComplete={handleCalibrateComplete}
+           onPlaneCalibrateComplete={setPendingPlaneCalibration}
            updateSignById={updateSignById}
            setActiveSign={setActiveSign}
            updateDimension={updateDimension}
@@ -1055,7 +1081,6 @@ const App: React.FC = () => {
              imageUrl={activeCanvas.backgroundImage}
              onClose={() => setShowCleanupTool(false)}
              onSave={handleCleanupSave}
-             apiKey={effectiveApiKey}
           />
         </Suspense>
       )}
@@ -1071,6 +1096,10 @@ const App: React.FC = () => {
              }}
           />
         </Suspense>
+      )}
+
+      {showAccountSettings && !state.user.uid.startsWith('guest_') && (
+        <Suspense fallback={null}><AccountSettings user={state.user} onClose={() => setShowAccountSettings(false)} onAccountDeleted={() => { setShowAccountSettings(false); setState(getInitialState()); }} /></Suspense>
       )}
 
       {showElementStudio && (() => {

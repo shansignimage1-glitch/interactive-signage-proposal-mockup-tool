@@ -1,5 +1,7 @@
 import { db, storage } from '../firebase';
-import { SignTemplate } from '../types';
+import { addDoc, collection, deleteDoc, doc, getDocs, limit, query, setDoc, where } from 'firebase/firestore';
+import { deleteObject, getDownloadURL, ref as storageRef, uploadBytes } from 'firebase/storage';
+import { SignTemplate, SignType } from '../types';
 import { hashDataUri, dataUriToBlob } from './imageHash';
 import { resolveRef, isDriveRef } from './AssetResolver';
 
@@ -12,9 +14,7 @@ import { resolveRef, isDriveRef } from './AssetResolver';
 //     each user's personal templates.
 // Images are stored as Storage download URLs, so <img> can hot-link them.
 
-export const ADMIN_EMAIL = 'shansignimage1@gmail.com';
-export const isLibraryAdmin = (email?: string | null): boolean =>
-    !!email && email.toLowerCase() === ADMIN_EMAIL;
+export const isLibraryAdmin = (user?: { isAdmin?: boolean } | null): boolean => user?.isAdmin === true;
 
 const SHARED_COLLECTION = 'library';
 const PERSONAL_COLLECTION = 'userLibrary';
@@ -25,6 +25,10 @@ export interface NewTemplateInput {
     widthMm: number;
     heightMm: number;
     dataUri: string;
+    brand?: string;
+    tags?: string[];
+    signType?: SignType;
+    rightsNote?: string;
 }
 
 let sharedCache: SignTemplate[] | null = null;
@@ -40,15 +44,21 @@ const docToTemplate = (id: string, d: any, source: 'shared' | 'personal'): SignT
     source,
     storagePath: d.storagePath,
     ownerUid: d.ownerUid,
+    brand: d.brand,
+    tags: d.tags ?? [],
+    signType: d.signType,
+    rightsNote: d.rightsNote,
+    version: d.version ?? 1,
+    updatedAt: d.updatedAt,
 });
 
 const uploadLibraryImage = async (storagePath: string, dataUri: string): Promise<string> => {
-    const ref = storage.ref(storagePath);
+    const imageRef = storageRef(storage, storagePath);
     try {
-        return await ref.getDownloadURL(); // content-addressed: may already exist
+        return await getDownloadURL(imageRef); // content-addressed: may already exist
     } catch {
-        await ref.put(dataUriToBlob(dataUri));
-        return await ref.getDownloadURL();
+        await uploadBytes(imageRef, dataUriToBlob(dataUri));
+        return await getDownloadURL(imageRef);
     }
 };
 
@@ -71,7 +81,7 @@ export const LibraryService = {
 
     listShared: async (): Promise<SignTemplate[]> => {
         if (sharedCache) return sharedCache;
-        const snapshot = await db.collection(SHARED_COLLECTION).limit(200).get();
+        const snapshot = await getDocs(query(collection(db, SHARED_COLLECTION), limit(200)));
         sharedCache = snapshot.docs
             .map(doc => docToTemplate(doc.id, doc.data(), 'shared'))
             .sort((a, b) => a.name.localeCompare(b.name));
@@ -81,10 +91,7 @@ export const LibraryService = {
     listPersonal: async (uid: string): Promise<SignTemplate[]> => {
         if (uid.startsWith('guest_')) return [];
         // No orderBy — avoids needing a composite index; sort client-side
-        const snapshot = await db.collection(PERSONAL_COLLECTION)
-            .where('ownerUid', '==', uid)
-            .limit(200)
-            .get();
+        const snapshot = await getDocs(query(collection(db, PERSONAL_COLLECTION), where('ownerUid', '==', uid), limit(200)));
         return snapshot.docs
             .map(doc => docToTemplate(doc.id, doc.data(), 'personal'))
             .sort((a, b) => a.name.localeCompare(b.name));
@@ -105,16 +112,17 @@ export const LibraryService = {
             storagePath,
             ownerUid: uid,
             createdAt: Date.now(),
+            brand: input.brand ?? '', tags: input.tags ?? [], signType: input.signType ?? 'fascia_non_ill', rightsNote: input.rightsNote ?? '', version: 1, updatedAt: Date.now(),
         };
-        await db.collection(PERSONAL_COLLECTION).doc(docId).set(data);
+        await setDoc(doc(db, PERSONAL_COLLECTION, docId), data);
         return docToTemplate(docId, data, 'personal');
     },
 
     deletePersonal: async (template: SignTemplate): Promise<void> => {
         if (!template.docId) return;
-        await db.collection(PERSONAL_COLLECTION).doc(template.docId).delete();
+        await deleteDoc(doc(db, PERSONAL_COLLECTION, template.docId));
         if (template.storagePath) {
-            await storage.ref(template.storagePath).delete()
+            await deleteObject(storageRef(storage, template.storagePath))
                 .catch(e => console.warn('Library image delete skipped:', e));
         }
     },
@@ -133,17 +141,36 @@ export const LibraryService = {
             imageUrl,
             storagePath,
             createdAt: Date.now(),
+            brand: input.brand ?? '', tags: input.tags ?? [], signType: input.signType ?? 'fascia_non_ill', rightsNote: input.rightsNote ?? '', version: 1, updatedAt: Date.now(),
         };
-        const docRef = await db.collection(SHARED_COLLECTION).add(data);
+        const docRef = await addDoc(collection(db, SHARED_COLLECTION), data);
         sharedCache = null; // refetch next time
         return docToTemplate(docRef.id, data, 'shared');
     },
 
+    updateShared: async (template: SignTemplate, input: NewTemplateInput): Promise<SignTemplate> => {
+        if (!template.docId) throw new Error('Template document is missing');
+        const replacingImage = input.dataUri.startsWith('data:');
+        const hash = replacingImage ? await hashDataUri(input.dataUri) : null;
+        const storagePath = hash ? `library/${hash}` : template.storagePath;
+        const imageUrl = hash ? await uploadLibraryImage(storagePath!, input.dataUri) : template.image;
+        const data: Record<string, unknown> = {
+            name: input.name, category: input.category, widthMm: input.widthMm, heightMm: input.heightMm,
+            imageUrl, brand: input.brand ?? '', tags: input.tags ?? [], signType: input.signType ?? 'fascia_non_ill',
+            rightsNote: input.rightsNote ?? '', version: (template.version ?? 1) + 1, updatedAt: Date.now(),
+        };
+        if (storagePath) data.storagePath = storagePath;
+        await setDoc(doc(db, SHARED_COLLECTION, template.docId), data, { merge: true });
+        if (replacingImage && template.storagePath && template.storagePath !== storagePath) await deleteObject(storageRef(storage, template.storagePath)).catch(() => undefined);
+        sharedCache = null;
+        return docToTemplate(template.docId, data, 'shared');
+    },
+
     deleteShared: async (template: SignTemplate): Promise<void> => {
         if (!template.docId) return;
-        await db.collection(SHARED_COLLECTION).doc(template.docId).delete();
+        await deleteDoc(doc(db, SHARED_COLLECTION, template.docId));
         if (template.storagePath) {
-            await storage.ref(template.storagePath).delete()
+            await deleteObject(storageRef(storage, template.storagePath))
                 .catch(e => console.warn('Library image delete skipped:', e));
         }
         sharedCache = null;

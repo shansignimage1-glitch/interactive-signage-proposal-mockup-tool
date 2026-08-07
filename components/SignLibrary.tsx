@@ -1,8 +1,8 @@
 
 import React, { useState, useEffect, useMemo } from 'react';
 import { BRANDS } from '../data/brands';
-import { Dimension, SignTemplate, Sign, UserProfile } from '../types';
-import { Sparkles, X, LayoutGrid, Loader2, User as UserIcon, Trash2, UploadCloud, BookmarkPlus, Globe, LogIn } from 'lucide-react';
+import { Dimension, SignTemplate, Sign, UserProfile, SIGN_TYPES, SignType } from '../types';
+import { Sparkles, X, LayoutGrid, Loader2, User as UserIcon, Trash2, UploadCloud, BookmarkPlus, Globe, LogIn, Search, Pencil } from 'lucide-react';
 import { LibraryService, isLibraryAdmin, materializeDataUri, NewTemplateInput } from '../services/LibraryService';
 
 interface SignLibraryProps {
@@ -28,12 +28,17 @@ const SignLibrary: React.FC<SignLibraryProps> = ({ isOpen, onClose, onSelect, ac
   const [isLoadingCloud, setIsLoadingCloud] = useState(false);
   const [cloudError, setCloudError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null); // template id or action key
+  const [query, setQuery] = useState('');
+  const [categoryFilter, setCategoryFilter] = useState('All');
+  const [page, setPage] = useState(1);
+
+  useEffect(() => { setPage(1); }, [tab, selectedBrandId]);
 
   // Save/upload form state (used by both "save active sign" and file upload)
-  const [form, setForm] = useState<{ dataUri: string; name: string; category: string; widthMm: number; heightMm: number; publishShared: boolean } | null>(null);
+  const [form, setForm] = useState<{ dataUri: string; name: string; category: string; widthMm: number; heightMm: number; publishShared: boolean; brand: string; tags: string; rightsNote: string; signType: SignType; editing?: SignTemplate } | null>(null);
 
   const isGuest = !user || user.uid.startsWith('guest_');
-  const admin = isLibraryAdmin(user?.email);
+  const admin = isLibraryAdmin(user);
 
   const SHARED_BRAND_ID = '__shared__';
 
@@ -97,6 +102,7 @@ const SignLibrary: React.FC<SignLibraryProps> = ({ isOpen, onClose, onSelect, ac
         widthMm: 2000,
         heightMm: 500,
         publishShared: false,
+        brand: '', tags: '', rightsNote: '', signType: activeSign.signType,
       });
     } catch (e: any) {
       setCloudError(e?.message ?? 'Could not read the sign image');
@@ -115,6 +121,7 @@ const SignLibrary: React.FC<SignLibraryProps> = ({ isOpen, onClose, onSelect, ac
         widthMm: 2000,
         heightMm: 500,
         publishShared: false,
+        brand: '', tags: '', rightsNote: '', signType: 'fascia_non_ill',
       });
     };
     reader.readAsDataURL(file);
@@ -130,9 +137,13 @@ const SignLibrary: React.FC<SignLibraryProps> = ({ isOpen, onClose, onSelect, ac
       widthMm: form.widthMm,
       heightMm: form.heightMm,
       dataUri: form.dataUri,
+      brand: form.brand.trim(), tags: form.tags.split(',').map(t => t.trim()).filter(Boolean), rightsNote: form.rightsNote.trim(), signType: form.signType,
     };
     try {
-      if (form.publishShared && admin) {
+      if (form.editing && admin) {
+        const t = await LibraryService.updateShared(form.editing, input);
+        setShared(prev => prev.map(x => x.id === t.id ? t : x).sort((a, b) => a.name.localeCompare(b.name)));
+      } else if (form.publishShared && admin) {
         const t = await LibraryService.saveToShared(input);
         setShared(prev => [...prev.filter(x => x.id !== t.id), t].sort((a, b) => a.name.localeCompare(b.name)));
       } else {
@@ -169,6 +180,19 @@ const SignLibrary: React.FC<SignLibraryProps> = ({ isOpen, onClose, onSelect, ac
   const selectedBrand = BRANDS.find(b => b.id === selectedBrandId);
   const catalogTemplates = selectedBrandId === SHARED_BRAND_ID ? shared : (selectedBrand?.templates ?? []);
   const catalogTitle = selectedBrandId === SHARED_BRAND_ID ? 'Shared Library' : `${selectedBrand?.name} Catalog`;
+  const currentTemplates = tab === 'catalog' ? catalogTemplates : personal;
+  const filteredTemplates = currentTemplates.filter(template => {
+    const haystack = [template.name, template.category, template.brand, ...(template.tags ?? [])].join(' ').toLowerCase();
+    return (!query || haystack.includes(query.toLowerCase())) && (categoryFilter === 'All' || template.category === categoryFilter);
+  });
+  const pageSize = 12;
+  const pageCount = Math.max(1, Math.ceil(filteredTemplates.length / pageSize));
+  const visibleTemplates = filteredTemplates.slice((page - 1) * pageSize, page * pageSize);
+
+  const editShared = (template: SignTemplate) => setForm({
+    dataUri: template.image, name: template.name, category: template.category, widthMm: template.width, heightMm: template.height,
+    publishShared: true, brand: template.brand ?? '', tags: (template.tags ?? []).join(', '), rightsNote: template.rightsNote ?? '', signType: template.signType ?? 'fascia_non_ill', editing: template,
+  });
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
@@ -198,7 +222,7 @@ const SignLibrary: React.FC<SignLibraryProps> = ({ isOpen, onClose, onSelect, ac
                         Save Current Sign
                     </button>
                 )}
-                <button onClick={onClose} className="p-2 text-gray-400 hover:text-white hover:bg-gray-700 rounded-full">
+                <button onClick={onClose} aria-label="Close asset library" className="p-2 text-gray-400 hover:text-white hover:bg-gray-700 rounded-full">
                     <X className="w-5 h-5" />
                 </button>
             </div>
@@ -254,6 +278,10 @@ const SignLibrary: React.FC<SignLibraryProps> = ({ isOpen, onClose, onSelect, ac
 
             {/* Main Content */}
             <div className="flex-1 overflow-y-auto p-6 bg-gray-900">
+                <div className="flex gap-2 mb-5">
+                    <div className="relative flex-1"><Search className="absolute left-3 top-2.5 w-4 h-4 text-gray-500" /><input value={query} onChange={e => { setQuery(e.target.value); setPage(1); }} placeholder="Search name, brand or tag" className="w-full bg-gray-800 border border-gray-700 rounded-lg pl-9 pr-3 py-2 text-sm text-white" /></div>
+                    <select value={categoryFilter} onChange={e => { setCategoryFilter(e.target.value); setPage(1); }} className="bg-gray-800 border border-gray-700 rounded-lg px-3 text-sm text-white"><option>All</option>{CATEGORY_OPTIONS.map(c => <option key={c}>{c}</option>)}</select>
+                </div>
 
                 {/* Suggestions */}
                 {suggestions.length > 0 && (
@@ -280,12 +308,13 @@ const SignLibrary: React.FC<SignLibraryProps> = ({ isOpen, onClose, onSelect, ac
                             <p className="text-sm text-gray-500">No shared templates yet.{admin ? ' Use "Save Current Sign" and tick "Publish to shared library" to add the first one.' : ''}</p>
                         )}
                         <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
-                            {catalogTemplates.map((template) => (
+                            {visibleTemplates.map((template) => (
                                 <TemplateCard
                                     key={template.id}
                                     template={template}
                                     onClick={() => onSelect(template)}
                                     onDelete={admin && template.source === 'shared' ? () => handleDelete(template) : undefined}
+                                    onEdit={admin && template.source === 'shared' ? () => editShared(template) : undefined}
                                     deleting={busy === template.id}
                                 />
                             ))}
@@ -312,7 +341,7 @@ const SignLibrary: React.FC<SignLibraryProps> = ({ isOpen, onClose, onSelect, ac
                                         onChange={e => { const f = e.target.files?.[0]; if (f) handleUploadFile(f); e.target.value = ''; }}
                                     />
                                 </label>
-                                {personal.map((template) => (
+                                {visibleTemplates.map((template) => (
                                     <TemplateCard
                                         key={template.id}
                                         template={template}
@@ -328,6 +357,10 @@ const SignLibrary: React.FC<SignLibraryProps> = ({ isOpen, onClose, onSelect, ac
                         )}
                     </div>
                 )}
+                {!isLoadingCloud && currentTemplates.length > 0 && filteredTemplates.length === 0 && (
+                    <p className="text-center text-sm text-gray-500 py-12">No templates match this search or category.</p>
+                )}
+                {filteredTemplates.length > pageSize && <div className="flex justify-center items-center gap-3 mt-6"><button disabled={page <= 1} onClick={() => setPage(p => p - 1)} className="px-3 py-1 bg-gray-800 rounded disabled:opacity-30">Previous</button><span className="text-xs text-gray-400">{page} / {pageCount}</span><button disabled={page >= pageCount} onClick={() => setPage(p => p + 1)} className="px-3 py-1 bg-gray-800 rounded disabled:opacity-30">Next</button></div>}
             </div>
         </div>
 
@@ -335,7 +368,7 @@ const SignLibrary: React.FC<SignLibraryProps> = ({ isOpen, onClose, onSelect, ac
         {form && (
             <div className="absolute inset-0 z-10 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4" onClick={() => setForm(null)}>
                 <div className="bg-gray-900 border border-gray-700 rounded-2xl shadow-2xl p-5 w-full max-w-md" onClick={e => e.stopPropagation()}>
-                    <h3 className="text-white font-bold mb-4 flex items-center gap-2"><BookmarkPlus className="w-5 h-5 text-purple-400" /> Save to Library</h3>
+                    <h3 className="text-white font-bold mb-4 flex items-center gap-2"><BookmarkPlus className="w-5 h-5 text-purple-400" /> {form.editing ? 'Edit Library Template' : 'Save to Library'}</h3>
                     <div className="aspect-video bg-gray-800 rounded-lg mb-4 flex items-center justify-center p-3 border border-gray-700">
                         <img src={form.dataUri} alt="" className="max-w-full max-h-full object-contain" />
                     </div>
@@ -370,6 +403,10 @@ const SignLibrary: React.FC<SignLibraryProps> = ({ isOpen, onClose, onSelect, ac
                             />
                         </div>
                         <p className="text-[10px] text-gray-500 -mt-1">Category · Width (mm) · Height (mm)</p>
+                        <input value={form.brand} onChange={e => setForm({ ...form, brand: e.target.value })} placeholder="Brand" className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white" />
+                        <input value={form.tags} onChange={e => setForm({ ...form, tags: e.target.value })} placeholder="Tags, comma separated" className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white" />
+                        <input value={form.rightsNote} onChange={e => setForm({ ...form, rightsNote: e.target.value })} placeholder="Artwork usage rights / license note" className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white" />
+                        <select value={form.signType} onChange={e => setForm({ ...form, signType: e.target.value as SignType })} className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white">{SIGN_TYPES.map(type => <option key={type.value} value={type.value}>{type.label}</option>)}</select>
                         {admin && (
                             <label className="flex items-center gap-2 text-xs text-gray-300">
                                 <input
@@ -400,7 +437,7 @@ const SignLibrary: React.FC<SignLibraryProps> = ({ isOpen, onClose, onSelect, ac
   );
 };
 
-const TemplateCard: React.FC<{ template: SignTemplate, onClick: () => void, isSuggestion?: boolean, onDelete?: () => void, deleting?: boolean }> = ({ template, onClick, isSuggestion, onDelete, deleting }) => (
+const TemplateCard: React.FC<{ template: SignTemplate, onClick: () => void, isSuggestion?: boolean, onDelete?: () => void, onEdit?: () => void, deleting?: boolean }> = ({ template, onClick, isSuggestion, onDelete, onEdit, deleting }) => (
     <div
         onClick={onClick}
         className={`group relative aspect-video bg-gray-800 rounded-lg border overflow-hidden cursor-pointer transition-all hover:scale-[1.02] ${isSuggestion ? 'border-yellow-500/50 ring-1 ring-yellow-500/20' : 'border-gray-700 hover:border-blue-500'}`}
@@ -418,12 +455,13 @@ const TemplateCard: React.FC<{ template: SignTemplate, onClick: () => void, isSu
         {onDelete && (
             <button
                 onClick={e => { e.stopPropagation(); onDelete(); }}
-                className="absolute top-2 right-2 p-1.5 rounded-full bg-black/60 text-red-400 opacity-0 group-hover:opacity-100 hover:bg-red-950 transition-opacity"
+                className="absolute top-2 right-2 p-1.5 rounded-full bg-black/60 text-red-400 opacity-100 md:opacity-0 md:group-hover:opacity-100 hover:bg-red-950 transition-opacity"
                 title="Delete from library"
             >
                 {deleting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Trash2 className="w-3.5 h-3.5" />}
             </button>
         )}
+        {onEdit && <button onClick={e => { e.stopPropagation(); onEdit(); }} className="absolute top-2 left-2 p-1.5 rounded-full bg-black/60 text-blue-300 opacity-100 md:opacity-0 md:group-hover:opacity-100" title="Edit template"><Pencil className="w-3.5 h-3.5" /></button>}
     </div>
 );
 

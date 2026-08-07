@@ -1,5 +1,6 @@
-import { MockupState, GDRIVE_REF_PREFIX } from '../types';
-import { getActiveConnector, DriveAuthError } from './driveConnectors';
+import { MockupState } from '../types';
+import { getConnectorForRef, DriveAuthError } from './driveConnectors';
+import { isCloudDriveRef } from './driveConnectors/providerState';
 import { getCachedAsset, putCachedAsset } from './StorageService';
 import { hashDataUri, blobToDataUri } from './imageHash';
 
@@ -13,7 +14,7 @@ import { hashDataUri, blobToDataUri } from './imageHash';
 // re-uploads `data:` strings), so nothing is lost while disconnected.
 
 export const isDriveRef = (s: string | null | undefined): s is string =>
-    !!s && s.startsWith(GDRIVE_REF_PREFIX);
+    !!s && isCloudDriveRef(s);
 
 // dataUri-hash → ref, session-lifetime. Guarantees save-after-load is a no-op
 // even if re-encoding isn't byte-identical to the originally uploaded file.
@@ -31,7 +32,7 @@ export const resolveRef = async (ref: string): Promise<string> => {
     let blob = cached?.blob ?? null;
 
     if (!blob) {
-        const connector = getActiveConnector();
+        const connector = getConnectorForRef(ref);
         if (!connector) throw new DriveAuthError('No cloud drive connected');
         if (!(await connector.ensureReady(false))) throw new DriveAuthError();
         blob = await connector.fetchImage(ref);

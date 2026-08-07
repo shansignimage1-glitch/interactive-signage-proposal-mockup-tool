@@ -3,11 +3,13 @@ import React, { useRef, useState, useEffect } from 'react';
 import { BLEND_MODES, MockupState, Sign, Point, Dimension, SignTemplate, ReferenceImage, TitleBlockField, Canvas, PaperSize, Orientation, SIGN_TYPES, SignType, UnitSystem } from '../types';
 import { distance } from '../utils/math';
 import { getMmPerPx, formatLength, toMm, measureLine, measureBox } from '../utils/measure';
-import { Upload, Download, Sun, Moon, Move3d, Palette, Image as ImageIcon, Plus, Trash2, Layers, Eye, Copy, Box, Minus, Maximize, Ruler, ArrowRight, ArrowDown, Scissors, Check, X, Eraser, Loader2, Square, PenTool, MousePointer2, Mic, EyeOff, Undo2, Redo2, Layout, FileText, Settings, Briefcase, User, Calendar, MapPin, Notebook, Camera, Library, Sparkles, PencilLine, Grid, Save, ChevronDown, ChevronRight, Monitor, Printer, FolderOpen } from 'lucide-react';
+import { Upload, Download, Sun, Moon, Move3d, Palette, Image as ImageIcon, Plus, Trash2, Layers, Eye, Copy, Box, Minus, Maximize, Ruler, ArrowRight, ArrowDown, Scissors, Check, X, Eraser, Loader2, Square, PenTool, MousePointer2, Mic, EyeOff, Undo2, Redo2, Layout, FileText, Settings, Briefcase, User, Calendar, MapPin, Notebook, Camera, Library, Sparkles, PencilLine, Grid, Save, ChevronDown, ChevronRight, Monitor, Printer, FolderOpen, HardDrive } from 'lucide-react';
 import ImageUploader from './ImageUploader';
 import SignLibrary from './SignLibrary';
 import { ToolMode } from '../App';
 import { TITLE_BLOCK_TEMPLATES } from '../data/titleBlockTemplates';
+import { notify } from '../services/toast';
+import { optimizeDataUri } from '../services/imageProcessing';
 
 interface ControlsPanelProps {
   state: MockupState;
@@ -36,7 +38,7 @@ interface ControlsPanelProps {
   onBackgroundUpload: (file: File) => void;
   onForegroundUpload: (file: File) => void;
   onLogoUpload: (file: File) => void;
-  onDownload: () => void;
+  onDownload: (destination?: 'device' | 'drive') => void;
 
   isCropping: boolean;
   setIsCropping: (v: boolean) => void;
@@ -138,7 +140,7 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
 
   const handleVoiceInput = (target: 'dimension' | 'notes' | 'ref_note' = 'dimension') => {
     if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
-        alert("Speech recognition is not supported in this browser.");
+        notify('Speech recognition is not supported in this browser.', 'warning');
         return;
     }
 
@@ -173,7 +175,10 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
     recognition.start();
   };
 
-  const handleImageReady = (dataUrl: string) => {
+  const handleImageReady = async (rawDataUrl: string) => {
+    let dataUrl: string;
+    try { dataUrl = await optimizeDataUri(rawDataUrl, uploadTarget === 'background' ? 4096 : 3072); }
+    catch (error) { notify(error instanceof Error ? error.message : 'Could not optimize this image.', 'error'); return; }
     if (uploadTarget === 'sign') {
         let targetSignId = activeCanvas.activeSignId;
         let activeSign = activeCanvas.signs.find(s => s.id === targetSignId);
@@ -393,7 +398,7 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
           savedTemplates: [...state.savedTemplates, newTemplate],
           titleBlock: { ...state.titleBlock, style: newTemplate }
       });
-      alert("Template saved to library!");
+      notify('Template saved to library!', 'success');
   };
 
   const activeSign = activeCanvas.signs.find(s => s.id === activeCanvas.activeSignId);
@@ -645,11 +650,12 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
                     <button onClick={() => setToolMode('draw_line')} className={`flex-1 flex items-center justify-center p-2 rounded gap-2 text-xs transition-colors ${toolMode === 'draw_line' ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white'}`}><PenTool className="w-4 h-4" /> Line</button>
                     <button onClick={() => setToolMode('draw_box')} className={`flex-1 flex items-center justify-center p-2 rounded gap-2 text-xs transition-colors ${toolMode === 'draw_box' ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white'}`}><Square className="w-4 h-4" /> Box</button>
                     <button onClick={() => setToolMode('calibrate')} className={`flex-1 flex items-center justify-center p-2 rounded gap-2 text-xs transition-colors ${toolMode === 'calibrate' ? 'bg-amber-600 text-white' : 'text-gray-400 hover:text-white'}`} title="Draw over a known-size object to set the real-world scale"><Ruler className="w-4 h-4" /> Scale</button>
+                    <button onClick={() => setToolMode('calibrate_plane')} className={`flex-1 flex items-center justify-center p-2 rounded gap-1 text-xs transition-colors ${toolMode === 'calibrate_plane' ? 'bg-amber-600 text-white' : 'text-gray-400 hover:text-white'}`} title="Tap wall corners clockwise: top-left, top-right, bottom-right, bottom-left"><Grid className="w-4 h-4" /> Plane</button>
                 </div>
                 {calibration && mmPerPx ? (
                     <div className="flex items-center justify-between text-xs bg-amber-500/10 border border-amber-500/30 rounded-lg px-2 py-1.5">
                         <span className="text-amber-300 font-mono truncate">
-                            1px ≈ {mmPerPx >= 10 ? `${(mmPerPx / 10).toFixed(1)}cm` : `${mmPerPx.toFixed(1)}mm`} · ref {calibration.realValue}{calibration.unit}
+                            {calibration.plane ? `Perspective plane ${Math.round(calibration.plane.widthMm)}×${Math.round(calibration.plane.heightMm)}mm` : `1px ≈ ${mmPerPx >= 10 ? `${(mmPerPx / 10).toFixed(1)}cm` : `${mmPerPx.toFixed(1)}mm`} · ref ${calibration.realValue}${calibration.unit}`}
                         </span>
                         <button onClick={() => updateActiveCanvasWithHistory({ calibration: null })} className="text-amber-400 hover:text-red-400 ml-2 flex-shrink-0" title="Clear scale">
                             <X className="w-3.5 h-3.5" />
@@ -1173,12 +1179,17 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
 
         <div className="p-4 md:p-6 border-t border-gray-700 bg-gray-800 flex-shrink-0">
           <button
-            onClick={onDownload}
+            onClick={() => onDownload('device')}
             className="w-full flex items-center justify-center gap-2 bg-blue-600 hover:bg-blue-500 text-white py-3 rounded-lg font-semibold transition-colors shadow-lg shadow-blue-900/20"
           >
             <Download className="w-5 h-5" />
-            Export PDF/PNG
+            Download PDF/PNG to device
           </button>
+          {!state.user?.uid.startsWith('guest_') && (
+            <button onClick={() => onDownload('drive')} className="w-full mt-2 flex items-center justify-center gap-2 bg-gray-700 hover:bg-gray-600 text-white py-2.5 rounded-lg text-sm font-semibold transition-colors border border-gray-600">
+              <HardDrive className="w-4 h-4" /> Save PDF/PNG to selected drive
+            </button>
+          )}
         </div>
       </div>
 

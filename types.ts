@@ -94,6 +94,11 @@ export interface Calibration {
   end: Point;
   realValue: number; // e.g. 85.6
   unit: MeasureUnit; // e.g. 'mm'
+  plane?: {
+    corners: [Point, Point, Point, Point]; // TL, TR, BR, BL on one wall plane
+    widthMm: number;
+    heightMm: number;
+  };
 }
 
 export interface Revision {
@@ -179,6 +184,7 @@ export interface UserProfile {
   displayName: string | null;
   email: string | null;
   photoURL: string | null;
+  isAdmin?: boolean;
 }
 
 export interface MockupState {
@@ -204,6 +210,7 @@ export interface MockupState {
   
   // Sync & Connectivity
   lastSaved: number; // Timestamp
+  cloudRevision?: number; // optimistic-concurrency base revision
   isOnline: boolean;
   isSyncing: boolean;
 }
@@ -249,6 +256,12 @@ export interface SignTemplate {
   docId?: string;       // Firestore doc id (for delete)
   storagePath?: string; // Firebase Storage path of the image (for delete)
   ownerUid?: string;    // personal templates only
+  brand?: string;
+  tags?: string[];
+  signType?: SignType;
+  rightsNote?: string;
+  version?: number;
+  updatedAt?: number;
 }
 
 export interface Brand {
@@ -266,5 +279,7 @@ export type CloudProvider = 'google_drive' | 'dropbox' | 'onedrive';
 // opaque refs (e.g. "gdrive://<fileId>") instead of https URLs; the
 // AssetResolver materializes them back into data URIs at load time.
 export const GDRIVE_REF_PREFIX = 'gdrive://';
+export const ONEDRIVE_REF_PREFIX = 'onedrive://';
+export const DROPBOX_REF_PREFIX = 'dropbox://';
 
 export type ConnectorStatus = 'disconnected' | 'connected' | 'expired';

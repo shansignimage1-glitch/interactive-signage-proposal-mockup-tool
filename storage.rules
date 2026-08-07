@@ -12,12 +12,12 @@ service firebase.storage {
                          && request.auth.uid == userId;
     }
 
-    // Shared sign library images: readable by any signed-in user, writable
-    // only by the app owner.
+    // Shared sign library images: readable by signed-in users and writable by
+    // users carrying the server-issued admin custom claim.
     match /library/{allPaths=**} {
       allow read: if request.auth != null;
       allow write: if request.auth != null
-                   && request.auth.token.email == 'shansignimage1@gmail.com';
+                   && request.auth.token.admin == true;
     }
 
     // Deny everything else by default

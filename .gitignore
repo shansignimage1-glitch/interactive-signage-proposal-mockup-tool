@@ -8,6 +8,10 @@ pnpm-debug.log*
 lerna-debug.log*
 
 node_modules
+coverage/
+playwright-report/
+test-results/
+.firebase/
 dist
 dist-ssr
 *.local
@@ -29,3 +33,4 @@ dist-ssr
 *.sw?
 
 .vercel
+.serena/

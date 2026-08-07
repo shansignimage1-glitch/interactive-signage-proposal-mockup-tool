@@ -1,20 +1,35 @@
 import path from 'path';
-import { defineConfig, loadEnv } from 'vite';
+import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
+import { VitePWA } from 'vite-plugin-pwa';
 
-export default defineConfig(({ mode }) => {
-    const env = loadEnv(mode, '.', '');
+export default defineConfig(() => {
     return {
       server: {
         port: 3000,
         host: '0.0.0.0',
       },
-      plugins: [react(), tailwindcss()],
-      define: {
-        'process.env.API_KEY': JSON.stringify(env.GEMINI_API_KEY),
-        'process.env.GEMINI_API_KEY': JSON.stringify(env.GEMINI_API_KEY)
-      },
+      plugins: [
+        react(), tailwindcss(),
+        VitePWA({
+          registerType: 'autoUpdate',
+          includeAssets: ['icon.svg'],
+          manifest: {
+            name: 'SignagePro', short_name: 'SignagePro',
+            description: 'Offline-first signage proposal and measurement tool',
+            theme_color: '#111827', background_color: '#030712', display: 'standalone',
+            start_url: '/', scope: '/', orientation: 'any',
+            icons: [{ src: '/icon.svg', sizes: 'any', type: 'image/svg+xml', purpose: 'any maskable' }],
+          },
+          workbox: {
+            navigateFallback: '/index.html',
+            globPatterns: ['**/*.{js,css,html,svg,png,woff2}'],
+            maximumFileSizeToCacheInBytes: 1_500_000,
+            cleanupOutdatedCaches: true,
+          },
+        }),
+      ],
       resolve: {
         alias: {
           '@': path.resolve(__dirname, '.'),
@@ -27,8 +42,7 @@ export default defineConfig(({ mode }) => {
             // chunks instead of one 1.3MB+ bundle — browsers can cache these
             // separately from app code that changes every deploy.
             manualChunks: {
-              firebase: ['firebase/compat/app', 'firebase/compat/auth', 'firebase/compat/firestore', 'firebase/compat/storage'],
-              genai: ['@google/genai'],
+              firebase: ['firebase/app', 'firebase/auth', 'firebase/firestore', 'firebase/storage'],
               'lucide-react': ['lucide-react'],
             },
           },

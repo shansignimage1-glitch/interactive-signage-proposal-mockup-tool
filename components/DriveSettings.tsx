@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { ConnectorStatus } from '../types';
-import { connectors, DriveConnector } from '../services/driveConnectors';
+import { connectors, DriveConnector, getPreferredProvider, setPreferredProvider } from '../services/driveConnectors';
 import { X, HardDrive, Check, Loader2, Unplug, CloudOff } from 'lucide-react';
 
 interface DriveSettingsProps {
@@ -25,6 +25,7 @@ const DriveSettings: React.FC<DriveSettingsProps> = ({ isOpen, onClose, onStatus
     setError(null);
     try {
       await connector.connect();
+      setPreferredProvider(connector.id);
       onStatusChange('connected');
     } catch (e: any) {
       setError(e?.message ?? 'Connection failed.');
@@ -64,9 +65,11 @@ const DriveSettings: React.FC<DriveSettingsProps> = ({ isOpen, onClose, onStatus
             <span className="text-gray-200 font-semibold"> "SignagePro" </span>
             folder there. When no drive is connected, photos are stored with the app.
           </p>
+          <p className="text-xs text-amber-300/80 bg-amber-950/30 border border-amber-900 rounded-lg p-2">Disconnecting revokes this app's access. Files already created in your SignagePro folder remain in the provider until you delete the project data or remove those files yourself.</p>
 
           {connectors.map(connector => {
             const connected = connector.available && connector.isConnected();
+            const preferred = getPreferredProvider() === connector.id;
             const busy = busyId === connector.id;
             return (
               <div
@@ -82,7 +85,8 @@ const DriveSettings: React.FC<DriveSettingsProps> = ({ isOpen, onClose, onStatus
                     {connected && (
                       <p className="text-[11px] text-green-400 flex items-center gap-1"><Check className="w-3 h-3" /> Connected</p>
                     )}
-                    {!connector.available && <p className="text-[11px] text-gray-600">Coming soon</p>}
+                    {connected && preferred && <p className="text-[11px] text-blue-400">Selected for new files</p>}
+                    {!connector.available && <p className="text-[11px] text-amber-600">OAuth setup required</p>}
                   </div>
                 </div>
 
@@ -90,12 +94,15 @@ const DriveSettings: React.FC<DriveSettingsProps> = ({ isOpen, onClose, onStatus
                   busy ? (
                     <Loader2 className="w-4 h-4 text-blue-400 animate-spin" />
                   ) : connected ? (
-                    <button
-                      onClick={() => handleDisconnect(connector)}
-                      className="text-xs flex items-center gap-1 text-red-400 hover:text-red-300 bg-gray-900 border border-gray-700 px-3 py-1.5 rounded-lg"
-                    >
-                      <Unplug className="w-3 h-3" /> Disconnect
-                    </button>
+                    <div className="flex gap-1">
+                      {!preferred && <button onClick={() => { setPreferredProvider(connector.id); onStatusChange('connected'); setVersion(v => v + 1); }} className="text-xs text-blue-300 bg-blue-950 border border-blue-800 px-2 py-1.5 rounded-lg">Use</button>}
+                      <button
+                        onClick={() => handleDisconnect(connector)}
+                        className="text-xs flex items-center gap-1 text-red-400 hover:text-red-300 bg-gray-900 border border-gray-700 px-3 py-1.5 rounded-lg"
+                      >
+                        <Unplug className="w-3 h-3" /> Disconnect
+                      </button>
+                    </div>
                   ) : (
                     <button
                       onClick={() => handleConnect(connector)}

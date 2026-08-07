@@ -138,6 +138,7 @@ const ElementStudio: React.FC<ElementStudioProps> = ({ sign, quadWidthMm, unitSy
                       key={el.id}
                       d={contoursToPath(el.contours)}
                       fill={`hsla(${hue}, 90%, 60%, ${selected ? 0.5 : el.enabled ? 0.22 : 0.06})`}
+                      fillRule="evenodd"
                       stroke={`hsl(${hue}, 90%, ${selected ? 70 : 55}%)`}
                       strokeWidth={selected ? imgSize.width * 0.004 : imgSize.width * 0.002}
                       style={{ cursor: 'pointer' }}

@@ -3,6 +3,8 @@ import React, { useState, useEffect } from 'react';
 import { StorageService } from '../services/StorageService';
 import { ProjectMetadata, MockupState } from '../types';
 import { Save, FolderOpen, Trash2, X, Plus, Clock, FileImage, Layout, Loader2 } from 'lucide-react';
+import { notify } from '../services/toast';
+import { reportError } from '../services/monitoring';
 
 interface ProjectManagerProps {
     isOpen: boolean;
@@ -60,7 +62,8 @@ const ProjectManager: React.FC<ProjectManagerProps> = ({ isOpen, onClose, curren
                 onClose();
             }
         } catch (e) {
-            alert("Failed to load project.");
+            reportError('project-load', e, { id });
+            notify('Failed to load project.', 'error');
         } finally {
             setIsLoading(false);
         }

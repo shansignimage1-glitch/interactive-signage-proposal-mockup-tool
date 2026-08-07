@@ -1,0 +1,10 @@
+import React, { useState } from 'react';
+import { X } from 'lucide-react';
+import { MeasureUnit } from '../types';
+import { toMm } from '../utils/measure';
+
+export default function PerspectiveCalibrationModal({ onConfirm, onCancel }: { onConfirm: (widthMm: number, heightMm: number) => void; onCancel: () => void }) {
+  const [width, setWidth] = useState('5'); const [height, setHeight] = useState('3'); const [unit, setUnit] = useState<MeasureUnit>('m');
+  const w = Number(width), h = Number(height), valid = w > 0 && h > 0;
+  return <div className="fixed inset-0 z-[210] bg-black/75 grid place-items-center p-4" onClick={onCancel}><div className="w-full max-w-md rounded-2xl border border-gray-700 bg-gray-900 p-6" onClick={e => e.stopPropagation()}><div className="flex justify-between"><h2 className="font-bold text-white">Perspective wall calibration</h2><button onClick={onCancel}><X/></button></div><p className="text-sm text-gray-400 my-4">Enter the real width and height of the four wall-plane corners you selected. Measurements inside this plane are corrected for perspective.</p><div className="grid grid-cols-3 gap-2"><input type="number" min="0" step="any" value={width} onChange={e => setWidth(e.target.value)} className="bg-gray-800 border border-gray-700 rounded p-2" aria-label="Wall width"/><input type="number" min="0" step="any" value={height} onChange={e => setHeight(e.target.value)} className="bg-gray-800 border border-gray-700 rounded p-2" aria-label="Wall height"/><select value={unit} onChange={e => setUnit(e.target.value as MeasureUnit)} className="bg-gray-800 border border-gray-700 rounded p-2"><option>mm</option><option>cm</option><option>m</option><option>in</option><option>ft</option></select></div><p className="text-xs text-gray-500 mt-2">Width · Height · Unit</p><button disabled={!valid} onClick={() => onConfirm(toMm(w, unit), toMm(h, unit))} className="mt-5 w-full bg-amber-600 disabled:opacity-40 rounded-lg py-2 font-semibold">Set perspective plane</button></div></div>;
+}

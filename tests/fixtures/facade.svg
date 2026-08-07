@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="450" viewBox="0 0 800 450">
+  <rect width="800" height="450" fill="#cbd5e1"/>
+  <rect x="80" y="80" width="640" height="320" fill="#64748b"/>
+  <rect x="320" y="210" width="160" height="190" fill="#1e293b"/>
+  <text x="400" y="150" text-anchor="middle" font-family="Arial" font-size="42" fill="white">TEST FACADE</text>
+</svg>

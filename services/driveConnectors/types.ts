@@ -27,11 +27,18 @@ export interface DriveConnector {
    *  "gdrive://<fileId>" that is persisted in project JSON. */
   uploadImage(dataUri: string, hash: string): Promise<string>;
 
+  /** Save a user-visible export (PNG/PDF) and return the provider reference. */
+  uploadFile(file: Blob, fileName: string): Promise<string>;
+
   /** Fetch the binary for a ref produced by uploadImage. */
   fetchImage(ref: string): Promise<Blob>;
 
   /** Best-effort delete (trash) of a ref's file. Must not throw. */
   deleteImage(ref: string): Promise<void>;
+
+  /** Delete every app-created image/export in this provider's app folder.
+   * Requires an active session and is only used by the explicit delete-all flow. */
+  deleteAllAppData(): Promise<void>;
 }
 
 /** Auth-shaped failure (expired/revoked token): the UI offers "reconnect"

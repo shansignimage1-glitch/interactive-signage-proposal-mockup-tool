@@ -1,6 +1,8 @@
 
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { Camera, Upload, X, Check, RotateCcw, ZoomIn, ZoomOut, Move } from 'lucide-react';
+import { notify } from '../services/toast';
+import { reportError } from '../services/monitoring';
 
 interface ImageUploaderProps {
   isOpen: boolean;
@@ -84,8 +86,8 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({ isOpen, onClose, onImageR
         }
       }, 100);
     } catch (err) {
-      console.error("Camera access denied", err);
-      alert("Could not access camera. Please allow permissions.");
+      reportError('camera', err);
+      notify('Could not access camera. Please allow camera permission and try again.', 'error');
     }
   };
 

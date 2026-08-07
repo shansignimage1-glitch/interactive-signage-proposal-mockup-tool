@@ -246,6 +246,16 @@ export const googleDriveConnector: DriveConnector = {
         return `${GDRIVE_REF_PREFIX}${fileId}`;
     },
 
+    uploadFile: async (file, fileName) => {
+        const folderId = await findOrCreateFolder();
+        const body = new FormData();
+        body.append('metadata', new Blob([JSON.stringify({ name: fileName, parents: [folderId] })], { type: 'application/json' }));
+        body.append('file', file);
+        const created = await (await driveFetch(`${UPLOAD_API}/files?uploadType=multipart&fields=id`, { method: 'POST', body })).json();
+        if (!created.id) throw new Error('Drive export upload did not return a file id');
+        return `${GDRIVE_REF_PREFIX}${created.id}`;
+    },
+
     fetchImage: async (ref) => {
         const res = await driveFetch(`${API}/files/${refToFileId(ref)}?alt=media`);
         return res.blob();
@@ -261,6 +271,14 @@ export const googleDriveConnector: DriveConnector = {
         } catch (e) {
             console.warn('Could not trash Drive file (skipping):', e);
         }
+    },
+    deleteAllAppData: async () => {
+        const folderId = await findOrCreateFolder();
+        await driveFetch(`${API}/files/${folderId}`, {
+            method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ trashed: true }),
+        });
+        localStorage.removeItem(FOLDER_KEY);
+        if (currentUid) localStorage.removeItem(fileMapKey(currentUid));
     },
 };
 

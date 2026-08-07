@@ -1,6 +1,14 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import App from './App';
+import AppErrorBoundary from './components/AppErrorBoundary';
+import ToastViewport from './components/ToastViewport';
+import { initMonitoring, reportError } from './services/monitoring';
+import LegalCenter from './components/LegalCenter';
+
+initMonitoring();
+window.addEventListener('error', event => reportError('window-error', event.error ?? event.message));
+window.addEventListener('unhandledrejection', event => reportError('unhandled-rejection', event.reason));
 
 const rootElement = document.getElementById('root');
 if (!rootElement) {
@@ -10,6 +18,6 @@ if (!rootElement) {
 const root = ReactDOM.createRoot(rootElement);
 root.render(
   <React.StrictMode>
-    <App />
+    <AppErrorBoundary><App /><ToastViewport /><LegalCenter /></AppErrorBoundary>
   </React.StrictMode>
 );

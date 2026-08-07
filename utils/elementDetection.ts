@@ -226,6 +226,35 @@ const simplifyContour = (points: Point[]): Point[] => {
   return result;
 };
 
+const traceHoles = (labels: Int32Array, w: number, h: number, outer: Component): Point[][] => {
+  const inverse = new Uint8Array(w * h);
+  for (let y = outer.minY; y <= outer.maxY; y++) for (let x = outer.minX; x <= outer.maxX; x++) {
+    if (labels[y * w + x] !== outer.label) inverse[y * w + x] = 1;
+  }
+  const holes = labelComponents(inverse, w, h);
+  return holes.components
+    .filter(c => c.minX > outer.minX && c.maxX < outer.maxX && c.minY > outer.minY && c.maxY < outer.maxY)
+    .map(c => {
+      const raw = traceBoundary(holes.labels, w, h, c);
+      const simplified = simplifyContour(raw);
+      // Tiny counters (for example a small lowercase 'a') can legitimately
+      // collapse below three vertices at the normal RDP tolerance. Preserve
+      // their unsimplified ring rather than filling the letter solid.
+      return simplified.length >= 3 ? simplified : raw;
+    })
+    .filter(contour => contour.length >= 3);
+};
+
+// Pure algorithm hooks used by regression tests. Keeping these grouped avoids
+// making implementation details look like the main public detector API.
+export const elementDetectionTestables = {
+  binarize,
+  labelComponents,
+  traceBoundary,
+  simplifyClosed,
+  traceHoles,
+};
+
 // --- Public API ---
 
 export const classicalDetector: ElementDetector = {
@@ -257,8 +286,9 @@ export const classicalDetector: ElementDetector = {
       .map(c => {
         const raw = traceBoundary(labels, w, h, c);
         const simplified = simplifyContour(raw).map(p => ({ x: p.x * toFull, y: p.y * toFull }));
+        const holes = traceHoles(labels, w, h, c).map(contour => contour.map(p => ({ x: p.x * toFull, y: p.y * toFull })));
         return {
-          contours: [simplified],
+          contours: [simplified, ...holes],
           bbox: { x: c.minX * toFull, y: c.minY * toFull, w: (c.maxX - c.minX + 1) * toFull, h: (c.maxY - c.minY + 1) * toFull },
           areaPx: c.area * toFull * toFull,
         };
@@ -269,7 +299,6 @@ export const classicalDetector: ElementDetector = {
 
 // Fills an element's contours white on transparent — used for the WebGL face
 // mask texture and for click hit-testing in the Element Studio.
-// V1 limitation: inner holes (the counter of an "O") fill solid.
 export const buildElementMask = (contours: Point[][], imageSize: Size, maxDim = 1024): HTMLCanvasElement => {
   const scale = Math.min(1, maxDim / Math.max(imageSize.width, imageSize.height));
   const canvas = document.createElement('canvas');
@@ -285,6 +314,6 @@ export const buildElementMask = (contours: Point[][], imageSize: Size, maxDim = 
     });
     ctx.closePath();
   });
-  ctx.fill('nonzero');
+  ctx.fill('evenodd');
   return canvas;
 };

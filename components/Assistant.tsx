@@ -1,23 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { GoogleGenAI, Modality, GenerateContentResponse } from "@google/genai";
 import { MessageCircle, X, Send, Mic, Volume2, VolumeX, Loader2, Sparkles, Bot, ChevronDown, User as UserIcon } from 'lucide-react';
-
-const SYSTEM_INSTRUCTION = `You are the expert AI tutor for "SignagePro", a professional signage mockup tool.
-Your goal is to teach users how to use the application step-by-step.
-Be concise, friendly, and encouraging. Use short paragraphs and bullet points.
-
-App Features you must explain when asked:
-1. **Getting Started**: Upload a background image (building facade) using the "New Image" button or the Camera.
-2. **Signs**: Add signs with the "+" button. Select a sign to edit its properties.
-3. **3D Extrusion**: Enable "Extrusion 3D" in properties to give depth to the logo. Adjust depth and angle to match the building's perspective.
-4. **Perspective**: Drag the 4 corners of a sign to match the perspective of the wall. This is critical for realism.
-5. **Dimensions**: Use the Dimensions tool (Line or Box) to annotate sizes on the wall.
-6. **Title Block**: Switch to the "Title Block" tab to fill in project info (Client, Address, Scale) and view the final sheet layout.
-7. **Export**: Use the blue "Export PDF/PNG" button to save your work.
-8. **Magic Cleanup**: Use the Eraser icon to remove unwanted objects (like old signs or graffiti) from the background using Generative AI.
-9. **Navigation**: Scroll to zoom. Middle-click, Shift+Click, or Left-Click (in Title Block view) to pan the canvas.
-
-If the user asks about something not related to the app, politely steer them back to SignagePro.`;
+import { askSignageAssistant, generateSpeech } from '../services/GeminiService';
+import { notify } from '../services/toast';
 
 interface Message {
   id: string;
@@ -28,10 +12,9 @@ interface Message {
 interface AssistantProps {
   isOpen?: boolean;
   setIsOpen?: (isOpen: boolean) => void;
-  apiKey?: string;
 }
 
-const Assistant: React.FC<AssistantProps> = ({ isOpen: propIsOpen, setIsOpen: propSetIsOpen, apiKey }) => {
+const Assistant: React.FC<AssistantProps> = ({ isOpen: propIsOpen, setIsOpen: propSetIsOpen }) => {
   const [internalIsOpen, setInternalIsOpen] = useState(false);
   const [isMinimized, setIsMinimized] = useState(false);
   const [messages, setMessages] = useState<Message[]>([
@@ -43,29 +26,10 @@ const Assistant: React.FC<AssistantProps> = ({ isOpen: propIsOpen, setIsOpen: pr
   const [autoSpeak, setAutoSpeak] = useState(false);
   
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  const aiRef = useRef<GoogleGenAI | null>(null);
-  const chatSessionRef = useRef<any>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
 
   const isOpen = propIsOpen !== undefined ? propIsOpen : internalIsOpen;
   const setIsOpen = propSetIsOpen || setInternalIsOpen;
-
-  // Initialize AI — reinitialize whenever the resolved key changes
-  useEffect(() => {
-    const key = apiKey || process.env.API_KEY;
-    if (key) {
-      aiRef.current = new GoogleGenAI({ apiKey: key });
-      chatSessionRef.current = aiRef.current.chats.create({
-        model: 'gemini-2.5-flash',
-        config: {
-          systemInstruction: SYSTEM_INSTRUCTION,
-        }
-      });
-    } else {
-      aiRef.current = null;
-      chatSessionRef.current = null;
-    }
-  }, [apiKey]);
 
   // Auto-scroll
   useEffect(() => {
@@ -85,16 +49,18 @@ const Assistant: React.FC<AssistantProps> = ({ isOpen: propIsOpen, setIsOpen: pr
   };
 
   const handleSendMessage = async (text: string = inputText, shouldSpeak: boolean = autoSpeak) => {
-    if (!text.trim() || !aiRef.current) return;
+    if (!text.trim()) return;
 
     const userMsg: Message = { id: Date.now().toString(), role: 'user', text };
+    const conversation = [...messages.filter(message => message.id !== 'init'), userMsg]
+      .slice(-20)
+      .map(({ role, text }) => ({ role, text }));
     setMessages(prev => [...prev, userMsg]);
     setInputText('');
     setIsLoading(true);
 
     try {
-      const result: GenerateContentResponse = await chatSessionRef.current.sendMessage({ message: text });
-      const responseText = result.text;
+      const responseText = await askSignageAssistant(conversation);
 
       if (responseText) {
           const aiMsg: Message = { id: (Date.now() + 1).toString(), role: 'model', text: responseText };
@@ -106,30 +72,16 @@ const Assistant: React.FC<AssistantProps> = ({ isOpen: propIsOpen, setIsOpen: pr
       }
     } catch (error) {
       console.error("Chat Error:", error);
-      setMessages(prev => [...prev, { id: Date.now().toString(), role: 'model', text: "Sorry, I'm having trouble connecting right now." }]);
+      const message = error instanceof Error ? error.message : "Sorry, I'm having trouble connecting right now.";
+      setMessages(prev => [...prev, { id: Date.now().toString(), role: 'model', text: message }]);
     } finally {
       setIsLoading(false);
     }
   };
 
   const speakResponse = async (text: string) => {
-     if (!aiRef.current) return;
-     
      try {
-        const response = await aiRef.current.models.generateContent({
-            model: 'gemini-2.5-flash-preview-tts',
-            contents: [{ parts: [{ text }] }],
-            config: {
-                responseModalities: [Modality.AUDIO],
-                speechConfig: {
-                    voiceConfig: {
-                        prebuiltVoiceConfig: { voiceName: 'Aoede' }
-                    }
-                }
-            }
-        });
-
-        const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+        const base64Audio = await generateSpeech(text);
         if (base64Audio) {
             ensureAudioContext();
             if (audioContextRef.current) {
@@ -147,7 +99,7 @@ const Assistant: React.FC<AssistantProps> = ({ isOpen: propIsOpen, setIsOpen: pr
 
   const toggleListening = () => {
     if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
-        alert("Speech recognition is not supported in this browser.");
+        notify('Speech recognition is not supported in this browser.', 'warning');
         return;
     }
 
@@ -190,7 +142,10 @@ const Assistant: React.FC<AssistantProps> = ({ isOpen: propIsOpen, setIsOpen: pr
   }
 
   async function decodeAudioData(data: Uint8Array, ctx: AudioContext): Promise<AudioBuffer> {
-     const buffer = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+     // Copy into a guaranteed ArrayBuffer. Newer TypeScript versions model a
+     // Uint8Array's backing store as ArrayBufferLike (which may be shared),
+     // while Web Audio deliberately accepts only a transferable ArrayBuffer.
+     const buffer = Uint8Array.from(data).buffer;
      try {
          return await ctx.decodeAudioData(buffer);
      } catch (e) {

@@ -4,6 +4,7 @@ import { AppImages, MockupState, Point, Sign, Dimension, TitleBlock, Revision, P
 import { hexToRgb, isPointInPolygon, distance, computeHomography } from '../utils/math';
 import { measureLine, measureBox } from '../utils/measure';
 import { buildElementMask } from '../utils/elementDetection';
+import { reportError } from '../services/monitoring';
 import { ZoomIn, ZoomOut, Maximize, Check, X } from 'lucide-react';
 import { ToolMode } from '../App';
 import { TITLE_BLOCK_TEMPLATES } from '../data/titleBlockTemplates';
@@ -24,6 +25,7 @@ interface MockupCanvasProps {
   onDrawComplete: (start: Point, end: Point, variant: 'linear' | 'box') => void;
   calibration: Calibration | null;
   onCalibrateComplete: (start: Point, end: Point) => void;
+  onPlaneCalibrateComplete: (corners: [Point, Point, Point, Point]) => void;
   updateSignById: (id: string, updates: Partial<Sign>) => void;
   setActiveSign: (id: string | null) => void;
   updateDimension: (id: string, updates: Partial<Dimension>) => void;
@@ -62,6 +64,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
     onDrawComplete,
     calibration,
     onCalibrateComplete,
+    onPlaneCalibrateComplete,
     updateSignById,
     setActiveSign, 
     updateDimension,
@@ -90,6 +93,8 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
   const [tick, setTick] = useState(0); 
   const drawingStart = useRef<Point | null>(null);
   const drawingCurrent = useRef<Point | null>(null);
+  const [planePoints, setPlanePoints] = useState<Point[]>([]);
+  useEffect(() => { if (toolMode !== 'calibrate_plane') setPlanePoints([]); }, [toolMode]);
 
   const boxDragTargetsRef = useRef<{ x: 'start'|'end'|null, y: 'start'|'end'|null }>({ x: null, y: null });
   const textureCacheRef = useRef<Map<string, WebGLTexture>>(new Map());
@@ -356,7 +361,11 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
       const shader = gl.createShader(type)!;
       gl.shaderSource(shader, source);
       gl.compileShader(shader);
-      if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) return null;
+      if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+        reportError('webgl-shader', new Error(gl.getShaderInfoLog(shader) ?? 'Shader compilation failed'), { type });
+        gl.deleteShader(shader);
+        return null;
+      }
       return shader;
     };
 
@@ -368,7 +377,10 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
     gl.attachShader(program, vs);
     gl.attachShader(program, fs);
     gl.linkProgram(program);
-    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) return;
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+      reportError('webgl-program', new Error(gl.getProgramInfoLog(program) ?? 'Shader program linking failed'));
+      return;
+    }
 
     programRef.current = program;
 
@@ -452,7 +464,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
           aTop: gl.getAttribLocation(elemProgram, 'a_top'),
           aShade: gl.getAttribLocation(elemProgram, 'a_shade'),
         };
-      }
+      } else reportError('webgl-element-program', new Error(gl.getProgramInfoLog(elemProgram) ?? 'Element shader linking failed'));
     }
   }, [setCanvasRef]);
 
@@ -537,21 +549,18 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
       const lightX = Math.SQRT1_2, lightY = -Math.SQRT1_2;
 
       sign.elements.forEach(el => {
-        const pts = el.contours[0] ?? [];
-        if (pts.length < 3) return;
+        if (!el.contours.some(points => points.length >= 3)) return;
 
-        // Side-wall TRIANGLE_STRIP: each contour point at base (a_top 0) and
-        // extruded top (a_top 1), with per-segment normal shading baked in
+        // Independent side-wall triangles for outer and hole contours.
         const verts: number[] = [];
-        for (let i = 0; i <= pts.length; i++) {
-          const p = pts[i % pts.length];
-          const nxt = pts[(i + 1) % pts.length];
-          let nx = nxt.y - p.y, ny = -(nxt.x - p.x);
-          const len = Math.hypot(nx, ny) || 1;
-          nx /= len; ny /= len;
-          const shade = 0.68 + 0.32 * Math.abs(nx * lightX + ny * lightY);
-          verts.push(p.x, p.y, 0, shade, p.x, p.y, 1, shade);
-        }
+        el.contours.forEach(pts => {
+          for (let i = 0; i < pts.length; i++) {
+            const p = pts[i], nxt = pts[(i + 1) % pts.length];
+            let nx = nxt.y - p.y, ny = -(nxt.x - p.x); const len = Math.hypot(nx, ny) || 1;
+            nx /= len; ny /= len; const shade = 0.68 + 0.32 * Math.abs(nx * lightX + ny * lightY);
+            verts.push(p.x,p.y,0,shade, nxt.x,nxt.y,0,shade, p.x,p.y,1,shade, p.x,p.y,1,shade, nxt.x,nxt.y,0,shade, nxt.x,nxt.y,1,shade);
+          }
+        });
         const sideBuffer = gl.createBuffer()!;
         gl.bindBuffer(gl.ARRAY_BUFFER, sideBuffer);
         gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(verts), gl.STATIC_DRAW);
@@ -688,7 +697,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
           gl.uniform1i(eLocs.mode, 0);
           gl.uniform4f(eLocs.color, rgb[0], rgb[1], rgb[2], sign.opacity);
           setAttribs(geo.sideBuffer);
-          gl.drawArrays(gl.TRIANGLE_STRIP, 0, geo.sideVertexCount);
+          gl.drawArrays(gl.TRIANGLES, 0, geo.sideVertexCount);
 
           // Masked face, popped forward by the same offset
           gl.uniform1i(eLocs.mode, 1);
@@ -758,6 +767,13 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
 
       if (e.button === 2) { if (isDrawing) { setIsDrawing(false); drawingStart.current = null; drawingCurrent.current = null; return; } }
       const pos = getMousePos(e);
+      if (toolMode === 'calibrate_plane') {
+        e.preventDefault(); e.stopPropagation();
+        const next = [...planePoints, pos];
+        if (next.length === 4) { onPlaneCalibrateComplete(next as [Point, Point, Point, Point]); setPlanePoints([]); }
+        else setPlanePoints(next);
+        setActiveSign(null); setActiveDimension(''); return;
+      }
       if (toolMode === 'draw_line' || toolMode === 'calibrate') { e.preventDefault(); e.stopPropagation(); if (!isDrawing) { e.currentTarget.setPointerCapture(e.pointerId); setIsDrawing(true); drawingStart.current = pos; drawingCurrent.current = pos; setActiveSign(null); setActiveDimension(''); } else { if (drawingStart.current) { if (toolMode === 'calibrate') { onCalibrateComplete(drawingStart.current, pos); } else { onDrawComplete(drawingStart.current, pos, 'linear'); } } setIsDrawing(false); drawingStart.current = null; drawingCurrent.current = null; } return; }
       if (toolMode === 'draw_box') { e.preventDefault(); e.stopPropagation(); e.currentTarget.setPointerCapture(e.pointerId); setIsDrawing(true); drawingStart.current = pos; drawingCurrent.current = pos; setActiveSign(null); setActiveDimension(''); return; }
       
@@ -948,7 +964,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
       onPointerUp={handleContainerPointerUp}
       onPointerLeave={handleContainerPointerUp}
       onContextMenu={(e) => e.preventDefault()}
-      style={{ touchAction: 'none', cursor: (toolMode === 'draw_line' || toolMode === 'draw_box' || toolMode === 'calibrate') ? 'crosshair' : 'default', backgroundColor: isSheetView ? '#333' : '#0a0a0a' }}
+      style={{ touchAction: 'none', cursor: (toolMode === 'draw_line' || toolMode === 'draw_box' || toolMode === 'calibrate' || toolMode === 'calibrate_plane') ? 'crosshair' : 'default', backgroundColor: isSheetView ? '#333' : '#0a0a0a' }}
     >
       {/* Zoom Controls — offset below the user profile pill rendered by App at top-right */}
       <div className="absolute top-20 right-4 flex flex-col gap-2 z-40">
@@ -1090,6 +1106,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
             {!isCropping && (
             <>
                 <svg className="absolute inset-0 z-20 w-full h-full overflow-visible pointer-events-none" viewBox={`0 0 ${images.backgroundSize.width} ${images.backgroundSize.height}`}>
+                    {planePoints.length > 0 && <g><polyline points={planePoints.map(p => `${p.x},${p.y}`).join(' ')} fill="none" stroke="#f59e0b" strokeWidth={3 * handleScale} strokeDasharray="6 3"/>{planePoints.map((p, i) => <g key={i}><circle cx={p.x} cy={p.y} r={7 * handleScale} fill="#f59e0b"/><text x={p.x + 10 * handleScale} y={p.y} fill="white" fontSize={14 * handleScale}>{i + 1}</text></g>)}</g>}
                     {state.showDimensions && dimensions.map(dim => {
                         const isActive = dim.id === activeDimensionId;
                         const dimColor = dim.color || '#ffffff';
@@ -1186,6 +1203,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
                     {/* Stored calibration reference line (editor view only) */}
                     {calibration && !isSheetView && (
                         <g className="pointer-events-none">
+                            {calibration.plane && <polygon points={calibration.plane.corners.map(p => `${p.x},${p.y}`).join(' ')} fill="rgba(245,158,11,0.08)" stroke="#f59e0b" strokeWidth={1.5 * handleScale} strokeDasharray={`${6 * handleScale} ${3 * handleScale}`}/>}
                             <line x1={calibration.start.x} y1={calibration.start.y} x2={calibration.end.x} y2={calibration.end.y} stroke="#f59e0b" strokeWidth={1.5 * handleScale} strokeDasharray={`${6 * handleScale} ${3 * handleScale}`} />
                             <rect x={calibration.start.x - 3 * handleScale} y={calibration.start.y - 3 * handleScale} width={6 * handleScale} height={6 * handleScale} fill="#f59e0b" />
                             <rect x={calibration.end.x - 3 * handleScale} y={calibration.end.y - 3 * handleScale} width={6 * handleScale} height={6 * handleScale} fill="#f59e0b" />

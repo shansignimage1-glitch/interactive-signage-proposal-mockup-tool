@@ -1,16 +1,23 @@
 
 import { db, storage } from '../firebase';
+import { collection, deleteDoc, doc, getDoc, getDocs, limit, query, runTransaction, setDoc, where } from 'firebase/firestore';
+import { deleteObject, getDownloadURL, listAll, ref as storageRef, uploadBytes, type StorageReference } from 'firebase/storage';
 import { MockupState, ProjectMetadata } from '../types';
 import { hashDataUri, dataUriToBlob } from './imageHash';
-import { getActiveConnector } from './driveConnectors';
+import { connectors, getActiveConnector, getConnectorForRef } from './driveConnectors';
 import { getKnownRef, recordKnownRef, resolveProjectImages, ResolveResult, isDriveRef } from './AssetResolver';
+import { reportError, reportWarning } from './monitoring';
+import { assertStorageCapacity, optimizeDataUri } from './imageProcessing';
 
 const FIRESTORE_COLLECTION = 'projects';
 const DB_NAME = 'SignageProDB';
 const STORE_PROJECTS = 'projects';
 const STORE_METADATA = 'metadata';
 const STORE_ASSETS = 'assets'; // cached cloud-drive image blobs, keyed by ref
-const DB_VERSION = 3; // v3 adds the assets store
+const STORE_SYNC_QUEUE = 'syncQueue';
+const DB_VERSION = 4; // v4 adds durable offline cloud-sync jobs
+const knownCloudRevisions = new Map<string, number>();
+const revisionKey = (userId: string, projectId: string) => `${userId}_${projectId}`;
 
 // --- IndexedDB Wrapper ---
 
@@ -45,6 +52,9 @@ const initDB = (): Promise<IDBDatabase> => {
       // open instantly (and offline) after the first fetch
       if (!db.objectStoreNames.contains(STORE_ASSETS)) {
         db.createObjectStore(STORE_ASSETS, { keyPath: 'ref' });
+      }
+      if (!db.objectStoreNames.contains(STORE_SYNC_QUEUE)) {
+        db.createObjectStore(STORE_SYNC_QUEUE, { keyPath: 'projectId' });
       }
     };
   });
@@ -98,14 +108,14 @@ const uploadImageIfNeeded = async (userId: string, dataUri: string): Promise<str
     if (!dataUri || !dataUri.startsWith('data:')) return dataUri;
 
     const hash = await hashDataUri(dataUri);
-    const ref = storage.ref(`users/${userId}/images/${hash}`);
+    const imageRef = storageRef(storage, `users/${userId}/images/${hash}`);
 
     try {
-        return await ref.getDownloadURL();
+        return await getDownloadURL(imageRef);
     } catch {
         // Not uploaded yet
-        await ref.put(dataUriToBlob(dataUri));
-        return await ref.getDownloadURL();
+        await uploadBytes(imageRef, dataUriToBlob(dataUri));
+        return await getDownloadURL(imageRef);
     }
 };
 
@@ -140,7 +150,7 @@ const collectDriveRefs = (d: any): string[] => {
 // Drive refs ("gdrive://...") are naturally ignored here: extractImageHash
 // only matches Firebase Storage URLs, and only the Firebase bucket is listed.
 const pruneOrphanedImages = async (userId: string): Promise<void> => {
-    const snapshot = await db.collection(FIRESTORE_COLLECTION).where('userId', '==', userId).get();
+    const snapshot = await getDocs(query(collection(db, FIRESTORE_COLLECTION), where('userId', '==', userId)));
 
     const referenced = new Set<string>();
     const track = (url?: string | null) => {
@@ -158,10 +168,10 @@ const pruneOrphanedImages = async (userId: string): Promise<void> => {
         });
     });
 
-    const { items } = await storage.ref(`users/${userId}/images`).listAll();
+    const { items } = await listAll(storageRef(storage, `users/${userId}/images`));
     await Promise.all(items.map(item => {
         if (referenced.has(item.name)) return Promise.resolve();
-        return item.delete().catch(e => console.warn(`Failed to prune orphaned image ${item.name}:`, e));
+        return deleteObject(item).catch(e => console.warn(`Failed to prune orphaned image ${item.name}:`, e));
     }));
 };
 
@@ -179,6 +189,7 @@ export const StorageService = {
           thumbnail: thumbnail || undefined
       };
 
+      await assertStorageCapacity(new Blob([JSON.stringify(state)]).size);
       // Save Full Data
       await idbOperation(STORE_PROJECTS, 'readwrite', (store) => store.put(state));
       // Save Metadata
@@ -198,6 +209,78 @@ export const StorageService = {
       await idbOperation(STORE_METADATA, 'readwrite', (store) => store.delete(projectId));
   },
 
+  queueProjectSync: async (userId: string, projectId: string): Promise<void> => {
+      await idbOperation(STORE_SYNC_QUEUE, 'readwrite', store => store.put({ projectId, userId, queuedAt: Date.now() }));
+  },
+
+  flushSyncQueue: async (userId: string): Promise<number> => {
+      if (!navigator.onLine || userId.startsWith('guest_')) return 0;
+      const jobs = await idbOperation<Array<{ projectId: string; userId: string }>>(STORE_SYNC_QUEUE, 'readonly', store => store.getAll());
+      let completed = 0;
+      for (const job of jobs.filter(item => item.userId === userId)) {
+          const project = await StorageService.loadProjectLocal(job.projectId);
+          if (!project) {
+              await idbOperation(STORE_SYNC_QUEUE, 'readwrite', store => store.delete(job.projectId));
+              continue;
+          }
+          const result = await StorageService.saveProject(userId, project, true, false);
+          if (result === 'cloud') {
+              await idbOperation(STORE_SYNC_QUEUE, 'readwrite', store => store.delete(job.projectId));
+              completed++;
+          }
+      }
+      return completed;
+  },
+
+  exportAllUserData: async (userId: string): Promise<{ exportedAt: string; projects: MockupState[] }> => {
+      const byId = new Map<string, MockupState>();
+      const local = await StorageService.listProjectsLocal();
+      for (const meta of local) {
+          const project = await StorageService.loadProjectLocal(meta.id);
+          if (project) byId.set(project.projectId, project);
+      }
+      if (!userId.startsWith('guest_')) {
+          const cloud = await getDocs(query(collection(db, FIRESTORE_COLLECTION), where('userId', '==', userId)));
+          for (const doc of cloud.docs) {
+              const projectId = doc.data().projectId as string;
+              if (!byId.has(projectId)) {
+                  const project = await StorageService.loadProjectCloud(userId, projectId);
+                  if (project) byId.set(project.projectId, project);
+              }
+          }
+      }
+      return { exportedAt: new Date().toISOString(), projects: [...byId.values()] };
+  },
+
+  deleteAllUserData: async (userId: string): Promise<void> => {
+      const local = await StorageService.listProjectsLocal();
+      await Promise.all(local.map(project => StorageService.deleteProjectLocal(project.id)));
+      await idbOperation(STORE_ASSETS, 'readwrite', store => store.clear());
+      if (userId.startsWith('guest_')) return;
+
+      const cloud = await getDocs(query(collection(db, FIRESTORE_COLLECTION), where('userId', '==', userId)));
+      for (const doc of cloud.docs) await StorageService.deleteProjectCloud(userId, doc.data().projectId);
+      const remainingProjects = await getDocs(query(collection(db, FIRESTORE_COLLECTION), where('userId', '==', userId)));
+      if (!remainingProjects.empty) throw new Error('Some cloud projects could not be deleted');
+
+      const personal = await getDocs(query(collection(db, 'userLibrary'), where('ownerUid', '==', userId)));
+      await Promise.all(personal.docs.map(item => deleteDoc(item.ref)));
+
+      const deleteTree = async (ref: StorageReference): Promise<void> => {
+          const listing = await listAll(ref);
+          await Promise.all(listing.items.map(deleteObject));
+          await Promise.all(listing.prefixes.map(deleteTree));
+      };
+      await deleteTree(storageRef(storage, `users/${userId}`));
+
+      // Exports are not project references, so deleting the provider's app
+      // folder is the only complete way to remove them. Never prompt from this
+      // destructive background step; disconnected providers remain untouched.
+      for (const connector of connectors) {
+          if (await connector.ensureReady(false).catch(() => false)) await connector.deleteAllAppData();
+      }
+  },
+
   // --- Cloud Sync (Firestore) ---
 
   // Without this, a project deleted locally kept living in Firestore forever —
@@ -210,43 +293,47 @@ export const StorageService = {
       // unique to it can be trashed from the user's drive afterwards.
       let deletedRefs: string[] = [];
       try {
-          const doc = await db.collection(FIRESTORE_COLLECTION).doc(`${userId}_${projectId}`).get();
-          if (doc.exists) deletedRefs = collectDriveRefs(doc.data());
+          const snapshot = await getDoc(doc(db, FIRESTORE_COLLECTION, `${userId}_${projectId}`));
+          if (snapshot.exists()) deletedRefs = collectDriveRefs(snapshot.data());
       } catch { /* best-effort */ }
 
       try {
-          await db.collection(FIRESTORE_COLLECTION).doc(`${userId}_${projectId}`).delete();
+          await deleteDoc(doc(db, FIRESTORE_COLLECTION, `${userId}_${projectId}`));
       } catch (e) {
           console.warn("Could not delete cloud project:", e);
       }
       await pruneOrphanedImages(userId).catch(e => console.warn("Orphaned image prune failed:", e));
 
       // Trash drive files no other project still references (best-effort)
-      const connector = getActiveConnector();
-      if (connector && deletedRefs.length > 0 && await connector.ensureReady(false).catch(() => false)) {
+      if (deletedRefs.length > 0) {
           try {
-              const snapshot = await db.collection(FIRESTORE_COLLECTION).where('userId', '==', userId).get();
+              const snapshot = await getDocs(query(collection(db, FIRESTORE_COLLECTION), where('userId', '==', userId)));
               const stillReferenced = new Set<string>(snapshot.docs.flatMap(d => collectDriveRefs(d.data())));
-              await Promise.all(deletedRefs
-                  .filter(ref => !stillReferenced.has(ref))
-                  .map(ref => connector.deleteImage(ref)));
+              await Promise.all(deletedRefs.filter(ref => !stillReferenced.has(ref)).map(async ref => {
+                  const connector = getConnectorForRef(ref);
+                  if (connector && await connector.ensureReady(false).catch(() => false)) await connector.deleteImage(ref);
+              }));
           } catch (e) {
               console.warn("Drive image cleanup skipped:", e);
           }
       }
   },
 
-  saveProject: async (userId: string, state: MockupState): Promise<'cloud' | 'local' | 'error'> => {
+  saveProject: async (userId: string, state: MockupState, fromQueue = false, force = false): Promise<'cloud' | 'local' | 'queued' | 'conflict' | 'error'> => {
       // Always save to local first
       try {
           await StorageService.saveProjectLocal(state);
       } catch (e) {
-          console.error("Local save failed", e);
+          reportError('local-sync', e, { userId, projectId: state.projectId });
           return 'error';
       }
 
       // Skip cloud sync for guest users
       if (userId.startsWith('guest_')) return 'local';
+      if (!navigator.onLine) {
+          if (!fromQueue) await StorageService.queueProjectSync(userId, state.projectId);
+          return 'queued';
+      }
 
       try {
           // Upload base64 images — Firestore only ever gets a URL or drive ref.
@@ -256,6 +343,7 @@ export const StorageService = {
           // every autosave debounce. A drive failure must never fail the save:
           // it silently falls back to Firebase Storage.
           const uploadImage = async (dataUri: string): Promise<string> => {
+              dataUri = await optimizeDataUri(dataUri);
               const hash = await hashDataUri(dataUri);
 
               // Image was loaded from a drive ref this session — reuse it
@@ -269,7 +357,7 @@ export const StorageService = {
                       recordKnownRef(hash, ref);
                       return ref;
                   } catch (e) {
-                      console.warn('Drive upload failed, falling back to Firebase Storage:', e);
+                      reportWarning('drive-sync', 'Drive upload failed; using Firebase Storage fallback', { provider: connector.id, error: String(e) });
                   }
               }
               return uploadImageIfNeeded(userId, dataUri);
@@ -280,8 +368,11 @@ export const StorageService = {
               if (!dataUri || !dataUri.startsWith('data:')) return Promise.resolve(dataUri);
               if (!uploadCache.has(dataUri)) {
                   uploadCache.set(dataUri, uploadImage(dataUri).catch(e => {
-                      console.warn("Image upload failed, image will be blank in cloud copy:", e);
-                      return '';
+                      reportError('image-sync', e, { projectId: state.projectId });
+                      // Never turn a temporary compression/provider failure
+                      // into a permanently blank cloud image. Abort this cloud
+                      // revision and retain the complete IndexedDB copy.
+                      throw e;
                   }));
               }
               return uploadCache.get(dataUri)!;
@@ -312,18 +403,24 @@ export const StorageService = {
               referenceImages,
           };
 
-          await db
-              .collection(FIRESTORE_COLLECTION)
-              .doc(`${userId}_${state.projectId}`)
-              .set({
-                  ...cloudState,
-                  userId,
-                  updatedAt: Date.now(),
-              });
+          const projectRef = doc(db, FIRESTORE_COLLECTION, `${userId}_${state.projectId}`);
+          const key = revisionKey(userId, state.projectId);
+          const baseRevision = knownCloudRevisions.get(key) ?? state.cloudRevision ?? 0;
+          const nextRevision = await runTransaction(db, async transaction => {
+              const remote = await transaction.get(projectRef);
+              const remoteRevision = remote.exists() ? (remote.data().cloudRevision ?? 0) : 0;
+              if (!force && remote.exists() && remoteRevision > baseRevision) return null;
+              const revision = remoteRevision + 1;
+              transaction.set(projectRef, { ...cloudState, userId, updatedAt: Date.now(), cloudRevision: revision });
+              return revision;
+          });
+          if (nextRevision === null) return 'conflict';
+          knownCloudRevisions.set(key, nextRevision);
+          await StorageService.saveProjectLocal({ ...state, cloudRevision: nextRevision });
 
           return 'cloud';
       } catch (e) {
-          console.warn("Cloud save failed, project is local only:", e);
+          reportError('firestore-sync', e, { userId, projectId: state.projectId, permissionDenied: (e as any)?.code === 'permission-denied' });
           return 'local';
       }
   },
@@ -335,11 +432,7 @@ export const StorageService = {
           // requires a composite Firestore index to be deployed first, and fails
           // silently (empty list) until that index exists. Sorting client-side
           // needs only the automatic single-field index Firestore always has.
-          const snapshot = await db
-              .collection(FIRESTORE_COLLECTION)
-              .where('userId', '==', userId)
-              .limit(50)
-              .get();
+          const snapshot = await getDocs(query(collection(db, FIRESTORE_COLLECTION), where('userId', '==', userId), limit(50)));
 
           return snapshot.docs.map(doc => {
               const d = doc.data();
@@ -351,7 +444,7 @@ export const StorageService = {
               };
           }).sort((a, b) => (b.lastModified ?? 0) - (a.lastModified ?? 0));
       } catch (e) {
-          console.warn("Could not list cloud projects:", e);
+          reportError('firestore-list', e, { userId, permissionDenied: (e as any)?.code === 'permission-denied' });
           return [];
       }
   },
@@ -363,15 +456,13 @@ export const StorageService = {
   ): Promise<MockupState | null> => {
       if (userId.startsWith('guest_')) return null;
       try {
-          const doc = await db
-              .collection(FIRESTORE_COLLECTION)
-              .doc(`${userId}_${projectId}`)
-              .get();
+          const snapshot = await getDoc(doc(db, FIRESTORE_COLLECTION, `${userId}_${projectId}`));
 
-          if (!doc.exists) return null;
-          const data = doc.data() as MockupState & { userId: string; updatedAt: number };
+          if (!snapshot.exists()) return null;
+          const data = snapshot.data() as MockupState & { userId: string; updatedAt: number };
           // Remove Firestore-only fields before returning
           const { userId: _u, updatedAt: _t, ...projectState } = data;
+          knownCloudRevisions.set(revisionKey(userId, projectId), projectState.cloudRevision ?? 0);
 
           // Materialize any cloud-drive refs into displayable data URIs
           const resolved = await resolveProjectImages(projectState as MockupState);
@@ -380,7 +471,7 @@ export const StorageService = {
           }
           return resolved.state;
       } catch (e) {
-          console.warn("Could not load cloud project:", e);
+          reportError('firestore-load', e, { userId, projectId, permissionDenied: (e as any)?.code === 'permission-denied' });
           return null;
       }
   },

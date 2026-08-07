@@ -5,6 +5,10 @@ interface ImportMetaEnv {
   // the Google Identity Services token client for Drive access. The Drive
   // connector shows "not configured" when this is absent.
   readonly VITE_GOOGLE_OAUTH_CLIENT_ID?: string;
+  readonly VITE_MICROSOFT_CLIENT_ID?: string;
+  readonly VITE_DROPBOX_APP_KEY?: string;
+  readonly VITE_SENTRY_DSN?: string;
+  readonly VITE_APP_VERSION?: string;
 }
 
 interface ImportMeta {
