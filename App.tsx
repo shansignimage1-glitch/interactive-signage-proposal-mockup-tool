@@ -29,6 +29,7 @@ import { optimizeImageFile } from './services/imageProcessing';
 
 const GUEST_PROJECT_ID_KEY = 'signagepro_guest_project_id';
 const AUTH_BOOT_TIMEOUT_MS = 20_000;
+const AUTH_CALLBACK_TIMEOUT_MS = 12_000;
 
 const withTimeout = <T,>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> =>
   new Promise<T>((resolve, reject) => {
@@ -226,6 +227,38 @@ const App: React.FC = () => {
       setIsAuthLoading(false);
     });
   }, []);
+
+  // onAuthStateChanged can occasionally fail to fire after an OAuth redirect
+  // in iPad standalone/Safari mode. This outer watchdog is deliberately
+  // independent of that callback, so the loading screen can never be permanent.
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      if (stateRef.current.user) {
+        setIsAuthLoading(false);
+        return;
+      }
+
+      const firebaseUser = auth.currentUser;
+      if (firebaseUser) {
+        const user = {
+          uid: firebaseUser.uid,
+          displayName: firebaseUser.displayName,
+          email: firebaseUser.email,
+          photoURL: firebaseUser.photoURL,
+          isAdmin: false,
+        };
+        startSession({ ...getInitialState(), user, isOnline: navigator.onLine, isSyncing: false });
+        setSyncStatus('error');
+        reportWarning('auth-bootstrap', 'Auth-state callback timed out; opened a fallback session', { uid: user.uid });
+        notify('Signed in. Cloud data is still connecting; you can continue working.', 'warning');
+      } else {
+        setAuthError('Sign-in took too long to finish. Please try again.');
+      }
+      setIsAuthLoading(false);
+    }, AUTH_CALLBACK_TIMEOUT_MS);
+
+    return () => window.clearTimeout(timer);
+  }, [startSession]);
 
   // --- Auth & Data Loading ---
   useEffect(() => {

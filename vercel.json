@@ -7,6 +7,24 @@
   ],
   "headers": [
     {
+      "source": "/",
+      "headers": [
+        { "key": "Cache-Control", "value": "no-cache, no-store, must-revalidate" }
+      ]
+    },
+    {
+      "source": "/index.html",
+      "headers": [
+        { "key": "Cache-Control", "value": "no-cache, no-store, must-revalidate" }
+      ]
+    },
+    {
+      "source": "/sw.js",
+      "headers": [
+        { "key": "Cache-Control", "value": "no-cache, no-store, must-revalidate" }
+      ]
+    },
+    {
       "source": "/(.*)",
       "headers": [
         { "key": "Content-Security-Policy", "value": "default-src 'self'; script-src 'self' 'sha256-4Sry3sxnDNx0KfLx6AAUo8D2CUTWL64/sHuxb6HhCaM=' https://accounts.google.com https://apis.google.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self' data:; connect-src 'self' https://accounts.google.com https://*.googleapis.com https://*.firebaseio.com https://*.firebase.com https://*.firebasestorage.app https://securetoken.googleapis.com https://identitytoolkit.googleapis.com https://login.microsoftonline.com https://graph.microsoft.com https://api.dropboxapi.com https://content.dropboxapi.com https://*.ingest.sentry.io; frame-src 'self' https://accounts.google.com https://*.firebaseapp.com; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'self'; upgrade-insecure-requests" },
