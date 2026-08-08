@@ -4,6 +4,8 @@ import { BRANDS } from '../data/brands';
 import { Dimension, SignTemplate, Sign, UserProfile, SIGN_TYPES, SignType } from '../types';
 import { Sparkles, X, LayoutGrid, Loader2, User as UserIcon, Trash2, UploadCloud, BookmarkPlus, Globe, LogIn, Search, Pencil } from 'lucide-react';
 import { LibraryService, isLibraryAdmin, materializeDataUri, NewTemplateInput } from '../services/LibraryService';
+import { reportError } from '../services/monitoring';
+import { notify } from '../services/toast';
 
 interface SignLibraryProps {
   isOpen: boolean;
@@ -36,6 +38,7 @@ const SignLibrary: React.FC<SignLibraryProps> = ({ isOpen, onClose, onSelect, ac
 
   // Save/upload form state (used by both "save active sign" and file upload)
   const [form, setForm] = useState<{ dataUri: string; name: string; category: string; widthMm: number; heightMm: number; publishShared: boolean; brand: string; tags: string; rightsNote: string; signType: SignType; editing?: SignTemplate } | null>(null);
+  const [formError, setFormError] = useState<string | null>(null);
 
   const isGuest = !user || user.uid.startsWith('guest_');
   const admin = isLibraryAdmin(user);
@@ -93,6 +96,7 @@ const SignLibrary: React.FC<SignLibraryProps> = ({ isOpen, onClose, onSelect, ac
     if (!activeSign) return;
     setBusy('materialize');
     setCloudError(null);
+    setFormError(null);
     try {
       const dataUri = await materializeDataUri(activeSign.image);
       setForm({
@@ -112,6 +116,7 @@ const SignLibrary: React.FC<SignLibraryProps> = ({ isOpen, onClose, onSelect, ac
   };
 
   const handleUploadFile = (file: File) => {
+    setFormError(null);
     const reader = new FileReader();
     reader.onload = () => {
       setForm({
@@ -131,6 +136,7 @@ const SignLibrary: React.FC<SignLibraryProps> = ({ isOpen, onClose, onSelect, ac
     if (!form || isGuest) return;
     setBusy('save');
     setCloudError(null);
+    setFormError(null);
     const input: NewTemplateInput = {
       name: form.name.trim() || 'Untitled Sign',
       category: form.category,
@@ -151,9 +157,14 @@ const SignLibrary: React.FC<SignLibraryProps> = ({ isOpen, onClose, onSelect, ac
         setPersonal(prev => [...prev.filter(x => x.id !== t.id), t].sort((a, b) => a.name.localeCompare(b.name)));
         setTab('personal');
       }
+      const destination = form.editing || (form.publishShared && admin) ? 'shared library' : 'My Library';
       setForm(null);
+      notify(`Asset saved to ${destination}.`, 'success');
     } catch (e: any) {
-      setCloudError(e?.message ?? 'Save failed');
+      const message = e?.message ?? 'Save failed. Please try again.';
+      setFormError(message);
+      reportError('library-save', e, { source: form.editing?.source ?? (form.publishShared ? 'shared' : 'personal') });
+      notify('The asset could not be saved. Your form is still open.', 'error');
     } finally {
       setBusy(null);
     }
@@ -189,10 +200,19 @@ const SignLibrary: React.FC<SignLibraryProps> = ({ isOpen, onClose, onSelect, ac
   const pageCount = Math.max(1, Math.ceil(filteredTemplates.length / pageSize));
   const visibleTemplates = filteredTemplates.slice((page - 1) * pageSize, page * pageSize);
 
-  const editShared = (template: SignTemplate) => setForm({
-    dataUri: template.image, name: template.name, category: template.category, widthMm: template.width, heightMm: template.height,
-    publishShared: true, brand: template.brand ?? '', tags: (template.tags ?? []).join(', '), rightsNote: template.rightsNote ?? '', signType: template.signType ?? 'fascia_non_ill', editing: template,
-  });
+  const editShared = (template: SignTemplate) => {
+    setFormError(null);
+    setForm({
+      dataUri: template.image, name: template.name, category: template.category, widthMm: template.width, heightMm: template.height,
+      publishShared: true, brand: template.brand ?? '', tags: (template.tags ?? []).join(', '), rightsNote: template.rightsNote ?? '', signType: template.signType ?? 'fascia_non_ill', editing: template,
+    });
+  };
+
+  const formSaveLabel = form?.editing
+    ? 'Save library changes'
+    : form?.publishShared && admin
+      ? 'Publish to Shared Library'
+      : 'Save asset to My Library';
 
   return (
     <div className="fixed inset-0 z-[220] flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
@@ -366,13 +386,32 @@ const SignLibrary: React.FC<SignLibraryProps> = ({ isOpen, onClose, onSelect, ac
 
         {/* Save-to-library form */}
         {form && (
-            <div className="absolute inset-0 z-10 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4" onClick={() => setForm(null)}>
-                <div className="bg-gray-900 border border-gray-700 rounded-2xl shadow-2xl p-5 w-full max-w-md" onClick={e => e.stopPropagation()}>
-                    <h3 className="text-white font-bold mb-4 flex items-center gap-2"><BookmarkPlus className="w-5 h-5 text-purple-400" /> {form.editing ? 'Edit Library Template' : 'Save to Library'}</h3>
-                    <div className="aspect-video bg-gray-800 rounded-lg mb-4 flex items-center justify-center p-3 border border-gray-700">
-                        <img src={form.dataUri} alt="" className="max-w-full max-h-full object-contain" />
+            <div className="absolute inset-0 z-10 bg-black/70 backdrop-blur-sm flex items-center justify-center p-2 sm:p-4">
+                <div
+                    role="dialog"
+                    aria-modal="true"
+                    aria-label="Save asset"
+                    className="bg-gray-900 border border-gray-700 rounded-2xl shadow-2xl w-full max-w-md max-h-full flex flex-col overflow-hidden"
+                    onClick={e => e.stopPropagation()}
+                >
+                    <div className="flex shrink-0 items-center justify-between gap-3 border-b border-gray-700 px-4 py-3 sm:px-5">
+                        <h3 className="text-white font-bold flex items-center gap-2"><BookmarkPlus className="w-5 h-5 text-purple-400" /> {form.editing ? 'Edit Library Template' : 'Save to Library'}</h3>
+                        <button type="button" onClick={() => setForm(null)} aria-label="Cancel asset editing" className="p-2 -mr-2 text-gray-400 hover:text-white hover:bg-gray-800 rounded-lg">
+                            <X className="w-5 h-5" />
+                        </button>
                     </div>
-                    <div className="space-y-3">
+                    <form onSubmit={e => { e.preventDefault(); void submitForm(); }} className="min-h-0 flex flex-1 flex-col">
+                      <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4 sm:px-5">
+                        <div className="h-28 sm:h-36 bg-gray-800 rounded-lg mb-4 flex items-center justify-center p-3 border border-gray-700">
+                            <img src={form.dataUri} alt="Asset preview" className="max-w-full max-h-full object-contain" />
+                        </div>
+                        <div className="space-y-3">
+                          {formError && (
+                            <div role="alert" className="rounded-lg border border-red-800 bg-red-950/70 px-3 py-2 text-xs text-red-200">
+                              <p className="font-semibold">Could not save this asset</p>
+                              <p className="mt-0.5 text-red-300">{formError}</p>
+                            </div>
+                          )}
                         <input
                             value={form.name}
                             onChange={e => setForm({ ...form, name: e.target.value })}
@@ -417,17 +456,22 @@ const SignLibrary: React.FC<SignLibraryProps> = ({ isOpen, onClose, onSelect, ac
                                 <Globe className="w-3 h-3 text-blue-400" /> Publish to shared library (visible to all users)
                             </label>
                         )}
-                        <div className="flex gap-2 pt-1">
-                            <button onClick={() => setForm(null)} className="flex-1 bg-gray-800 hover:bg-gray-700 text-gray-300 py-2 rounded-lg text-sm border border-gray-700">Cancel</button>
-                            <button
-                                onClick={submitForm}
-                                disabled={busy === 'save' || !form.dataUri}
-                                className="flex-1 bg-purple-600 hover:bg-purple-500 disabled:opacity-40 text-white py-2 rounded-lg text-sm font-semibold flex items-center justify-center gap-2"
-                            >
-                                {busy === 'save' && <Loader2 className="w-3.5 h-3.5 animate-spin" />} Save
-                            </button>
                         </div>
-                    </div>
+                      </div>
+                      <div className="shrink-0 border-t border-gray-700 bg-gray-900 px-4 py-3 sm:px-5">
+                        <p className="mb-2 text-center text-[11px] text-gray-500">Your changes are kept open until you save or cancel.</p>
+                        <div className="flex gap-2">
+                          <button type="button" onClick={() => setForm(null)} className="min-h-11 flex-1 bg-gray-800 hover:bg-gray-700 text-gray-300 py-2 rounded-lg text-sm border border-gray-700">Cancel</button>
+                          <button
+                              type="submit"
+                              disabled={busy === 'save' || !form.dataUri}
+                              className="min-h-11 flex-[1.6] bg-purple-600 hover:bg-purple-500 disabled:opacity-40 text-white px-3 py-2 rounded-lg text-sm font-semibold flex items-center justify-center gap-2"
+                          >
+                              {busy === 'save' && <Loader2 className="w-3.5 h-3.5 animate-spin" />} {busy === 'save' ? 'Saving…' : formSaveLabel}
+                          </button>
+                        </div>
+                      </div>
+                    </form>
                 </div>
             </div>
         )}
