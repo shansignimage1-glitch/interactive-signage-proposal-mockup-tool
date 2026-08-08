@@ -6,6 +6,7 @@ import ToastViewport from './components/ToastViewport';
 import { initMonitoring, reportError } from './services/monitoring';
 import LegalCenter from './components/LegalCenter';
 import { installChunkRecovery } from './services/chunkRecovery';
+import PwaUpdatePrompt from './components/PwaUpdatePrompt';
 
 initMonitoring();
 installChunkRecovery();
@@ -20,6 +21,6 @@ if (!rootElement) {
 const root = ReactDOM.createRoot(rootElement);
 root.render(
   <React.StrictMode>
-    <AppErrorBoundary><App /><ToastViewport /><LegalCenter /></AppErrorBoundary>
+    <AppErrorBoundary><App /><ToastViewport /><PwaUpdatePrompt /><LegalCenter /></AppErrorBoundary>
   </React.StrictMode>
 );

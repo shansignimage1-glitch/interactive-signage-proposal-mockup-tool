@@ -1,4 +1,5 @@
 /// <reference types="vite/client" />
+/// <reference types="vite-plugin-pwa/react" />
 
 interface ImportMetaEnv {
   // OAuth web client ID from the sunny-ship-437805-c5 GCP project — used by
