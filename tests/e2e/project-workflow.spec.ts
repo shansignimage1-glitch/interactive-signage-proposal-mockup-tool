@@ -7,6 +7,12 @@ test('guest can upload, autosave, reopen, browse library, measure, and export', 
   await page.goto('/');
   await page.getByRole('button', { name: 'Continue as Guest' }).click();
 
+  const openMobileControls = async () => {
+    const button = page.getByRole('button', { name: 'Open all controls' });
+    if (await button.isVisible()) await button.click();
+  };
+
+  await openMobileControls();
   await page.getByRole('button', { name: /New Image \/ Camera/ }).click();
   await expect(page.getByText('Select Image Source')).toBeVisible();
   await page.locator('input[type=file]').setInputFiles(fixture);
@@ -35,29 +41,37 @@ test('guest can upload, autosave, reopen, browse library, measure, and export', 
 
   await page.reload();
   await page.getByRole('button', { name: 'Continue as Guest' }).click();
-  await expect(page.getByText('Guest User')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Sign Out' })).toBeVisible();
 
+  await openMobileControls();
   await page.getByRole('button', { name: 'Lib', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Asset Library' })).toBeVisible();
   await page.getByRole('button', { name: 'Close asset library' }).click();
 
-  await page.getByRole('button', { name: 'Scale' }).click();
-  await expect(page.getByRole('button', { name: 'Scale' })).toHaveClass(/bg-amber-600/);
+  await page.getByRole('button', { name: /Set real-world scale/ }).click();
+  await expect(page.getByRole('heading', { name: 'How was this photo taken?' })).toBeVisible();
+  await page.getByRole('button', { name: /Straight-on photo/ }).click();
   const drawingSurface = page.locator('#export-target');
   const bounds = await drawingSurface.boundingBox();
   expect(bounds).not.toBeNull();
   await drawingSurface.click({ position: { x: bounds!.width * 0.35, y: bounds!.height * 0.4 } });
   await drawingSurface.click({ position: { x: bounds!.width * 0.55, y: bounds!.height * 0.4 } });
-  await expect(page.getByRole('heading', { name: 'Set Real-World Scale' })).toBeVisible();
-  await page.getByRole('button', { name: 'Set Scale' }).click();
-  await expect(page.getByText(/1px ≈/)).toBeVisible();
+  await page.getByRole('button', { name: 'Continue' }).click();
+  await expect(page.getByRole('heading', { name: 'Enter the known size' })).toBeVisible();
+  await page.getByRole('button', { name: 'Review calibration' }).click();
+  await expect(page.getByRole('heading', { name: 'Review calibration' })).toBeVisible();
+  await page.getByRole('button', { name: 'Apply calibration' }).click();
+  const mobileCalibration = page.getByRole('button', { name: 'Edit calibration' });
+  if (await mobileCalibration.isVisible()) await expect(mobileCalibration).toBeVisible();
+  else await expect(page.locator('p').filter({ hasText: /^Calibrated$/ })).toBeVisible();
 
-  await page.getByRole('button', { name: 'Line' }).click();
-  await expect(page.getByRole('button', { name: 'Line' })).toHaveClass(/bg-blue-600/);
+  await page.getByRole('button', { name: 'Measure line' }).click();
+  await expect(page.getByRole('button', { name: 'Measure line' })).toHaveClass(/bg-blue-600/);
   await drawingSurface.click({ position: { x: bounds!.width * 0.3, y: bounds!.height * 0.55 } });
   await drawingSurface.click({ position: { x: bounds!.width * 0.6, y: bounds!.height * 0.55 } });
   await expect(page.locator('#export-target input')).toHaveValue(/(mm|cm|m)$/);
 
+  await openMobileControls();
   const download = page.waitForEvent('download');
   await page.getByRole('button', { name: 'Download PDF/PNG to device' }).click();
   expect((await download).suggestedFilename()).toMatch(/\.png$/);

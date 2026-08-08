@@ -158,7 +158,7 @@ const Assistant: React.FC<AssistantProps> = ({ isOpen: propIsOpen, setIsOpen: pr
       return (
           <button 
             onClick={() => setIsOpen(true)}
-            className="fixed bottom-6 right-6 z-50 w-14 h-14 bg-blue-600 hover:bg-blue-500 text-white rounded-full shadow-lg shadow-blue-900/40 flex items-center justify-center transition-all hover:scale-110"
+            className="fixed bottom-[calc(6rem+env(safe-area-inset-bottom))] right-3 z-50 flex h-12 w-12 items-center justify-center rounded-full bg-blue-600 text-white shadow-lg shadow-blue-900/40 transition-all hover:scale-110 hover:bg-blue-500 lg:bottom-6 lg:right-6 lg:h-14 lg:w-14"
             title="Open Assistant"
           >
               <Bot className="w-7 h-7" />
@@ -168,7 +168,7 @@ const Assistant: React.FC<AssistantProps> = ({ isOpen: propIsOpen, setIsOpen: pr
 
   return (
     <div 
-        className={`fixed right-4 md:right-6 z-50 bg-gray-900 border border-gray-700 rounded-xl shadow-2xl flex flex-col transition-all duration-300 overflow-hidden ${isMinimized ? 'bottom-6 w-72 h-14' : 'bottom-6 w-[90vh] md:w-96 h-[60vh] md:h-[550px]'}`}
+        className={`fixed right-3 z-50 flex flex-col overflow-hidden rounded-2xl border border-gray-700 bg-gray-900 shadow-2xl transition-all duration-300 md:right-6 ${isMinimized ? 'bottom-[calc(6rem+env(safe-area-inset-bottom))] h-14 w-[calc(100vw-1.5rem)] max-w-72 lg:bottom-6' : 'bottom-[calc(6rem+env(safe-area-inset-bottom))] h-[min(64dvh,540px)] w-[calc(100vw-1.5rem)] lg:bottom-6 lg:h-[550px] lg:w-96'}`}
     >
         {/* Header */}
         <div className="flex items-center justify-between p-3 bg-gray-800 border-b border-gray-700 cursor-pointer" onClick={() => isMinimized && setIsMinimized(false)}>

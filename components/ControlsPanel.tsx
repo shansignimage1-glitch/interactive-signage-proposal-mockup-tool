@@ -3,7 +3,7 @@ import React, { useRef, useState, useEffect } from 'react';
 import { BLEND_MODES, MockupState, Sign, Point, Dimension, SignTemplate, ReferenceImage, TitleBlockField, Canvas, PaperSize, Orientation, SIGN_TYPES, SignType, UnitSystem } from '../types';
 import { distance } from '../utils/math';
 import { getMmPerPx, formatLength, toMm, measureLine, measureBox } from '../utils/measure';
-import { Upload, Download, Sun, Moon, Move3d, Palette, Image as ImageIcon, Plus, Trash2, Layers, Eye, Copy, Box, Minus, Maximize, Ruler, ArrowRight, ArrowDown, ArrowLeft, ArrowUp, Scissors, Check, X, Eraser, Loader2, Square, PenTool, MousePointer2, Hand, Mic, EyeOff, Undo2, Redo2, Layout, FileText, Settings, Briefcase, User, Calendar, MapPin, Notebook, Camera, Library, Sparkles, PencilLine, Grid, Save, ChevronDown, ChevronRight, Monitor, Printer, FolderOpen, HardDrive } from 'lucide-react';
+import { Upload, Download, Sun, Moon, Move3d, Palette, Image as ImageIcon, Plus, Trash2, Layers, Eye, Copy, Box, Minus, Maximize, Ruler, ArrowRight, ArrowDown, ArrowLeft, ArrowUp, Scissors, Check, X, Eraser, Loader2, Square, PenTool, MousePointer2, Hand, Mic, EyeOff, Undo2, Redo2, Layout, FileText, Settings, Briefcase, User, Calendar, MapPin, Notebook, Camera, Library, Sparkles, PencilLine, Grid, Save, ChevronDown, ChevronRight, Monitor, Printer, FolderOpen, HardDrive, Lock, Unlock } from 'lucide-react';
 import ImageUploader from './ImageUploader';
 import SignLibrary from './SignLibrary';
 import { ToolMode } from '../App';
@@ -31,6 +31,11 @@ interface ControlsPanelProps {
 
   toolMode: ToolMode;
   setToolMode: (mode: ToolMode) => void;
+  viewLocked: boolean;
+  onViewLockedChange: (locked: boolean) => void;
+  onOpenCalibration: () => void;
+  showCalibrationReference: boolean;
+  setShowCalibrationReference: (show: boolean) => void;
   updateDimension: (id: string, updates: Partial<Dimension>) => void;
   removeDimension: (id: string) => void;
   setActiveDimension: (id: string) => void;
@@ -75,6 +80,11 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
 
   toolMode,
   setToolMode,
+  viewLocked,
+  onViewLockedChange,
+  onOpenCalibration,
+  showCalibrationReference,
+  setShowCalibrationReference,
   updateDimension,
   removeDimension,
   setActiveDimension,
@@ -114,6 +124,7 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
   const [isViewMenuOpen, setIsViewMenuOpen] = useState(false);
   
   const [activeTab, setActiveTab] = useState<'editor' | 'page' | 'notes'>('editor');
+  const [mobilePanelExpanded, setMobilePanelExpanded] = useState(false);
 
   // Target real-world width input for the "Set width" sign-sizing control
   const [targetWidth, setTargetWidth] = useState('');
@@ -408,6 +419,26 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
   const calibration = activeCanvas.calibration ?? null;
   const mmPerPx = calibration ? getMmPerPx(calibration) : null;
 
+  const activateTool = (mode: ToolMode) => {
+      setToolMode(mode);
+      setMobilePanelExpanded(false);
+  };
+
+  const activatePan = () => {
+      if (viewLocked) onViewLockedChange(false);
+      activateTool('pan');
+  };
+
+  const startCalibration = () => {
+      setMobilePanelExpanded(false);
+      onOpenCalibration();
+  };
+
+  const startLineMeasurement = () => {
+      if (calibration) activateTool('draw_line');
+      else startCalibration();
+  };
+
   const setUnitSystem = (system: UnitSystem) => {
       // Re-label every auto-measured dimension across all views in the new units
       const newCanvases = state.canvases.map(c => {
@@ -456,14 +487,35 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
 
   return (
     <>
-      <div className="w-full lg:w-80 h-[45%] lg:h-full bg-gray-900 border-t lg:border-t-0 lg:border-r border-gray-700 flex flex-col shadow-xl z-20">
-        <div className="p-4 md:p-6 border-b border-gray-700 bg-gray-800 flex-shrink-0 flex items-center justify-between">
+      <div data-testid="controls-panel" data-mobile-expanded={mobilePanelExpanded} className={`fixed inset-x-0 bottom-0 z-[80] flex flex-col transition-[height] duration-300 ease-out lg:static lg:z-20 lg:h-full lg:w-80 lg:flex-shrink-0 lg:border-r lg:border-gray-700 lg:bg-gray-900 lg:shadow-xl lg:pointer-events-auto ${mobilePanelExpanded ? 'h-[min(78dvh,720px)] rounded-t-3xl border-t border-gray-700 bg-gray-900 shadow-[0_-18px_60px_rgba(0,0,0,0.55)]' : 'h-[calc(78px+env(safe-area-inset-bottom))] pointer-events-none'}`}>
+        {!mobilePanelExpanded && (
+          <div data-testid="mobile-tool-dock" className="pointer-events-auto mx-2 mb-[max(0.5rem,env(safe-area-inset-bottom))] mt-auto rounded-2xl border border-gray-700/90 bg-gray-900/95 p-1.5 shadow-2xl backdrop-blur-xl lg:hidden">
+            <div className="grid grid-cols-5 gap-1">
+              <MobileDockButton label="Select" ariaLabel="Select & adjust" active={toolMode === 'select'} onClick={() => activateTool('select')} icon={<MousePointer2 className="h-5 w-5" />} />
+              <MobileDockButton
+                label={viewLocked ? 'Locked' : 'Pan'}
+                ariaLabel={viewLocked ? 'Unlock view' : 'Pan view'}
+                active={!viewLocked && toolMode === 'pan'}
+                warning={viewLocked}
+                onClick={activatePan}
+                icon={viewLocked ? <Lock className="h-5 w-5" /> : <Hand className="h-5 w-5" />}
+              />
+              <MobileDockButton label="Measure" ariaLabel="Measure line" active={toolMode === 'draw_line'} onClick={startLineMeasurement} icon={<PenTool className="h-5 w-5" />} />
+              <MobileDockButton label={calibration ? 'Calibrated' : 'Scale'} ariaLabel={calibration ? 'Edit calibration' : 'Set real-world scale'} active={toolMode === 'calibrate' || toolMode === 'calibrate_plane'} accent onClick={startCalibration} icon={<Ruler className="h-5 w-5" />} />
+              <MobileDockButton label="More" ariaLabel="Open all controls" onClick={() => setMobilePanelExpanded(true)} icon={<Settings className="h-5 w-5" />} />
+            </div>
+          </div>
+        )}
+
+        {mobilePanelExpanded && <button onClick={() => setMobilePanelExpanded(false)} className="grid min-h-6 w-full place-items-center lg:hidden" aria-label="Collapse controls"><span className="h-1 w-10 rounded-full bg-gray-600" /></button>}
+
+        <div className={`${mobilePanelExpanded ? 'flex' : 'hidden'} flex-shrink-0 items-center justify-between border-b border-gray-700 bg-gray-800 px-3 py-2.5 lg:flex lg:p-6`}>
           <div className="flex-1 min-w-0 pr-2">
-            <h1 className="text-xl font-bold text-white flex items-center gap-2 truncate">
-                <Move3d className="w-6 h-6 text-blue-400 flex-shrink-0" />
+            <h1 className="flex items-center gap-2 truncate text-base font-bold text-white lg:text-xl">
+                <Move3d className="h-5 w-5 flex-shrink-0 text-blue-400 lg:h-6 lg:w-6" />
                 <span className="truncate">{state.projectName || 'SignagePro'}</span>
             </h1>
-            <p className="text-xs text-gray-400 mt-1 truncate">Proposal Mockup Tool</p>
+            <p className="mt-0.5 hidden truncate text-[11px] text-gray-400 sm:block lg:mt-1 lg:text-xs">Proposal Mockup Tool</p>
           </div>
           <div className="flex items-center gap-1 flex-shrink-0">
              <button 
@@ -498,11 +550,12 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
              >
                 <Redo2 className="w-4 h-4" />
              </button>
+             <button onClick={() => setMobilePanelExpanded(false)} className="ml-1 grid h-10 w-10 place-items-center rounded-xl text-gray-300 hover:bg-gray-700 lg:hidden" aria-label="Collapse controls"><ChevronDown className="h-5 w-5" /></button>
           </div>
         </div>
 
         {/* Tab Header */}
-        <div className="flex border-b border-gray-700 bg-gray-900 overflow-x-auto no-scrollbar">
+        <div className={`${mobilePanelExpanded ? 'flex' : 'hidden'} flex-shrink-0 overflow-x-auto border-b border-gray-700 bg-gray-900 no-scrollbar lg:flex`}>
            <button 
               onClick={() => setActiveTab('editor')}
               className={`flex-1 py-3 text-sm font-medium flex items-center justify-center gap-2 transition-colors border-b-2 min-w-[80px] ${activeTab === 'editor' ? 'text-blue-400 border-blue-400 bg-gray-800' : 'text-gray-400 border-transparent hover:text-gray-200 hover:bg-gray-800/50'}`}
@@ -523,7 +576,7 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
            </button>
         </div>
 
-        <div className="p-4 md:p-6 space-y-6 md:space-y-8 flex-1 overflow-y-auto custom-scrollbar">
+        <div className={`${mobilePanelExpanded ? 'block' : 'hidden'} flex-1 space-y-5 overflow-y-auto p-3 custom-scrollbar lg:block lg:space-y-8 lg:p-6`}>
           
           {/* EDITOR TAB CONTENT */}
           {activeTab === 'editor' && (
@@ -655,32 +708,65 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
                         </button>
                     </div>
                 </div>
-                <div className="grid grid-cols-3 gap-1 bg-gray-800 p-1 rounded-lg border border-gray-700">
-                    <button onClick={() => setToolMode('select')} className={`flex-1 flex items-center justify-center p-2 rounded gap-2 text-xs transition-colors ${toolMode === 'select' ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white'}`}><MousePointer2 className="w-4 h-4" /> Select</button>
-                    <button onClick={() => setToolMode('pan')} className={`flex-1 flex items-center justify-center p-2 rounded gap-2 text-xs transition-colors ${toolMode === 'pan' ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white'}`} title="Drag to move the view; pinch with two fingers to zoom"><Hand className="w-4 h-4" /> Pan</button>
-                    <button onClick={() => setToolMode('draw_line')} className={`flex-1 flex items-center justify-center p-2 rounded gap-2 text-xs transition-colors ${toolMode === 'draw_line' ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white'}`}><PenTool className="w-4 h-4" /> Line</button>
-                    <button onClick={() => setToolMode('draw_box')} className={`flex-1 flex items-center justify-center p-2 rounded gap-2 text-xs transition-colors ${toolMode === 'draw_box' ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white'}`}><Square className="w-4 h-4" /> Box</button>
-                    <button onClick={() => setToolMode('calibrate')} className={`flex-1 flex items-center justify-center p-2 rounded gap-2 text-xs transition-colors ${toolMode === 'calibrate' ? 'bg-amber-600 text-white' : 'text-gray-400 hover:text-white'}`} title="Draw over a known-size object to set the real-world scale"><Ruler className="w-4 h-4" /> Scale</button>
-                    <button onClick={() => setToolMode('calibrate_plane')} className={`flex-1 flex items-center justify-center p-2 rounded gap-1 text-xs transition-colors ${toolMode === 'calibrate_plane' ? 'bg-amber-600 text-white' : 'text-gray-400 hover:text-white'}`} title="Tap wall corners clockwise: top-left, top-right, bottom-right, bottom-left"><Grid className="w-4 h-4" /> Plane</button>
-                </div>
-                {calibration && mmPerPx ? (
-                    <div className="flex items-center justify-between text-xs bg-amber-500/10 border border-amber-500/30 rounded-lg px-2 py-1.5">
-                        <span className="text-amber-300 font-mono truncate">
-                            {calibration.plane ? `Perspective plane ${Math.round(calibration.plane.widthMm)}×${Math.round(calibration.plane.heightMm)}mm` : `1px ≈ ${mmPerPx >= 10 ? `${(mmPerPx / 10).toFixed(1)}cm` : `${mmPerPx.toFixed(1)}mm`} · ref ${calibration.realValue}${calibration.unit}`}
-                        </span>
-                        <button onClick={() => updateActiveCanvasWithHistory({ calibration: null })} className="text-amber-400 hover:text-red-400 ml-2 flex-shrink-0" title="Clear scale">
-                            <X className="w-3.5 h-3.5" />
+                <div>
+                    <p className="mb-1.5 text-[10px] font-bold uppercase tracking-wider text-gray-500">Canvas navigation</p>
+                    <div className="grid grid-cols-2 gap-2">
+                        <button onClick={() => activateTool('select')} className={`flex min-h-11 items-center justify-center gap-2 rounded-lg border text-xs transition-colors ${toolMode === 'select' ? 'border-blue-500 bg-blue-600 text-white' : 'border-gray-700 bg-gray-800 text-gray-300 hover:border-gray-600 hover:text-white'}`}><MousePointer2 className="h-4 w-4" /> Select & adjust</button>
+                        <button onClick={activatePan} className={`flex min-h-11 items-center justify-center gap-2 rounded-lg border text-xs transition-colors ${toolMode === 'pan' && !viewLocked ? 'border-blue-500 bg-blue-600 text-white' : 'border-gray-700 bg-gray-800 text-gray-300 hover:border-gray-600 hover:text-white'}`} title="Drag to move the view; pinch with two fingers to zoom"><Hand className="h-4 w-4" /> Pan view</button>
+                        <button
+                            type="button"
+                            aria-label={viewLocked ? 'Unlock view' : 'Lock view'}
+                            aria-pressed={viewLocked}
+                            onClick={() => onViewLockedChange(!viewLocked)}
+                            className={`col-span-2 flex min-h-12 items-center gap-3 rounded-xl border px-3 text-left transition-colors ${viewLocked ? 'border-amber-400/70 bg-amber-500/15 text-amber-100' : 'border-gray-700 bg-gray-800 text-gray-200 hover:border-gray-600 hover:bg-gray-750'}`}
+                        >
+                            <span className={`grid h-9 w-9 shrink-0 place-items-center rounded-lg ${viewLocked ? 'bg-amber-400/20 text-amber-300' : 'bg-gray-700 text-gray-300'}`}>
+                                {viewLocked ? <Lock className="h-4 w-4" /> : <Unlock className="h-4 w-4" />}
+                            </span>
+                            <span className="min-w-0">
+                                <strong className="block text-xs">{viewLocked ? 'View locked — tap to unlock' : 'Lock pan and zoom'}</strong>
+                                <span className="mt-0.5 block text-[10px] text-gray-400">Sign, dimension and calibration editing stays active.</span>
+                            </span>
                         </button>
                     </div>
+                </div>
+
+                {calibration && mmPerPx ? (
+                    <div className="rounded-xl border border-emerald-500/35 bg-emerald-500/10 p-3">
+                        <div className="flex items-start justify-between gap-2">
+                            <div className="min-w-0">
+                                <p className="text-[10px] font-bold uppercase tracking-wider text-emerald-400">Calibrated</p>
+                                <p className="mt-1 truncate text-xs font-medium text-white">
+                                    {calibration.plane ? `Perspective wall · ${formatLength(calibration.plane.widthMm, state.unitSystem)} × ${formatLength(calibration.plane.heightMm, state.unitSystem)}` : `Straight-on reference · ${calibration.realValue}${calibration.unit}`}
+                                </p>
+                            </div>
+                            <Grid className={`h-5 w-5 shrink-0 ${calibration.plane ? 'text-emerald-300' : 'text-blue-300'}`} />
+                        </div>
+                        <div className="mt-3 grid grid-cols-3 gap-2">
+                            <button onClick={startCalibration} className="min-h-10 rounded-lg bg-gray-800 px-2 text-xs text-gray-200 hover:bg-gray-700">Edit scale</button>
+                            <button onClick={() => setShowCalibrationReference(!showCalibrationReference)} className="min-h-10 rounded-lg bg-gray-800 px-2 text-xs text-gray-200 hover:bg-gray-700">{showCalibrationReference ? 'Hide ref' : 'Show ref'}</button>
+                            <button onClick={() => { updateActiveCanvasWithHistory({ calibration: null }); setShowCalibrationReference(false); }} className="min-h-10 rounded-lg bg-gray-800 px-2 text-xs text-red-300 hover:bg-red-950/60">Clear</button>
+                        </div>
+                    </div>
                 ) : (
-                    <p className="text-[10px] text-gray-500 leading-snug">
-                        No scale set — use the <strong className="text-gray-400">Scale</strong> tool to trace a known-size object (door, brick, card) and measurements will calculate automatically.
-                    </p>
+                    <button onClick={startCalibration} className="flex min-h-16 w-full items-center gap-3 rounded-xl border border-amber-500/40 bg-amber-500/10 p-3 text-left transition hover:border-amber-400 hover:bg-amber-500/15">
+                        <span className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-amber-500/20 text-amber-300"><Ruler className="h-5 w-5" /></span>
+                        <span><strong className="block text-sm text-white">Set real-world scale</strong><span className="mt-0.5 block text-xs text-gray-400">Guided 2-point or perspective-wall calibration</span></span>
+                    </button>
                 )}
+
+                <div>
+                    <div className="mb-1.5 flex items-center justify-between"><p className="text-[10px] font-bold uppercase tracking-wider text-gray-500">Measure</p>{!calibration && <span className="text-[10px] text-amber-400">Set scale first</span>}</div>
+                    <div className="grid grid-cols-2 gap-2">
+                        <button onClick={startLineMeasurement} className={`flex min-h-11 items-center justify-center gap-2 rounded-lg border text-xs transition-colors ${toolMode === 'draw_line' ? 'border-blue-500 bg-blue-600 text-white' : 'border-gray-700 bg-gray-800 text-gray-300 hover:border-gray-600 hover:text-white'}`}><PenTool className="h-4 w-4" /> Measure line</button>
+                        <button onClick={() => calibration ? activateTool('draw_box') : startCalibration()} className={`flex min-h-11 items-center justify-center gap-2 rounded-lg border text-xs transition-colors ${toolMode === 'draw_box' ? 'border-blue-500 bg-blue-600 text-white' : 'border-gray-700 bg-gray-800 text-gray-300 hover:border-gray-600 hover:text-white'}`}><Square className="h-4 w-4" /> Width × height</button>
+                    </div>
+                    <p className="mt-1.5 text-[10px] leading-snug text-gray-500">Tap the first point, then the second. Select a finished measurement to adjust its large handles.</p>
+                </div>
                 {activeCanvas.dimensions.length > 0 && state.showDimensions && (
                     <div className="space-y-2 max-h-32 overflow-y-auto pr-1 custom-scrollbar">
                         {activeCanvas.dimensions.map(dim => (
-                            <div key={dim.id} onClick={() => { setActiveDimension(dim.id); setToolMode('select'); }} className={`flex items-center justify-between p-2 rounded border cursor-pointer transition-all ${dim.id === activeCanvas.activeDimensionId ? 'bg-blue-900/20 border-blue-500/50' : 'bg-gray-800 border-gray-700 hover:border-gray-600'}`}>
+                            <div key={dim.id} onClick={() => { setActiveDimension(dim.id); activateTool('select'); }} className={`flex items-center justify-between p-2 rounded border cursor-pointer transition-all ${dim.id === activeCanvas.activeDimensionId ? 'bg-blue-900/20 border-blue-500/50' : 'bg-gray-800 border-gray-700 hover:border-gray-600'}`}>
                                 <div className="flex items-center gap-2 text-sm text-gray-300">
                                     {dim.variant === 'box' ? <Square className="w-3 h-3 text-gray-500" /> : <PenTool className="w-3 h-3 text-gray-500" />}
                                     <span className="font-mono text-xs truncate max-w-[120px]">{dim.text || 'Untitled'}</span>
@@ -705,7 +791,7 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
                 </div>
                 <div className="space-y-2 max-h-48 overflow-y-auto pr-1 custom-scrollbar">
                   {activeCanvas.signs.map((sign) => (
-                    <div key={sign.id} onClick={() => { setActiveSign(sign.id); setToolMode('select'); }} className={`flex items-center justify-between p-3 rounded border cursor-pointer transition-all ${sign.id === activeCanvas.activeSignId ? 'bg-blue-900/20 border-blue-500/50 ring-1 ring-blue-500/50' : 'bg-gray-800 border-gray-700 hover:border-gray-600'}`}>
+                    <div key={sign.id} onClick={() => { setActiveSign(sign.id); activateTool('select'); }} className={`flex items-center justify-between p-3 rounded border cursor-pointer transition-all ${sign.id === activeCanvas.activeSignId ? 'bg-blue-900/20 border-blue-500/50 ring-1 ring-blue-500/50' : 'bg-gray-800 border-gray-700 hover:border-gray-600'}`}>
                       <div className="flex items-center gap-3 overflow-hidden flex-1 min-w-0 mr-2">
                         <div className="w-8 h-8 rounded bg-gray-700 overflow-hidden flex-shrink-0 border border-gray-600">
                           <img src={sign.image} className="w-full h-full object-cover" alt="" />
@@ -1220,7 +1306,7 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
           )}
         </div>
 
-        <div className="p-4 md:p-6 border-t border-gray-700 bg-gray-800 flex-shrink-0">
+        <div className={`${mobilePanelExpanded ? 'block' : 'hidden'} flex-shrink-0 border-t border-gray-700 bg-gray-800 px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-3 lg:block lg:p-6`}>
           <button
             onClick={() => onDownload('device')}
             className="w-full flex items-center justify-center gap-2 bg-blue-600 hover:bg-blue-500 text-white py-3 rounded-lg font-semibold transition-colors shadow-lg shadow-blue-900/20"
@@ -1233,6 +1319,9 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
               <HardDrive className="w-4 h-4" /> Save PDF/PNG to selected drive
             </button>
           )}
+          <nav className="mt-2 flex justify-center gap-4 text-[11px] text-gray-500 lg:hidden" aria-label="Legal and support">
+            <a href="#/privacy">Privacy</a><a href="#/terms">Terms</a><a href="#/support">Support</a>
+          </nav>
         </div>
       </div>
 
@@ -1337,5 +1426,26 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
     </>
   );
 };
+
+const MobileDockButton: React.FC<{
+  label: string;
+  ariaLabel: string;
+  icon: React.ReactNode;
+  active?: boolean;
+  accent?: boolean;
+  warning?: boolean;
+  onClick: () => void;
+}> = ({ label, ariaLabel, icon, active = false, accent = false, warning = false, onClick }) => (
+  <button
+    type="button"
+    aria-label={ariaLabel}
+    aria-pressed={active || warning}
+    onClick={onClick}
+    className={`flex min-h-14 min-w-0 flex-col items-center justify-center gap-1 rounded-xl px-1 text-[10px] font-semibold transition active:scale-95 ${warning ? 'bg-amber-500/15 text-amber-200 ring-1 ring-inset ring-amber-400/50' : active ? 'bg-blue-600 text-white shadow-lg shadow-blue-950/40' : accent ? 'text-amber-300 hover:bg-amber-500/10' : 'text-gray-300 hover:bg-gray-800'}`}
+  >
+    {icon}
+    <span className="max-w-full truncate">{label}</span>
+  </button>
+);
 
 export default ControlsPanel;

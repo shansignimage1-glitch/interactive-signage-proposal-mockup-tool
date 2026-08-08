@@ -397,8 +397,8 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({ isOpen, onClose, onImageR
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
-      <div className="bg-gray-800 border border-gray-700 rounded-xl shadow-2xl w-full max-w-2xl overflow-hidden flex flex-col max-h-[90vh]">
+    <div className="fixed inset-0 z-[220] flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
+      <div className="flex max-h-[calc(100dvh-1rem)] w-full max-w-2xl flex-col overflow-hidden rounded-xl border border-gray-700 bg-gray-800 shadow-2xl sm:max-h-[90vh]">
         {/* Header */}
         <div className="flex items-center justify-between p-4 border-b border-gray-700 bg-gray-900">
           <h3 className="text-lg font-semibold text-white flex items-center gap-2">
@@ -412,11 +412,11 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({ isOpen, onClose, onImageR
         </div>
 
         {/* Content */}
-        <div className="flex-1 overflow-auto p-6 flex flex-col items-center justify-center min-h-[300px]">
+        <div className="flex min-h-0 flex-1 flex-col items-center justify-center overflow-auto p-3 sm:min-h-[300px] sm:p-6">
           
           {step === 'select' && (
-            <div className="grid grid-cols-2 gap-6 w-full max-w-md">
-              <label className="flex flex-col items-center justify-center gap-4 p-8 bg-gray-700/50 hover:bg-gray-700 border-2 border-dashed border-gray-600 hover:border-blue-500 rounded-xl cursor-pointer transition-all group">
+            <div className="grid w-full max-w-md grid-cols-1 gap-3 sm:grid-cols-2 sm:gap-6">
+              <label className="group flex min-h-28 cursor-pointer flex-col items-center justify-center gap-3 rounded-xl border-2 border-dashed border-gray-600 bg-gray-700/50 p-4 transition-all hover:border-blue-500 hover:bg-gray-700 sm:gap-4 sm:p-8">
                 <div className="p-4 bg-gray-800 rounded-full group-hover:bg-blue-600 transition-colors">
                   <Upload className="w-8 h-8 text-gray-300 group-hover:text-white" />
                 </div>
@@ -426,7 +426,7 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({ isOpen, onClose, onImageR
 
               <button 
                 onClick={startCamera}
-                className="flex flex-col items-center justify-center gap-4 p-8 bg-gray-700/50 hover:bg-gray-700 border-2 border-dashed border-gray-600 hover:border-purple-500 rounded-xl cursor-pointer transition-all group"
+                className="group flex min-h-28 cursor-pointer flex-col items-center justify-center gap-3 rounded-xl border-2 border-dashed border-gray-600 bg-gray-700/50 p-4 transition-all hover:border-purple-500 hover:bg-gray-700 sm:gap-4 sm:p-8"
               >
                 <div className="p-4 bg-gray-800 rounded-full group-hover:bg-purple-600 transition-colors">
                   <Camera className="w-8 h-8 text-gray-300 group-hover:text-white" />

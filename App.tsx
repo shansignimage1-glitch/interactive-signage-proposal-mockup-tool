@@ -12,13 +12,12 @@ const ProjectManager = React.lazy(() => import('./components/ProjectManager'));
 const ElementStudio = React.lazy(() => import('./components/ElementStudio'));
 const DriveSettings = React.lazy(() => import('./components/DriveSettings'));
 const AccountSettings = React.lazy(() => import('./components/AccountSettings'));
-import { MockupState, AppImages, Point, Sign, Dimension, TitleBlock, TitleBlockField, Canvas, Calibration, MeasureUnit, SignElement, Size, ConnectorStatus, CloudProvider } from './types';
+import { MockupState, AppImages, Point, Sign, Dimension, TitleBlock, TitleBlockField, Canvas, Calibration, SignElement, Size, ConnectorStatus, CloudProvider } from './types';
 import { getActiveConnector, getPreferredProvider, setConnectorUid, connectors, getConnectorForRef } from './services/driveConnectors';
 import { distance } from './utils/math';
 import { measureLine, measureBox, getMmPerPx } from './utils/measure';
 import { normalizeProjectState } from './utils/projectMigration';
-import CalibrationModal from './components/CalibrationModal';
-import PerspectiveCalibrationModal from './components/PerspectiveCalibrationModal';
+import CalibrationWizard, { CalibrationDraft } from './components/CalibrationWizard';
 import { TITLE_BLOCK_TEMPLATES } from './data/titleBlockTemplates';
 import { StorageService } from './services/StorageService';
 import { Wifi, WifiOff, RefreshCw, LogIn, LogOut, Loader2, AlertTriangle, User as UserIcon, HardDrive, Database, Settings } from 'lucide-react';
@@ -158,9 +157,9 @@ const App: React.FC = () => {
   useEffect(() => { historyIndexRef.current = historyIndex; }, [historyIndex]);
 
   const [toolMode, setToolMode] = useState<ToolMode>('select');
-  // Reference line drawn in calibrate mode, awaiting its real-world length via modal
-  const [pendingCalibration, setPendingCalibration] = useState<{ start: Point; end: Point } | null>(null);
-  const [pendingPlaneCalibration, setPendingPlaneCalibration] = useState<[Point, Point, Point, Point] | null>(null);
+  const [viewLocked, setViewLocked] = useState(false);
+  const [calibrationDraft, setCalibrationDraft] = useState<CalibrationDraft | null>(null);
+  const [showCalibrationReference, setShowCalibrationReference] = useState(false);
   const [isCropping, setIsCropping] = useState(false);
   const [showCleanupTool, setShowCleanupTool] = useState(false);
   const [showElementStudio, setShowElementStudio] = useState(false);
@@ -175,6 +174,17 @@ const App: React.FC = () => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const stateRef = useRef(state);
   useEffect(() => { stateRef.current = state; }, [state]);
+  useEffect(() => {
+      document.documentElement.classList.toggle('signagepro-authenticated', !!state.user);
+      return () => document.documentElement.classList.remove('signagepro-authenticated');
+  }, [state.user]);
+
+  const handleViewLockedChange = useCallback((locked: boolean) => {
+      setViewLocked(locked);
+      if (locked) {
+          setToolMode(current => current === 'pan' ? 'select' : current);
+      }
+  }, []);
 
   // Start a fresh session: replace state AND the undo history so undo can
   // never step back into a pre-login (user: null) state
@@ -184,6 +194,8 @@ const App: React.FC = () => {
       setHistory([newState]);
       setHistoryIndex(0);
       historyIndexRef.current = 0;
+      setViewLocked(false);
+      setToolMode('select');
   }, []);
 
   const handleGuestLogin = useCallback(async () => {
@@ -676,14 +688,30 @@ const App: React.FC = () => {
       setToolMode('select');
   };
 
-  // --- Calibration Handlers ---
-  const handleCalibrateComplete = (start: Point, end: Point) => {
-      setPendingCalibration({ start, end });
+  // --- Guided calibration workflow ---
+  const openCalibration = () => {
+      const existing = activeCanvas?.calibration ?? null;
+      const isPlane = !!existing?.plane;
+      setCalibrationDraft({
+          stage: 'choose',
+          method: isPlane ? 'plane' : existing ? 'line' : null,
+          points: existing?.plane ? [...existing.plane.corners] : existing ? [existing.start, existing.end] : [],
+          presetId: isPlane ? 'custom_plane' : existing ? 'custom' : 'door_height',
+          value: existing && !isPlane ? String(existing.realValue) : '',
+          width: existing?.plane ? String(existing.plane.widthMm / 1000) : '0.813',
+          height: existing?.plane ? String(existing.plane.heightMm / 1000) : '2.032',
+          unit: isPlane ? 'm' : existing?.unit ?? 'm',
+          reapply: false,
+      });
   };
 
-  const confirmCalibration = (realValue: number, unit: MeasureUnit, reapply: boolean) => {
-      if (!pendingCalibration || !activeCanvas) return;
-      const calibration: Calibration = { ...pendingCalibration, realValue, unit };
+  const cancelCalibration = () => {
+      setCalibrationDraft(null);
+      setToolMode('select');
+  };
+
+  const applyCalibration = (calibration: Calibration, reapply: boolean) => {
+      if (!activeCanvas) return;
       let newDims = activeCanvas.dimensions;
       if (reapply) {
           newDims = activeCanvas.dimensions.map(d => ({
@@ -695,22 +723,19 @@ const App: React.FC = () => {
           }));
       }
       updateActiveCanvasWithHistory({ calibration, dimensions: newDims });
-      setPendingCalibration(null);
+      setCalibrationDraft(null);
+      setShowCalibrationReference(false);
       setToolMode('select');
   };
 
-  const cancelCalibration = () => {
-      setPendingCalibration(null);
-      setToolMode('select');
-  };
-
-  const confirmPlaneCalibration = (widthMm: number, heightMm: number) => {
-      if (!pendingPlaneCalibration) return;
-      const [start, end] = pendingPlaneCalibration;
-      const calibration: Calibration = { start, end, realValue: widthMm, unit: 'mm', plane: { corners: pendingPlaneCalibration, widthMm, heightMm } };
-      updateActiveCanvasWithHistory({ calibration });
-      setPendingPlaneCalibration(null); setToolMode('select');
-  };
+  useEffect(() => {
+      if (!calibrationDraft) return;
+      if (calibrationDraft.stage === 'place' && calibrationDraft.method) {
+          setToolMode(calibrationDraft.method === 'plane' ? 'calibrate_plane' : 'calibrate');
+      } else if (toolMode === 'calibrate' || toolMode === 'calibrate_plane') {
+          setToolMode('select');
+      }
+  }, [calibrationDraft?.stage, calibrationDraft?.method, toolMode]);
 
   // --- Per-Element Extrusion (Element Studio) ---
   const applySignElements = (elements: SignElement[] | undefined, sourceSize: Size | undefined) => {
@@ -988,17 +1013,17 @@ const App: React.FC = () => {
   if (!activeCanvas) return null;
 
   return (
-    <div className="flex flex-col-reverse lg:flex-row w-full h-full bg-black overflow-hidden relative">
+    <div className="relative flex h-[100dvh] w-full overflow-hidden bg-black lg:flex-row">
       {/* Top Bar Status */}
-      <div className="absolute top-4 left-1/2 -translate-x-1/2 z-50 pointer-events-none flex items-center gap-2">
+      <div className="pointer-events-none absolute left-3 top-[max(0.75rem,env(safe-area-inset-top))] z-50 flex max-w-[48vw] items-center gap-2 lg:left-1/2 lg:max-w-none lg:-translate-x-1/2">
           {!state.isOnline && !state.user.uid.startsWith('guest_') && (
               <div className="bg-red-600/90 text-white px-3 py-1 rounded-full text-xs font-bold flex items-center gap-1 shadow-lg backdrop-blur">
                   <WifiOff className="w-3 h-3" /> Offline Mode
               </div>
           )}
           {state.user.uid.startsWith('guest_') && (
-              <div className="bg-gray-700/90 text-gray-300 px-3 py-1 rounded-full text-xs font-bold flex items-center gap-1 shadow-lg backdrop-blur border border-gray-600">
-                  <UserIcon className="w-3 h-3" /> Guest Mode (Local)
+              <div className="flex min-h-9 max-w-full items-center gap-1 rounded-full border border-gray-600 bg-gray-700/90 px-3 py-1 text-xs font-bold text-gray-300 shadow-lg backdrop-blur">
+                  <UserIcon className="h-3 w-3 shrink-0" /> <span className="truncate">Guest Mode (Local)</span>
               </div>
           )}
           {state.isSyncing && state.isOnline && (
@@ -1033,30 +1058,30 @@ const App: React.FC = () => {
       </div>
 
       {/* User Profile / Logout (Top Right) */}
-      <div className="absolute top-4 right-4 z-50 flex items-center gap-3 bg-gray-900/80 backdrop-blur p-1 pr-3 rounded-full border border-gray-700">
-          <img src={state.user.photoURL || DEFAULT_AVATAR} className="w-8 h-8 rounded-full border border-gray-600" alt="User" />
+      <div className="absolute right-3 top-[max(0.75rem,env(safe-area-inset-top))] z-50 flex items-center gap-1 rounded-full border border-gray-700 bg-gray-900/85 p-1 pr-1.5 shadow-xl backdrop-blur lg:right-4 lg:gap-2 lg:pr-3">
+          <img src={state.user.photoURL || DEFAULT_AVATAR} className="h-9 w-9 rounded-full border border-gray-600 lg:h-8 lg:w-8" alt="User" />
           <span className="text-xs font-medium text-gray-300 hidden md:block">{state.user.displayName}</span>
           {!state.user.uid.startsWith('guest_') && (
-              <button onClick={() => setShowDriveSettings(true)} className={`p-1.5 rounded-full transition-colors ${driveStatus === 'connected' ? 'text-green-400 hover:bg-green-500/20' : driveStatus === 'expired' ? 'text-amber-400 hover:bg-amber-500/20' : 'text-gray-400 hover:bg-blue-500/20 hover:text-blue-400'}`} title={driveStatus === 'connected' ? 'Cloud drive connected' : 'Connect your cloud drive'}>
+              <button onClick={() => setShowDriveSettings(true)} className={`grid h-10 w-10 place-items-center rounded-full transition-colors ${driveStatus === 'connected' ? 'text-green-400 hover:bg-green-500/20' : driveStatus === 'expired' ? 'text-amber-400 hover:bg-amber-500/20' : 'text-gray-400 hover:bg-blue-500/20 hover:text-blue-400'}`} title={driveStatus === 'connected' ? 'Cloud drive connected' : 'Connect your cloud drive'} aria-label={driveStatus === 'connected' ? 'Cloud drive connected' : 'Connect your cloud drive'}>
                   <HardDrive className="w-4 h-4" />
               </button>
           )}
-          {!state.user.uid.startsWith('guest_') && <button onClick={() => setShowAccountSettings(true)} className="p-1.5 text-gray-400 hover:bg-gray-700 hover:text-white rounded-full" title="Account and data"><Settings className="w-4 h-4" /></button>}
-          <button onClick={handleLogout} className="p-1.5 hover:bg-red-500/20 hover:text-red-400 text-gray-400 rounded-full transition-colors" title="Sign Out">
+          {!state.user.uid.startsWith('guest_') && <button onClick={() => setShowAccountSettings(true)} className="grid h-10 w-10 place-items-center rounded-full text-gray-400 hover:bg-gray-700 hover:text-white" title="Account and data" aria-label="Account and data"><Settings className="w-4 h-4" /></button>}
+          <button onClick={handleLogout} className="grid h-10 w-10 place-items-center rounded-full text-gray-400 transition-colors hover:bg-red-500/20 hover:text-red-400" title="Sign Out" aria-label="Sign Out">
               <LogOut className="w-4 h-4" />
           </button>
       </div>
 
-      {/* Calibration: real-world length entry for the drawn reference line */}
-      {pendingCalibration && (
-          <CalibrationModal
-              pixelLength={distance(pendingCalibration.start, pendingCalibration.end)}
+      {calibrationDraft && (
+          <CalibrationWizard
+              draft={calibrationDraft}
+              imageSize={activeCanvas.backgroundSize}
               existingDimensionCount={activeCanvas.dimensions.length}
-              onConfirm={confirmCalibration}
+              onChange={setCalibrationDraft}
+              onApply={applyCalibration}
               onCancel={cancelCalibration}
           />
       )}
-      {pendingPlaneCalibration && <PerspectiveCalibrationModal onConfirm={confirmPlaneCalibration} onCancel={() => setPendingPlaneCalibration(null)} />}
 
       <Suspense fallback={null}>
         <Assistant isOpen={showAssistant} setIsOpen={setShowAssistant} />
@@ -1081,6 +1106,11 @@ const App: React.FC = () => {
 
         toolMode={toolMode}
         setToolMode={setToolMode}
+        viewLocked={viewLocked}
+        onViewLockedChange={handleViewLockedChange}
+        onOpenCalibration={openCalibration}
+        showCalibrationReference={showCalibrationReference}
+        setShowCalibrationReference={setShowCalibrationReference}
         updateDimension={updateDimension}
         removeDimension={removeDimension}
         setActiveDimension={setActiveDimension}
@@ -1121,10 +1151,17 @@ const App: React.FC = () => {
            })}}
 
            toolMode={toolMode}
+           viewLocked={viewLocked}
+           onViewLockedChange={handleViewLockedChange}
            onDrawComplete={handleDrawComplete}
            calibration={activeCanvas.calibration ?? null}
-           onCalibrateComplete={handleCalibrateComplete}
-           onPlaneCalibrateComplete={setPendingPlaneCalibration}
+           calibrationDraft={calibrationDraft && calibrationDraft.method ? {
+             method: calibrationDraft.method,
+             points: calibrationDraft.points,
+             editable: calibrationDraft.stage === 'place',
+           } : null}
+           onCalibrationDraftPointsChange={points => setCalibrationDraft(current => current ? { ...current, points } : current)}
+           showCalibrationReference={showCalibrationReference}
            updateSignById={updateSignById}
            setActiveSign={setActiveSign}
            updateDimension={updateDimension}

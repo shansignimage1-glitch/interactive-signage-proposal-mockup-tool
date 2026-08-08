@@ -31,7 +31,7 @@ const transform = (page: Page) => page.locator('#export-target').evaluate(elemen
 test('touch gestures pan and pinch the canvas without changing project coordinates', async ({ page }) => {
   await page.goto('/');
   await page.getByRole('button', { name: 'Continue as Guest' }).click();
-  await expect(page.getByRole('button', { name: 'Pan' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Pan view' })).toBeVisible();
 
   // Synthetic PointerEvents are sufficient for gesture routing; pointer
   // capture itself is browser-owned and cannot be activated by synthetic input.
@@ -46,7 +46,7 @@ test('touch gestures pan and pinch the canvas without changing project coordinat
   expect(bounds).not.toBeNull();
   const center = { x: bounds!.x + bounds!.width / 2, y: bounds!.y + bounds!.height / 2 };
 
-  await page.getByRole('button', { name: 'Pan' }).click();
+  await page.getByRole('button', { name: 'Pan view' }).click();
   const beforePan = await transform(page);
   await dispatchTouch(page, 'pointerdown', 1, center.x, center.y);
   await dispatchTouch(page, 'pointermove', 1, center.x + 90, center.y + 55);
@@ -57,7 +57,7 @@ test('touch gestures pan and pinch the canvas without changing project coordinat
   expect(afterPan.y - beforePan.y).toBeCloseTo(55, 0);
 
   await page.getByRole('button', { name: 'Fit canvas to screen' }).click();
-  await page.getByRole('button', { name: 'Select', exact: true }).click();
+  await page.getByRole('button', { name: 'Select & adjust' }).click();
   const beforeEmptyPan = await transform(page);
   await dispatchTouch(page, 'pointerdown', 1, bounds!.x + 20, bounds!.y + 20);
   await dispatchTouch(page, 'pointermove', 1, bounds!.x + 65, bounds!.y + 50);
@@ -81,10 +81,71 @@ test('touch gestures pan and pinch the canvas without changing project coordinat
   expect(afterPinch.y).toBeGreaterThan(beforePinch.y);
 });
 
+test('view lock freezes pan and zoom while sign editing stays interactive', async ({ page }) => {
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Continue as Guest' }).click();
+  await page.evaluate(() => {
+    Element.prototype.setPointerCapture = () => undefined;
+    Element.prototype.releasePointerCapture = () => undefined;
+    Element.prototype.hasPointerCapture = () => false;
+  });
+
+  await page.getByRole('button', { name: 'Fit canvas to screen' }).click();
+  const surface = page.locator('#export-target');
+  const bounds = await surface.boundingBox();
+  expect(bounds).not.toBeNull();
+  const center = { x: bounds!.x + bounds!.width / 2, y: bounds!.y + bounds!.height / 2 };
+
+  await page.getByRole('button', { name: 'Lock canvas view' }).click();
+  await expect(page.getByRole('button', { name: 'Unlock canvas view' })).toHaveAttribute('aria-pressed', 'true');
+  await expect(page.getByRole('button', { name: 'Zoom in' })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Zoom out' })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Fit canvas to screen' })).toBeDisabled();
+
+  const lockedView = await transform(page);
+  const viewport = '[data-testid="canvas-viewport"]';
+  await dispatchTouch(page, 'pointerdown', 1, center.x - 50, center.y, viewport);
+  await dispatchTouch(page, 'pointerdown', 2, center.x + 50, center.y, viewport);
+  await dispatchTouch(page, 'pointermove', 1, center.x - 110, center.y + 45, viewport);
+  await dispatchTouch(page, 'pointermove', 2, center.x + 110, center.y + 45, viewport);
+  await dispatchTouch(page, 'pointerup', 1, center.x - 110, center.y + 45, viewport);
+  await dispatchTouch(page, 'pointerup', 2, center.x + 110, center.y + 45, viewport);
+  await page.waitForTimeout(50);
+  const afterLockedGesture = await transform(page);
+  expect(afterLockedGesture.x).toBeCloseTo(lockedView.x, 4);
+  expect(afterLockedGesture.y).toBeCloseTo(lockedView.y, 4);
+  expect(afterLockedGesture.scale).toBeCloseTo(lockedView.scale, 4);
+
+  const moveHandle = page.getByTestId('sign-move-handle');
+  await expect(moveHandle).toBeVisible();
+  const moveBounds = await moveHandle.boundingBox();
+  expect(moveBounds).not.toBeNull();
+  const signCenter = { x: moveBounds!.x + moveBounds!.width / 2, y: moveBounds!.y + moveBounds!.height / 2 };
+  await dispatchTouch(page, 'pointerdown', 1, signCenter.x, signCenter.y, '[data-testid="sign-move-handle"]');
+  await dispatchTouch(page, 'pointermove', 1, signCenter.x + 32, signCenter.y + 20, '[data-testid="sign-move-handle"]');
+  await dispatchTouch(page, 'pointerup', 1, signCenter.x + 32, signCenter.y + 20, '[data-testid="sign-move-handle"]');
+  const movedBounds = await moveHandle.boundingBox();
+  expect(movedBounds).not.toBeNull();
+  expect(movedBounds!.x - moveBounds!.x).toBeCloseTo(32, 0);
+  expect(movedBounds!.y - moveBounds!.y).toBeCloseTo(20, 0);
+
+  await page.getByRole('button', { name: 'Unlock canvas view' }).click();
+  await expect(page.getByRole('button', { name: 'Zoom in' })).toBeEnabled();
+  await page.getByRole('button', { name: 'Pan view' }).click();
+  const beforeUnlockedPan = await transform(page);
+  await dispatchTouch(page, 'pointerdown', 1, center.x, center.y, viewport);
+  await dispatchTouch(page, 'pointermove', 1, center.x + 55, center.y + 35, viewport);
+  await dispatchTouch(page, 'pointerup', 1, center.x + 55, center.y + 35, viewport);
+  await page.waitForTimeout(50);
+  const afterUnlockedPan = await transform(page);
+  expect(afterUnlockedPan.x - beforeUnlockedPan.x).toBeCloseTo(55, 0);
+  expect(afterUnlockedPan.y - beforeUnlockedPan.y).toBeCloseTo(35, 0);
+});
+
 test('sign controls have iPad-sized targets and move on the first drag', async ({ page }) => {
   await page.goto('/');
   await page.getByRole('button', { name: 'Continue as Guest' }).click();
-  await page.getByRole('button', { name: 'Select', exact: true }).click();
+  await page.getByRole('button', { name: 'Select & adjust' }).click();
   await page.evaluate(() => {
     Element.prototype.setPointerCapture = () => undefined;
     Element.prototype.releasePointerCapture = () => undefined;
@@ -129,6 +190,8 @@ test('sign controls have iPad-sized targets and move on the first drag', async (
   expect(movedCenter.x - signCenter.x).toBeCloseTo(48, 0);
   expect(movedCenter.y - signCenter.y).toBeCloseTo(30, 0);
 
+  const moreControls = page.getByRole('button', { name: 'Open all controls' });
+  if (await moreControls.isVisible()) await moreControls.click();
   await page.getByRole('button', { name: '5 pixel nudge step' }).click();
   const beforeNudge = await moveHandle.boundingBox();
   await page.getByRole('button', { name: 'Nudge sign right' }).click();

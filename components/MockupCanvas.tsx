@@ -5,7 +5,7 @@ import { hexToRgb, isPointInPolygon, distance, computeHomography } from '../util
 import { measureLine, measureBox } from '../utils/measure';
 import { buildElementMask } from '../utils/elementDetection';
 import { reportError } from '../services/monitoring';
-import { ZoomIn, ZoomOut, Maximize, Check, X } from 'lucide-react';
+import { ZoomIn, ZoomOut, Maximize, Check, X, Lock, Unlock } from 'lucide-react';
 import { ToolMode } from '../App';
 import { TITLE_BLOCK_TEMPLATES } from '../data/titleBlockTemplates';
 import { clampViewScale, viewForPinch, zoomViewAtPoint, type ViewTransform } from '../utils/viewport';
@@ -23,10 +23,13 @@ interface MockupCanvasProps {
   titleBlock: TitleBlock; // Passed explicitly to allow injection of sheet data
   
   toolMode: ToolMode;
+  viewLocked: boolean;
+  onViewLockedChange: (locked: boolean) => void;
   onDrawComplete: (start: Point, end: Point, variant: 'linear' | 'box') => void;
   calibration: Calibration | null;
-  onCalibrateComplete: (start: Point, end: Point) => void;
-  onPlaneCalibrateComplete: (corners: [Point, Point, Point, Point]) => void;
+  calibrationDraft: { method: 'line' | 'plane'; points: Point[]; editable: boolean } | null;
+  onCalibrationDraftPointsChange: (points: Point[]) => void;
+  showCalibrationReference: boolean;
   updateSignById: (id: string, updates: Partial<Sign>) => void;
   setActiveSign: (id: string | null) => void;
   updateDimension: (id: string, updates: Partial<Dimension>) => void;
@@ -43,6 +46,15 @@ const SIGN_CORNER_HIT_SIZE = 52;
 const SIGN_CORNER_VISUAL_SIZE = 18;
 const SIGN_MOVE_HIT_SIZE = 60;
 const SIGN_MOVE_VISUAL_SIZE = 30;
+
+const pointToSegmentDistance = (point: Point, start: Point, end: Point) => {
+    const dx = end.x - start.x;
+    const dy = end.y - start.y;
+    const lengthSquared = dx * dx + dy * dy;
+    if (lengthSquared === 0) return distance(point, start);
+    const t = Math.max(0, Math.min(1, ((point.x - start.x) * dx + (point.y - start.y) * dy) / lengthSquared));
+    return distance(point, { x: start.x + t * dx, y: start.y + t * dy });
+};
 
 // Paper Dimensions in Millimeters
 const PAPER_DIMENSIONS_MM: Record<PaperSize, { width: number, height: number }> = {
@@ -66,10 +78,13 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
     state,
     titleBlock,
     toolMode,
+    viewLocked,
+    onViewLockedChange,
     onDrawComplete,
     calibration,
-    onCalibrateComplete,
-    onPlaneCalibrateComplete,
+    calibrationDraft,
+    onCalibrationDraftPointsChange,
+    showCalibrationReference,
     updateSignById,
     setActiveSign, 
     updateDimension,
@@ -109,8 +124,13 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
   const [tick, setTick] = useState(0); 
   const drawingStart = useRef<Point | null>(null);
   const drawingCurrent = useRef<Point | null>(null);
-  const [planePoints, setPlanePoints] = useState<Point[]>([]);
-  useEffect(() => { if (toolMode !== 'calibrate_plane') setPlanePoints([]); }, [toolMode]);
+  const [calibrationDragIndex, setCalibrationDragIndex] = useState<number | null>(null);
+  const [calibrationLoupe, setCalibrationLoupe] = useState<{ clientX: number; clientY: number; point: Point } | null>(null);
+  useEffect(() => {
+    setIsDrawing(false);
+    drawingStart.current = null;
+    drawingCurrent.current = null;
+  }, [toolMode]);
 
   const boxDragTargetsRef = useRef<{ x: 'start'|'end'|null, y: 'start'|'end'|null }>({ x: null, y: null });
   const textureCacheRef = useRef<Map<string, WebGLTexture>>(new Map());
@@ -214,6 +234,23 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
   useEffect(() => () => {
     if (viewFrameRef.current !== null) window.cancelAnimationFrame(viewFrameRef.current);
   }, []);
+
+  useEffect(() => {
+    if (!viewLocked) return;
+
+    if (viewFrameRef.current !== null) {
+      window.cancelAnimationFrame(viewFrameRef.current);
+      viewFrameRef.current = null;
+    }
+    const pending = pendingViewRef.current;
+    pendingViewRef.current = null;
+    if (pending) applyView(pending);
+
+    activePointersRef.current.clear();
+    touchGestureRef.current = null;
+    if (activeHandleRef.current === -99) setActiveHandle(null);
+    setIsNavigating(false);
+  }, [applyView, setActiveHandle, viewLocked]);
 
   const viewportSize = useCallback(() => {
     const rect = containerRef.current?.getBoundingClientRect();
@@ -363,13 +400,15 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
       drawingStart.current = null;
       drawingCurrent.current = null;
     }
-    if (toolMode === 'calibrate_plane') setPlanePoints(points => points.slice(0, -1));
+    setCalibrationDragIndex(null);
+    setCalibrationLoupe(null);
     setIsNavigating(true);
   };
 
   const handleTouchPointerDownCapture = (e: React.PointerEvent<HTMLDivElement>) => {
     if (e.pointerType !== 'touch') return;
     if (e.target instanceof Element && e.target.closest('[data-canvas-ui]')) return;
+    if (viewLocked) return;
 
     const point = screenPoint(e.clientX, e.clientY);
     activePointersRef.current.set(e.pointerId, point);
@@ -397,6 +436,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
   };
 
   const handleTouchPointerMoveCapture = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (viewLocked) return;
     if (e.pointerType !== 'touch' || !activePointersRef.current.has(e.pointerId)) return;
     const point = screenPoint(e.clientX, e.clientY);
     activePointersRef.current.set(e.pointerId, point);
@@ -462,6 +502,10 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
   };
 
   const handleWheel = (e: React.WheelEvent) => {
+    if (viewLocked) {
+      e.preventDefault();
+      return;
+    }
     if (isCropping) return; 
     e.preventDefault();
     const point = screenPoint(e.clientX, e.clientY);
@@ -472,6 +516,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
   const handleContainerPointerDown = (e: React.PointerEvent) => {
     if (e.target instanceof Element && e.target.closest('[data-canvas-ui]')) return;
     if (toolMode === 'pan' || e.button === 1 || e.buttons === 4 || e.shiftKey) {
+        if (viewLocked) return;
         e.preventDefault();
         containerRef.current?.setPointerCapture(e.pointerId);
         lastPanPos.current = { x: e.clientX, y: e.clientY };
@@ -500,6 +545,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
   const handleContainerPointerMove = (e: React.PointerEvent) => {
     const interactionHandle = activeHandleRef.current;
     if (interactionHandle === -99) {
+        if (viewLocked) return;
         const dx = e.clientX - lastPanPos.current.x;
         const dy = e.clientY - lastPanPos.current.y;
         lastPanPos.current = { x: e.clientX, y: e.clientY };
@@ -531,6 +577,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
   };
 
   const zoomFromCenter = (factor: number) => {
+    if (viewLocked) return;
     const viewport = viewportSize();
     zoomAt(
       { x: viewport.width / 2, y: viewport.height / 2 },
@@ -1001,6 +1048,15 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
       setHoveredHandle(null);
   };
 
+  const beginCalibrationPointDrag = (index: number) => (e: React.PointerEvent) => {
+      if (!calibrationDraft?.editable || e.button !== 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      e.currentTarget.setPointerCapture(e.pointerId);
+      setCalibrationDragIndex(index);
+      setCalibrationLoupe({ clientX: e.clientX, clientY: e.clientY, point: calibrationDraft.points[index] });
+  };
+
   const handleCanvasPointerDown = (e: React.PointerEvent) => {
       if (isCropping) return;
       if (titleBlock.viewMode === 'sheet') return; // Disable interaction in sheet view
@@ -1008,18 +1064,34 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
 
       if (e.button === 2) { if (isDrawing) { setIsDrawing(false); drawingStart.current = null; drawingCurrent.current = null; return; } }
       const pos = getMousePos(e);
-      if (toolMode === 'calibrate_plane') {
+      if (toolMode === 'calibrate' || toolMode === 'calibrate_plane') {
         e.preventDefault(); e.stopPropagation();
-        const next = [...planePoints, pos];
-        if (next.length === 4) { onPlaneCalibrateComplete(next as [Point, Point, Point, Point]); setPlanePoints([]); }
-        else setPlanePoints(next);
+        const expectedMethod = toolMode === 'calibrate_plane' ? 'plane' : 'line';
+        const maxPoints = expectedMethod === 'plane' ? 4 : 2;
+        if (calibrationDraft?.editable && calibrationDraft.method === expectedMethod && calibrationDraft.points.length < maxPoints) {
+          onCalibrationDraftPointsChange([...calibrationDraft.points, pos]);
+        }
         setActiveSign(null); setActiveDimension(''); return;
       }
-      if (toolMode === 'draw_line' || toolMode === 'calibrate') { e.preventDefault(); e.stopPropagation(); if (!isDrawing) { e.currentTarget.setPointerCapture(e.pointerId); setIsDrawing(true); drawingStart.current = pos; drawingCurrent.current = pos; setActiveSign(null); setActiveDimension(''); } else { if (drawingStart.current) { if (toolMode === 'calibrate') { onCalibrateComplete(drawingStart.current, pos); } else { onDrawComplete(drawingStart.current, pos, 'linear'); } } setIsDrawing(false); drawingStart.current = null; drawingCurrent.current = null; } return; }
-      if (toolMode === 'draw_box') { e.preventDefault(); e.stopPropagation(); e.currentTarget.setPointerCapture(e.pointerId); setIsDrawing(true); drawingStart.current = pos; drawingCurrent.current = pos; setActiveSign(null); setActiveDimension(''); return; }
+      if (toolMode === 'draw_line' || toolMode === 'draw_box') {
+        e.preventDefault(); e.stopPropagation();
+        if (!isDrawing) {
+          setIsDrawing(true);
+          drawingStart.current = pos;
+          drawingCurrent.current = pos;
+          setActiveSign(null);
+          setActiveDimension('');
+        } else if (drawingStart.current) {
+          onDrawComplete(drawingStart.current, pos, toolMode === 'draw_box' ? 'box' : 'linear');
+          setIsDrawing(false);
+          drawingStart.current = null;
+          drawingCurrent.current = null;
+        }
+        return;
+      }
       
       let hitFound = false;
-      if (state.showDimensions) { for (const dim of dimensions) { let isHit = false; if (dim.variant === 'box') { const x = Math.min(dim.start.x, dim.end.x); const y = Math.min(dim.start.y, dim.end.y); const w = Math.abs(dim.end.x - dim.start.x); const h = Math.abs(dim.end.y - dim.start.y); if (pos.x >= x && pos.x <= x + w && pos.y >= y && pos.y <= y + h) isHit = true; } else { const xMin = Math.min(dim.start.x, dim.end.x) - 10; const xMax = Math.max(dim.start.x, dim.end.x) + 10; const yMin = Math.min(dim.start.y, dim.end.y) - 10; const yMax = Math.max(dim.start.y, dim.end.y) + 10; if (pos.x >= xMin && pos.x <= xMax && pos.y >= yMin && pos.y <= yMax) isHit = true; } if (isHit) { setActiveDimension(dim.id); if (dim.id === activeDimensionId) { e.currentTarget.setPointerCapture(e.pointerId); startMousePos.current = pos; startDimRef.current = { start: { ...dim.start }, end: { ...dim.end } }; setActiveHandle(2); } hitFound = true; return; } } }
+      if (state.showDimensions) { for (const dim of dimensions) { let isHit = false; if (dim.variant === 'box') { const x = Math.min(dim.start.x, dim.end.x); const y = Math.min(dim.start.y, dim.end.y); const w = Math.abs(dim.end.x - dim.start.x); const h = Math.abs(dim.end.y - dim.start.y); if (pos.x >= x && pos.x <= x + w && pos.y >= y && pos.y <= y + h) isHit = true; } else { const hitRadius = 20 / Math.max(baseScale * view.scale, 0.01); isHit = pointToSegmentDistance(pos, dim.start, dim.end) <= hitRadius; } if (isHit) { setActiveDimension(dim.id); if (dim.id === activeDimensionId) { e.currentTarget.setPointerCapture(e.pointerId); startMousePos.current = pos; startDimRef.current = { start: { ...dim.start }, end: { ...dim.end } }; setActiveHandle(2); } hitFound = true; return; } } }
       if (!hitFound) {
         for (let i = signs.length - 1; i >= 0; i--) {
           const sign = signs[i];
@@ -1033,6 +1105,17 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
 
   const handlePointerMove = (e: React.PointerEvent) => {
     if (isCropping) return;
+
+    if (calibrationDragIndex !== null && calibrationDraft?.editable) {
+        e.preventDefault();
+        e.stopPropagation();
+        const next = [...calibrationDraft.points];
+        const point = getMousePos(e);
+        next[calibrationDragIndex] = point;
+        onCalibrationDraftPointsChange(next);
+        setCalibrationLoupe({ clientX: e.clientX, clientY: e.clientY, point });
+        return;
+    }
     
     // If we are dragging a handle, handle it here and stop propagation
     const interactionHandle = activeHandleRef.current;
@@ -1085,15 +1168,6 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
   };
 
   const handlePointerUp = (e: React.PointerEvent) => {
-    if (isDrawing) {
-        const dStart = drawingStart.current;
-        const dCurr = drawingCurrent.current;
-        if (dStart && dCurr) {
-            if (toolMode === 'draw_box') { onDrawComplete(dStart, dCurr, 'box'); setIsDrawing(false); drawingStart.current = null; drawingCurrent.current = null; } 
-            else if (toolMode === 'draw_line' || toolMode === 'calibrate') { const worldDist = distance(dStart, dCurr); const screenDist = worldDist * (baseScale * view.scale); if (screenDist > 10) { if (toolMode === 'calibrate') { onCalibrateComplete(dStart, dCurr); } else { onDrawComplete(dStart, dCurr, 'linear'); } setIsDrawing(false); drawingStart.current = null; drawingCurrent.current = null; } }
-        }
-    }
-    
     // Capture release and cleanup
     if (e.currentTarget.hasPointerCapture(e.pointerId)) { 
         e.currentTarget.releasePointerCapture(e.pointerId); 
@@ -1104,6 +1178,8 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
         e.stopPropagation();
     }
     
+    setCalibrationDragIndex(null);
+    setCalibrationLoupe(null);
     setActiveHandle(null); startCornersRef.current = null; dragSignIdRef.current = null; startDimRef.current = null;
   };
 
@@ -1112,6 +1188,8 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
     drawingStart.current = null;
     drawingCurrent.current = null;
     setActiveHandle(null);
+    setCalibrationDragIndex(null);
+    setCalibrationLoupe(null);
     startCornersRef.current = null;
     dragSignIdRef.current = null;
     startDimRef.current = null;
@@ -1218,6 +1296,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
   return (
     <div 
       ref={containerRef} 
+      data-testid="canvas-viewport"
       className="w-full h-full flex items-center justify-center overflow-hidden relative select-none"
       onWheel={handleWheel}
       onPointerDownCapture={handleTouchPointerDownCapture}
@@ -1233,10 +1312,51 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
     >
       {/* Zoom Controls — offset below the user profile pill rendered by App at top-right */}
       <div data-canvas-ui className="absolute top-20 right-4 flex flex-col gap-2 z-40">
-        <button aria-label="Zoom in" title="Zoom in" onClick={() => zoomFromCenter(1.2)} className="p-3 md:p-2 bg-gray-800 hover:bg-gray-700 text-white rounded shadow border border-gray-600"><ZoomIn className="w-5 h-5" /></button>
-        <button aria-label="Zoom out" title="Zoom out" onClick={() => zoomFromCenter(1 / 1.2)} className="p-3 md:p-2 bg-gray-800 hover:bg-gray-700 text-white rounded shadow border border-gray-600"><ZoomOut className="w-5 h-5" /></button>
-        <button aria-label="Fit canvas to screen" title="Fit canvas to screen" onClick={fitToContainer} className="p-3 md:p-2 bg-gray-800 hover:bg-gray-700 text-white rounded shadow border border-gray-600"><Maximize className="w-5 h-5" /></button>
+        <button disabled={viewLocked} aria-label="Zoom in" title={viewLocked ? 'Unlock the view to zoom' : 'Zoom in'} onClick={() => zoomFromCenter(1.2)} className="p-3 md:p-2 bg-gray-800 enabled:hover:bg-gray-700 text-white rounded shadow border border-gray-600 disabled:cursor-not-allowed disabled:opacity-35"><ZoomIn className="w-5 h-5" /></button>
+        <button disabled={viewLocked} aria-label="Zoom out" title={viewLocked ? 'Unlock the view to zoom' : 'Zoom out'} onClick={() => zoomFromCenter(1 / 1.2)} className="p-3 md:p-2 bg-gray-800 enabled:hover:bg-gray-700 text-white rounded shadow border border-gray-600 disabled:cursor-not-allowed disabled:opacity-35"><ZoomOut className="w-5 h-5" /></button>
+        <button disabled={viewLocked} aria-label="Fit canvas to screen" title={viewLocked ? 'Unlock the view to fit the canvas' : 'Fit canvas to screen'} onClick={fitToContainer} className="p-3 md:p-2 bg-gray-800 enabled:hover:bg-gray-700 text-white rounded shadow border border-gray-600 disabled:cursor-not-allowed disabled:opacity-35"><Maximize className="w-5 h-5" /></button>
+        <button
+          type="button"
+          data-testid="view-lock-toggle"
+          aria-label={viewLocked ? 'Unlock canvas view' : 'Lock canvas view'}
+          aria-pressed={viewLocked}
+          title={viewLocked ? 'Unlock pan and zoom' : 'Lock pan and zoom'}
+          onClick={() => onViewLockedChange(!viewLocked)}
+          className={`p-3 md:p-2 rounded shadow border transition-colors ${viewLocked ? 'border-amber-300 bg-amber-500 text-gray-950 hover:bg-amber-400' : 'border-gray-600 bg-gray-800 text-white hover:bg-gray-700'}`}
+        >
+          {viewLocked ? <Lock className="h-5 w-5" /> : <Unlock className="h-5 w-5" />}
+        </button>
       </div>
+      {(toolMode === 'draw_line' || toolMode === 'draw_box') && (
+        <div data-canvas-ui className="pointer-events-none absolute bottom-[max(1rem,env(safe-area-inset-bottom))] left-1/2 z-40 -translate-x-1/2 rounded-full border border-blue-400/40 bg-gray-950/90 px-4 py-2 text-center text-sm font-medium text-white shadow-xl backdrop-blur">
+          {isDrawing ? `Tap the opposite ${toolMode === 'draw_box' ? 'corner' : 'endpoint'} · ${viewLocked ? 'view locked' : 'pinch to zoom'}` : `Tap the first ${toolMode === 'draw_box' ? 'corner' : 'endpoint'}`}
+        </div>
+      )}
+      {calibrationLoupe && images.background && (
+        <div
+          data-canvas-ui
+          className="pointer-events-none fixed z-[195] h-28 w-28 overflow-hidden rounded-full border-4 border-white bg-gray-900 shadow-2xl ring-2 ring-amber-400"
+          style={{
+            left: Math.min(calibrationLoupe.clientX + 28, window.innerWidth - 124),
+            top: Math.max(12, calibrationLoupe.clientY - 132),
+          }}
+        >
+          <img
+            src={images.background}
+            alt=""
+            className="absolute max-w-none select-none"
+            style={{
+              width: images.backgroundSize.width * 3,
+              height: images.backgroundSize.height * 3,
+              left: 56 - calibrationLoupe.point.x * 3,
+              top: 56 - calibrationLoupe.point.y * 3,
+            }}
+          />
+          <span className="absolute left-1/2 top-2 h-[calc(100%-1rem)] w-px -translate-x-1/2 bg-amber-400 shadow-[0_0_0_1px_rgba(0,0,0,.6)]" />
+          <span className="absolute left-2 top-1/2 h-px w-[calc(100%-1rem)] -translate-y-1/2 bg-amber-400 shadow-[0_0_0_1px_rgba(0,0,0,.6)]" />
+          <span className="absolute left-1/2 top-1/2 h-2 w-2 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white bg-amber-500" />
+        </div>
+      )}
 
       {/* Main Canvas Wrapper */}
       <div 
@@ -1372,7 +1492,37 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
             {!isCropping && (
             <>
                 <svg className="absolute inset-0 z-20 w-full h-full overflow-visible pointer-events-none" viewBox={`0 0 ${images.backgroundSize.width} ${images.backgroundSize.height}`}>
-                    {planePoints.length > 0 && <g><polyline points={planePoints.map(p => `${p.x},${p.y}`).join(' ')} fill="none" stroke="#f59e0b" strokeWidth={3 * handleScale} strokeDasharray="6 3"/>{planePoints.map((p, i) => <g key={i}><circle cx={p.x} cy={p.y} r={7 * handleScale} fill="#f59e0b"/><text x={p.x + 10 * handleScale} y={p.y} fill="white" fontSize={14 * handleScale}>{i + 1}</text></g>)}</g>}
+                    {calibrationDraft && calibrationDraft.points.length > 0 && (() => {
+                        const points = calibrationDraft.points;
+                        const closed = calibrationDraft.method === 'plane' && points.length === 4;
+                        const lerp = (a: Point, b: Point, t: number) => ({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t });
+                        const gridLines = closed ? [0.2, 0.4, 0.6, 0.8].flatMap(t => {
+                            const horizontalStart = lerp(points[0], points[3], t);
+                            const horizontalEnd = lerp(points[1], points[2], t);
+                            const verticalStart = lerp(points[0], points[1], t);
+                            const verticalEnd = lerp(points[3], points[2], t);
+                            return [[horizontalStart, horizontalEnd], [verticalStart, verticalEnd]] as [Point, Point][];
+                        }) : [];
+                        return (
+                            <g>
+                                {closed ? (
+                                    <>
+                                        <polygon points={points.map(p => `${p.x},${p.y}`).join(' ')} fill="rgba(245,158,11,0.10)" stroke="#f59e0b" strokeWidth={3 * handleScale} />
+                                        {gridLines.map(([start, end], index) => <line key={index} x1={start.x} y1={start.y} x2={end.x} y2={end.y} stroke="#fbbf24" strokeOpacity={0.55} strokeWidth={1.5 * handleScale} />)}
+                                    </>
+                                ) : points.length > 1 ? (
+                                    <polyline points={points.map(p => `${p.x},${p.y}`).join(' ')} fill="none" stroke="#f59e0b" strokeWidth={3 * handleScale} strokeDasharray={`${8 * handleScale} ${4 * handleScale}`} />
+                                ) : null}
+                                {points.map((point, index) => (
+                                    <g key={index}>
+                                        {calibrationDraft.editable && <circle data-calibration-handle={index} cx={point.x} cy={point.y} r={26 * handleScale} fill="transparent" pointerEvents="all" className="cursor-move" onPointerDown={beginCalibrationPointDrag(index)} onPointerMove={handlePointerMove} onPointerUp={handlePointerUp} />}
+                                        <circle cx={point.x} cy={point.y} r={10 * handleScale} fill="#f59e0b" stroke="white" strokeWidth={2.5 * handleScale} pointerEvents="none" />
+                                        <text x={point.x} y={point.y + 4.5 * handleScale} textAnchor="middle" fill="#111827" fontWeight={900} fontSize={12 * handleScale} pointerEvents="none">{index + 1}</text>
+                                    </g>
+                                ))}
+                            </g>
+                        );
+                    })()}
                     {toolMode === 'select' && signs.map(sign => (
                         <polygon
                             key={`hit-${sign.id}`}
@@ -1398,10 +1548,17 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
                                     <rect x={minX} y={minY} width={w} height={h} fill={isActive ? "rgba(59, 130, 246, 0.2)" : "rgba(255, 255, 255, 0.1)"} stroke={dimColor} strokeWidth={strokeWidth} strokeDasharray="4 2" />
                                     {isActive && !isSheetView && toolMode === 'select' && (
                                         <>
-                                            <circle cx={minX} cy={minY} r={6 * handleScale} fill="white" stroke={dimColor} strokeWidth={2*handleScale} cursor="nw-resize" 
-                                                    onPointerDown={handlePointerDown(10)} onPointerMove={handlePointerMove} onPointerUp={handlePointerUp} />
-                                            <circle cx={minX+w} cy={minY+h} r={6 * handleScale} fill="white" stroke={dimColor} strokeWidth={2*handleScale} cursor="se-resize" 
-                                                    onPointerDown={handlePointerDown(14)} onPointerMove={handlePointerMove} onPointerUp={handlePointerUp} />
+                                            {[
+                                                { x: minX, y: minY, index: 10, cursor: 'nw-resize' },
+                                                { x: minX + w, y: minY, index: 12, cursor: 'ne-resize' },
+                                                { x: minX + w, y: minY + h, index: 14, cursor: 'se-resize' },
+                                                { x: minX, y: minY + h, index: 16, cursor: 'sw-resize' },
+                                            ].map(handle => (
+                                                <g key={handle.index}>
+                                                    <circle cx={handle.x} cy={handle.y} r={24 * handleScale} fill="transparent" pointerEvents="all" style={{ cursor: handle.cursor }} onPointerDown={handlePointerDown(handle.index)} onPointerMove={handlePointerMove} onPointerUp={handlePointerUp} />
+                                                    <circle cx={handle.x} cy={handle.y} r={9 * handleScale} fill="white" stroke={dimColor} strokeWidth={2.5 * handleScale} pointerEvents="none" />
+                                                </g>
+                                            ))}
                                             <rect x={minX + 10*handleScale} y={minY + 10*handleScale} width={Math.max(0, w - 20*handleScale)} height={Math.max(0, h - 20*handleScale)} fill="transparent" 
                                                   onPointerDown={handlePointerDown(2)} onPointerMove={handlePointerMove} onPointerUp={handlePointerUp} className="cursor-move" />
                                         </>
@@ -1429,10 +1586,15 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
 
                                     {!isSheetView && toolMode === 'select' && (
                                         <>
-                                            <circle cx={dim.start.x} cy={dim.start.y} r={6 * handleScale} fill="white" stroke={dimColor} strokeWidth={2 * handleScale} className="cursor-move" 
-                                                    onPointerDown={handlePointerDown(0)} onPointerMove={handlePointerMove} onPointerUp={handlePointerUp} />
-                                            <circle cx={dim.end.x} cy={dim.end.y} r={6 * handleScale} fill="white" stroke={dimColor} strokeWidth={2 * handleScale} className="cursor-move" 
-                                                    onPointerDown={handlePointerDown(1)} onPointerMove={handlePointerMove} onPointerUp={handlePointerUp} />
+                                            {[
+                                                { point: dim.start, index: 0 },
+                                                { point: dim.end, index: 1 },
+                                            ].map(handle => (
+                                                <g key={handle.index}>
+                                                    <circle cx={handle.point.x} cy={handle.point.y} r={24 * handleScale} fill="transparent" pointerEvents="all" className="cursor-move" onPointerDown={handlePointerDown(handle.index)} onPointerMove={handlePointerMove} onPointerUp={handlePointerUp} />
+                                                    <circle cx={handle.point.x} cy={handle.point.y} r={9 * handleScale} fill="white" stroke={dimColor} strokeWidth={2.5 * handleScale} pointerEvents="none" />
+                                                </g>
+                                            ))}
                                         </>
                                     )}
                                 </g>
@@ -1478,7 +1640,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
                         );
                     })()}
                     {/* Stored calibration reference line (editor view only) */}
-                    {calibration && !isSheetView && (
+                    {calibration && showCalibrationReference && !isSheetView && (
                         <g className="pointer-events-none">
                             {calibration.plane && <polygon points={calibration.plane.corners.map(p => `${p.x},${p.y}`).join(' ')} fill="rgba(245,158,11,0.08)" stroke="#f59e0b" strokeWidth={1.5 * handleScale} strokeDasharray={`${6 * handleScale} ${3 * handleScale}`}/>}
                             <line x1={calibration.start.x} y1={calibration.start.y} x2={calibration.end.x} y2={calibration.end.y} stroke="#f59e0b" strokeWidth={1.5 * handleScale} strokeDasharray={`${6 * handleScale} ${3 * handleScale}`} />
