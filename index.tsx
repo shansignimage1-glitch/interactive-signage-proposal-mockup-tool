@@ -5,8 +5,10 @@ import AppErrorBoundary from './components/AppErrorBoundary';
 import ToastViewport from './components/ToastViewport';
 import { initMonitoring, reportError } from './services/monitoring';
 import LegalCenter from './components/LegalCenter';
+import { installChunkRecovery } from './services/chunkRecovery';
 
 initMonitoring();
+installChunkRecovery();
 window.addEventListener('error', event => reportError('window-error', event.error ?? event.message));
 window.addEventListener('unhandledrejection', event => reportError('unhandled-rejection', event.reason));
 
