@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { BRANDS } from '../data/brands';
 import { Dimension, SignTemplate, Sign, UserProfile, SIGN_TYPES, SignType } from '../types';
 import { Sparkles, X, LayoutGrid, Loader2, User as UserIcon, Trash2, UploadCloud, BookmarkPlus, Globe, LogIn, Search, Pencil } from 'lucide-react';
@@ -33,6 +33,8 @@ const SignLibrary: React.FC<SignLibraryProps> = ({ isOpen, onClose, onSelect, ac
   const [query, setQuery] = useState('');
   const [categoryFilter, setCategoryFilter] = useState('All');
   const [page, setPage] = useState(1);
+  const sharedMutationVersion = useRef(0);
+  const personalMutationVersion = useRef(0);
 
   useEffect(() => { setPage(1); }, [tab, selectedBrandId]);
 
@@ -49,6 +51,8 @@ const SignLibrary: React.FC<SignLibraryProps> = ({ isOpen, onClose, onSelect, ac
   useEffect(() => {
     if (!isOpen || isGuest) return;
     let cancelled = false;
+    const sharedVersionAtLoad = sharedMutationVersion.current;
+    const personalVersionAtLoad = personalMutationVersion.current;
     setIsLoadingCloud(true);
     setCloudError(null);
     Promise.all([
@@ -56,8 +60,8 @@ const SignLibrary: React.FC<SignLibraryProps> = ({ isOpen, onClose, onSelect, ac
       LibraryService.listPersonal(user!.uid),
     ]).then(([s, p]) => {
       if (cancelled) return;
-      setShared(s);
-      setPersonal(p);
+      if (sharedMutationVersion.current === sharedVersionAtLoad) setShared(s);
+      if (personalMutationVersion.current === personalVersionAtLoad) setPersonal(p);
     }).catch(e => {
       if (!cancelled) setCloudError(e?.message ?? 'Could not load cloud library');
     }).finally(() => {
@@ -148,13 +152,19 @@ const SignLibrary: React.FC<SignLibraryProps> = ({ isOpen, onClose, onSelect, ac
     try {
       if (form.editing && admin) {
         const t = await LibraryService.updateShared(form.editing, input);
+        sharedMutationVersion.current += 1;
         setShared(prev => prev.map(x => x.id === t.id ? t : x).sort((a, b) => a.name.localeCompare(b.name)));
       } else if (form.publishShared && admin) {
         const t = await LibraryService.saveToShared(input);
+        sharedMutationVersion.current += 1;
         setShared(prev => [...prev.filter(x => x.id !== t.id), t].sort((a, b) => a.name.localeCompare(b.name)));
       } else {
         const t = await LibraryService.saveToPersonal(user!.uid, input);
+        personalMutationVersion.current += 1;
         setPersonal(prev => [...prev.filter(x => x.id !== t.id), t].sort((a, b) => a.name.localeCompare(b.name)));
+        setQuery('');
+        setCategoryFilter('All');
+        setPage(1);
         setTab('personal');
       }
       const destination = form.editing || (form.publishShared && admin) ? 'shared library' : 'My Library';
@@ -176,9 +186,11 @@ const SignLibrary: React.FC<SignLibraryProps> = ({ isOpen, onClose, onSelect, ac
     try {
       if (template.source === 'personal') {
         await LibraryService.deletePersonal(template);
+        personalMutationVersion.current += 1;
         setPersonal(prev => prev.filter(t => t.id !== template.id));
       } else if (template.source === 'shared' && admin) {
         await LibraryService.deleteShared(template);
+        sharedMutationVersion.current += 1;
         setShared(prev => prev.filter(t => t.id !== template.id));
       }
     } catch (e: any) {

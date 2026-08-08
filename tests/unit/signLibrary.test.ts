@@ -137,6 +137,64 @@ describe('SignLibrary save editor', () => {
     expect(feedbackMocks.notify).toHaveBeenCalledWith('Asset saved to My Library.', 'success');
   });
 
+  it('reveals a newly saved asset even when a catalog filter was active', async () => {
+    const categoryFilter = document.querySelector('select') as HTMLSelectElement;
+    await act(async () => {
+      categoryFilter.value = 'Window';
+      categoryFilter.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+
+    await openSaveEditor();
+    await act(async () => {
+      findButton('Save asset to My Library').click();
+      await Promise.resolve();
+    });
+
+    expect((document.querySelector('select') as HTMLSelectElement).value).toBe('All');
+    expect(document.querySelector('img[alt="Reception Letters"]')).not.toBeNull();
+  });
+
+  it('does not let an older cloud-list response erase a newly saved asset', async () => {
+    let resolvePersonalLoad!: (templates: []) => void;
+    const stalePersonalLoad = new Promise<[]>(resolve => { resolvePersonalLoad = resolve; });
+
+    await act(async () => {
+      root.render(React.createElement(SignLibrary, {
+        isOpen: false,
+        onClose: vi.fn(),
+        onSelect: vi.fn(),
+        user,
+        activeSign,
+      }));
+    });
+    libraryMocks.listPersonal.mockReturnValueOnce(stalePersonalLoad);
+    await act(async () => {
+      root.render(React.createElement(SignLibrary, {
+        isOpen: true,
+        onClose: vi.fn(),
+        onSelect: vi.fn(),
+        user,
+        activeSign,
+      }));
+      await Promise.resolve();
+    });
+
+    await openSaveEditor();
+    await act(async () => {
+      findButton('Save asset to My Library').click();
+      await Promise.resolve();
+    });
+    expect(document.querySelector('img[alt="Reception Letters"]')).not.toBeNull();
+
+    await act(async () => {
+      resolvePersonalLoad([]);
+      await stalePersonalLoad;
+      await Promise.resolve();
+    });
+
+    expect(document.querySelector('img[alt="Reception Letters"]')).not.toBeNull();
+  });
+
   it('keeps the editor and its metadata visible when cloud save fails', async () => {
     libraryMocks.saveToPersonal.mockRejectedValueOnce(new Error('Storage permission denied'));
     const dialog = await openSaveEditor();
