@@ -1483,12 +1483,23 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
                     crossOrigin="anonymous"
                     className="absolute inset-0 w-full h-full object-contain pointer-events-none select-none max-w-none"
                     style={{
-                        opacity: state.isNightMode ? 0.5 : 1,
-                        filter: state.isNightMode ? 'brightness(0.6) contrast(1.2) hue-rotate(-10deg)' : 'none',
+                        opacity: state.isNightMode ? 0.82 : 1,
+                        filter: state.isNightMode ? 'brightness(0.32) contrast(1.32) saturate(0.72) hue-rotate(8deg)' : 'none',
+                        transition: 'filter 320ms ease, opacity 320ms ease',
                     }}
                 />
             )}
-            <canvas ref={canvasRef} width={images.backgroundSize.width} height={images.backgroundSize.height} className="absolute inset-0 z-10 w-full h-full pointer-events-none" style={{ opacity: isCropping ? 0.3 : 1 }} />
+            {state.isNightMode && (
+                <div
+                    aria-hidden="true"
+                    className="absolute inset-0 z-[5] pointer-events-none"
+                    style={{
+                        background: 'radial-gradient(ellipse at 50% 42%, rgba(15,35,58,0.02) 0%, rgba(2,8,23,0.26) 62%, rgba(0,3,12,0.62) 100%), linear-gradient(180deg, rgba(5,18,38,0.32) 0%, rgba(6,12,24,0.08) 48%, rgba(1,5,14,0.36) 100%)',
+                        boxShadow: 'inset 0 0 140px rgba(0,0,12,0.75)',
+                    }}
+                />
+            )}
+            <canvas ref={canvasRef} width={images.backgroundSize.width} height={images.backgroundSize.height} className="absolute inset-0 z-10 w-full h-full pointer-events-none" style={{ opacity: isCropping ? 0.3 : 1, filter: state.isNightMode ? 'brightness(1.16) saturate(1.22) drop-shadow(0 0 9px rgba(125,211,252,0.32))' : 'none', transition: 'filter 320ms ease' }} />
             {!isCropping && (
             <>
                 <svg className="absolute inset-0 z-20 w-full h-full overflow-visible pointer-events-none" viewBox={`0 0 ${images.backgroundSize.width} ${images.backgroundSize.height}`}>

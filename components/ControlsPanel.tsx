@@ -129,6 +129,23 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
   // Target real-world width input for the "Set width" sign-sizing control
   const [targetWidth, setTargetWidth] = useState('');
   const [nudgeStep, setNudgeStep] = useState<1 | 5>(1);
+
+  const applyPerspectivePreset = (preset: 'flat' | 'left' | 'right') => {
+      if (!activeSign) return;
+      const [tl, tr, br, bl] = activeSign.corners;
+      const minX = Math.min(tl.x, tr.x, br.x, bl.x);
+      const maxX = Math.max(tl.x, tr.x, br.x, bl.x);
+      const minY = Math.min(tl.y, tr.y, br.y, bl.y);
+      const maxY = Math.max(tl.y, tr.y, br.y, bl.y);
+      const inset = Math.min((maxX - minX) * 0.14, (maxY - minY) * 0.3);
+      const corners: Sign['corners'] = preset === 'flat'
+          ? [{ x: minX, y: minY }, { x: maxX, y: minY }, { x: maxX, y: maxY }, { x: minX, y: maxY }]
+          : preset === 'left'
+              ? [{ x: minX + inset, y: minY + inset }, { x: maxX, y: minY }, { x: maxX, y: maxY }, { x: minX + inset, y: maxY - inset }]
+              : [{ x: minX, y: minY }, { x: maxX - inset, y: minY + inset }, { x: maxX - inset, y: maxY - inset }, { x: minX, y: maxY }];
+      updateActiveSign({ corners });
+      activateTool('select');
+  };
   
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>, callback: (f: File) => void) => {
     if (e.target.files && e.target.files[0]) {
@@ -675,14 +692,16 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
                     
                     <button
                       onClick={() => updateState({ isNightMode: !state.isNightMode })}
-                      className={`flex items-center justify-center p-3 rounded-lg border transition-all gap-2 ${
+                      aria-pressed={state.isNightMode}
+                      className={`flex min-w-[132px] flex-1 items-center justify-center p-3 rounded-lg border transition-all gap-2 ${
                         state.isNightMode 
-                          ? 'bg-blue-900/30 border-blue-500 text-blue-200' 
+                          ? 'bg-indigo-950 border-cyan-400/70 text-cyan-100 shadow-[0_0_18px_rgba(34,211,238,0.16)]'
                           : 'bg-gray-800 border-gray-600 text-gray-300 hover:bg-gray-750'
                       }`}
-                      title="Toggle Night Mode"
+                      title="Preview illuminated signage after dark"
                     >
                       {state.isNightMode ? <Moon className="w-4 h-4" /> : <Sun className="w-4 h-4" />}
+                      <span className="text-xs font-medium">{state.isNightMode ? 'Night preview on' : 'Night preview'}</span>
                     </button>
                 </div>
               </div>
@@ -855,6 +874,45 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
                               </div>
                           </div>
 
+                          <div className="overflow-hidden rounded-xl border border-cyan-500/30 bg-gradient-to-br from-cyan-500/10 via-gray-900 to-gray-950">
+                              <div className="flex items-center justify-between border-b border-cyan-500/20 px-3 py-2.5">
+                                  <div className="flex items-center gap-2">
+                                      <Move3d className="h-4 w-4 text-cyan-300" />
+                                      <div>
+                                          <p className="text-xs font-semibold text-white">Perspective & 3D</p>
+                                          <p className="text-[10px] text-gray-400">Shape the face, then add physical depth.</p>
+                                      </div>
+                                  </div>
+                                  <span className="rounded-full bg-cyan-400/10 px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider text-cyan-300">Selected sign</span>
+                              </div>
+                              <div className="space-y-4 p-3">
+                                  <div>
+                                      <div className="mb-2 flex items-center justify-between">
+                                          <span className="text-[10px] font-bold uppercase tracking-wider text-gray-400">Perspective</span>
+                                          <span className="text-[10px] text-gray-500">Drag blue corners to refine</span>
+                                      </div>
+                                      <div className="grid grid-cols-3 gap-2">
+                                          <button type="button" onClick={() => applyPerspectivePreset('left')} className="min-h-10 rounded-lg border border-gray-700 bg-gray-800 text-xs text-gray-300 transition hover:border-cyan-500 hover:text-white">Left wall</button>
+                                          <button type="button" onClick={() => applyPerspectivePreset('flat')} className="min-h-10 rounded-lg border border-gray-700 bg-gray-800 text-xs text-gray-300 transition hover:border-cyan-500 hover:text-white">Straight</button>
+                                          <button type="button" onClick={() => applyPerspectivePreset('right')} className="min-h-10 rounded-lg border border-gray-700 bg-gray-800 text-xs text-gray-300 transition hover:border-cyan-500 hover:text-white">Right wall</button>
+                                      </div>
+                                  </div>
+                                  <div className="border-t border-gray-700/70 pt-3">
+                                      <label className="flex min-h-10 cursor-pointer items-center justify-between rounded-lg bg-gray-800 px-3">
+                                          <span className="flex items-center gap-2 text-xs font-medium text-gray-200"><Box className="h-4 w-4 text-cyan-300" /> 3D extrusion</span>
+                                          <input type="checkbox" checked={activeSign.extrusionEnabled} onChange={(e) => updateActiveSign({ extrusionEnabled: e.target.checked })} className="h-4 w-4 accent-cyan-500" />
+                                      </label>
+                                      {activeSign.extrusionEnabled && (
+                                          <div className="mt-3 space-y-3">
+                                              <div><div className="mb-1 flex justify-between"><label className="text-xs text-gray-400">Depth</label><span className="font-mono text-xs text-cyan-300">{activeSign.extrusionDepth}px</span></div><input type="range" min="0" max="100" value={activeSign.extrusionDepth} onChange={(e) => updateActiveSign({ extrusionDepth: parseInt(e.target.value) })} className="h-2 w-full accent-cyan-500" /></div>
+                                              <div><div className="mb-1 flex justify-between"><label className="text-xs text-gray-400">Direction</label><span className="font-mono text-xs text-cyan-300">{activeSign.extrusionAngle}°</span></div><input type="range" min="0" max="360" value={activeSign.extrusionAngle} onChange={(e) => updateActiveSign({ extrusionAngle: parseInt(e.target.value) })} className="h-2 w-full accent-cyan-500" /></div>
+                                              <label className="flex items-center justify-between text-xs text-gray-400"><span>Side colour</span><input type="color" value={activeSign.sideColor} onChange={(e) => updateActiveSign({ sideColor: e.target.value })} className="h-8 w-12 cursor-pointer rounded border border-gray-600 bg-transparent p-0.5" /></label>
+                                          </div>
+                                      )}
+                                  </div>
+                              </div>
+                          </div>
+
                           {/* Per-element 3D extrusion */}
                           <button
                               onClick={onOpenElementStudio}
@@ -910,16 +968,6 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
                               </select>
                           </div>
 
-                          <div className="space-y-4 pt-2">
-                             <div className="flex items-center justify-between"><span className="text-xs text-gray-300">Extrusion 3D</span><input type="checkbox" checked={activeSign.extrusionEnabled} onChange={(e) => updateActiveSign({ extrusionEnabled: e.target.checked })} /></div>
-                             {activeSign.extrusionEnabled && (
-                                <>
-                                   <div><div className="flex justify-between mb-1"><label className="text-xs text-gray-400">Depth</label><span className="text-xs text-gray-500">{activeSign.extrusionDepth}px</span></div><input type="range" min="0" max="100" value={activeSign.extrusionDepth} onChange={(e) => updateActiveSign({ extrusionDepth: parseInt(e.target.value) })} className="w-full h-2 bg-gray-700 rounded-lg accent-blue-500" /></div>
-                                   <div><div className="flex justify-between mb-1"><label className="text-xs text-gray-400">Angle</label><span className="text-xs text-gray-500">{activeSign.extrusionAngle}°</span></div><input type="range" min="0" max="360" value={activeSign.extrusionAngle} onChange={(e) => updateActiveSign({ extrusionAngle: parseInt(e.target.value) })} className="w-full h-2 bg-gray-700 rounded-lg accent-blue-500" /></div>
-                                   <div className="flex gap-2 items-center"><label className="text-xs text-gray-400">Color</label><input type="color" value={activeSign.sideColor} onChange={(e) => updateActiveSign({ sideColor: e.target.value })} className="bg-transparent border-none w-6 h-6 p-0" /></div>
-                                </>
-                             )}
-                          </div>
                           <div><div className="flex justify-between mb-1"><label className="text-xs text-gray-400">Opacity</label><span className="text-xs text-gray-500">{Math.round(activeSign.opacity * 100)}%</span></div><input type="range" min="0" max="1" step="0.05" value={activeSign.opacity} onChange={(e) => updateActiveSign({ opacity: parseFloat(e.target.value) })} className="w-full h-2 bg-gray-700 rounded-lg accent-purple-500" /></div>
                           <div><label className="text-xs text-gray-400 mb-1 block">Blend Mode</label><select value={activeSign.blendMode} onChange={(e) => updateActiveSign({ blendMode: e.target.value })} className="w-full bg-gray-800 text-sm text-white border border-gray-600 rounded p-1">{BLEND_MODES.map(mode => <option key={mode} value={mode}>{mode}</option>)}</select></div>
                     </div>
