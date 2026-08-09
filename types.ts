@@ -262,6 +262,9 @@ export interface SignTemplate {
   rightsNote?: string;
   version?: number;
   updatedAt?: number;
+  recovered?: boolean; // Storage object whose Firestore metadata was lost
+  deleting?: boolean;  // Personal-library tombstone for retry-safe deletion
+  deletionId?: string; // Identifies the exact cleanup operation
 }
 
 export interface Brand {

@@ -3,7 +3,7 @@ import { resolve } from 'node:path';
 import { afterAll, beforeAll, beforeEach, describe, it } from 'vitest';
 import { assertFails, assertSucceeds, initializeTestEnvironment, RulesTestEnvironment } from '@firebase/rules-unit-testing';
 import { doc, getDoc, setDoc, deleteDoc } from 'firebase/firestore';
-import { getBytes, ref, uploadBytes } from 'firebase/storage';
+import { getBytes, listAll, ref, uploadBytes } from 'firebase/storage';
 
 let env: RulesTestEnvironment;
 
@@ -52,7 +52,9 @@ describe('Storage rules', () => {
     const bytes = new TextEncoder().encode('image');
     await assertSucceeds(uploadBytes(ref(ownerStorage, 'users/owner/images/a'), bytes));
     await assertSucceeds(getBytes(ref(ownerStorage, 'users/owner/images/a')));
+    await assertSucceeds(listAll(ref(ownerStorage, 'users/owner/images')));
     await assertFails(getBytes(ref(strangerStorage, 'users/owner/images/a')));
+    await assertFails(listAll(ref(strangerStorage, 'users/owner/images')));
     await assertFails(uploadBytes(ref(strangerStorage, 'users/owner/images/b'), bytes));
   });
 

@@ -62,6 +62,27 @@ interface ControlsPanelProps {
   onOpenProjectManager: () => void;
 }
 
+export const readImageAspectRatio = (src: string): Promise<number | null> => new Promise(resolve => {
+  const image = new Image();
+  let settled = false;
+  const finish = (ratio: number | null) => {
+    if (settled) return;
+    settled = true;
+    window.clearTimeout(timer);
+    image.onload = null;
+    image.onerror = null;
+    resolve(ratio);
+  };
+  const timer = window.setTimeout(() => finish(null), 3_000);
+  image.onload = () => {
+    const width = image.naturalWidth || image.width;
+    const height = image.naturalHeight || image.height;
+    finish(width > 0 && height > 0 ? width / height : null);
+  };
+  image.onerror = () => finish(null);
+  image.src = src;
+});
+
 const ControlsPanel: React.FC<ControlsPanelProps> = ({
   state,
   activeCanvas,
@@ -365,7 +386,11 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
           const id = Date.now().toString();
           const cx = activeCanvas.backgroundSize.width / 2;
           const cy = activeCanvas.backgroundSize.height / 2;
-          const aspect = template.width / template.height;
+          const storedAspect = template.width / template.height;
+          const recoveredAspect = template.recovered ? await readImageAspectRatio(image) : null;
+          const aspect = recoveredAspect && Number.isFinite(recoveredAspect) && recoveredAspect > 0
+              ? recoveredAspect
+              : (Number.isFinite(storedAspect) && storedAspect > 0 ? storedAspect : 1);
           const w = 300;
           const h = w / aspect;
           

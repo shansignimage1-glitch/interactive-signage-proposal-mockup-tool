@@ -28,6 +28,139 @@ const transform = (page: Page) => page.locator('#export-target').evaluate(elemen
   return { x: matrix.m41, y: matrix.m42, scale: matrix.a };
 });
 
+const calibrateCanvas = async (page: Page) => {
+  const openAllControls = page.getByRole('button', { name: 'Open all controls' });
+  if (await openAllControls.isVisible()) await openAllControls.click();
+
+  await page.getByRole('button', { name: /Set real-world scale/ }).click();
+  await page.getByRole('button', { name: /Straight-on photo/ }).click();
+  const surface = page.locator('#export-target');
+  const bounds = await surface.boundingBox();
+  expect(bounds).not.toBeNull();
+  await surface.click({ position: { x: bounds!.width * 0.32, y: bounds!.height * 0.38 } });
+  await surface.click({ position: { x: bounds!.width * 0.56, y: bounds!.height * 0.38 } });
+  await page.getByRole('button', { name: 'Continue' }).click();
+  await page.getByRole('button', { name: 'Review calibration' }).click();
+  await page.getByRole('button', { name: 'Apply calibration' }).click();
+};
+
+test('touch drawing and dimension resize handles show a finger-offset precision magnifier', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name === 'desktop-chromium', 'Touch precision UI is specific to iPad and phone layouts.');
+
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Continue as Guest' }).click();
+  await page.evaluate(() => {
+    Element.prototype.setPointerCapture = () => undefined;
+    Element.prototype.releasePointerCapture = () => undefined;
+    Element.prototype.hasPointerCapture = () => false;
+  });
+  await calibrateCanvas(page);
+
+  const surface = page.locator('#export-target');
+  const bounds = await surface.boundingBox();
+  expect(bounds).not.toBeNull();
+  const signBounds = await page.locator('[data-testid^="sign-hit-area-"]').first().boundingBox();
+  expect(signBounds).not.toBeNull();
+  const lineStart = { x: signBounds!.x + signBounds!.width / 2, y: signBounds!.y + signBounds!.height / 2 };
+  const lineEnd = { x: Math.min(bounds!.x + bounds!.width * 0.82, lineStart.x + bounds!.width * 0.28), y: lineStart.y };
+
+  await page.getByRole('button', { name: 'Measure line' }).click();
+  await dispatchTouch(page, 'pointerdown', 1, lineStart.x, lineStart.y);
+  const loupe = page.getByTestId('precision-loupe');
+  await expect(loupe).toBeVisible();
+  await expect(loupe).toHaveAttribute('data-loupe-kind', 'drawing');
+  const signLayer = page.getByTestId('precision-loupe-sign-layer');
+  await expect(signLayer).toBeVisible();
+  await expect.poll(async () => signLayer.evaluate(node => {
+    const canvas = node as HTMLCanvasElement;
+    const context = canvas.getContext('2d');
+    if (!context) return 0;
+    const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
+    let visiblePixels = 0;
+    for (let index = 3; index < pixels.length; index += 4) if (pixels[index] > 0) visiblePixels += 1;
+    return visiblePixels;
+  })).toBeGreaterThan(0);
+  const firstLoupeBounds = await loupe.boundingBox();
+  expect(firstLoupeBounds).not.toBeNull();
+  expect(
+    lineStart.x >= firstLoupeBounds!.x && lineStart.x <= firstLoupeBounds!.x + firstLoupeBounds!.width &&
+    lineStart.y >= firstLoupeBounds!.y && lineStart.y <= firstLoupeBounds!.y + firstLoupeBounds!.height,
+  ).toBe(false);
+
+  await dispatchTouch(page, 'pointermove', 1, lineEnd.x, lineEnd.y);
+  await dispatchTouch(page, 'pointerup', 1, lineEnd.x, lineEnd.y);
+  await expect(loupe).toBeHidden();
+  await expect(page.locator('#export-target input')).toHaveCount(1);
+
+  const lineHandle = page.locator('[data-dimension-handle="0"]').first();
+  await expect(lineHandle).toBeVisible();
+  const lineHandleBounds = await lineHandle.boundingBox();
+  expect(lineHandleBounds).not.toBeNull();
+  const lineHandleCenter = {
+    x: lineHandleBounds!.x + lineHandleBounds!.width / 2,
+    y: lineHandleBounds!.y + lineHandleBounds!.height / 2,
+  };
+  await dispatchTouch(page, 'pointerdown', 1, lineHandleCenter.x, lineHandleCenter.y, '[data-dimension-handle="0"]');
+  await expect(loupe).toHaveAttribute('data-loupe-kind', 'dimension');
+  await dispatchTouch(page, 'pointermove', 1, lineHandleCenter.x + 18, lineHandleCenter.y + 10, '[data-dimension-handle="0"]');
+  await dispatchTouch(page, 'pointerup', 1, lineHandleCenter.x + 34, lineHandleCenter.y + 22, '[data-dimension-handle="0"]');
+  await expect(loupe).toBeHidden();
+  await expect.poll(async () => (await lineHandle.boundingBox())!.x).toBeGreaterThan(lineHandleBounds!.x + 25);
+
+  const openAllControls = page.getByRole('button', { name: 'Open all controls' });
+  if (await openAllControls.isVisible()) await openAllControls.click();
+  await page.getByRole('button', { name: 'Width × height' }).click();
+  const boxStart = { x: bounds!.x + bounds!.width * 0.36, y: bounds!.y + bounds!.height * 0.42 };
+  const boxEnd = { x: bounds!.x + bounds!.width * 0.68, y: bounds!.y + bounds!.height * 0.7 };
+  await dispatchTouch(page, 'pointerdown', 1, boxStart.x, boxStart.y);
+  await expect(loupe).toHaveAttribute('data-loupe-kind', 'drawing');
+  await dispatchTouch(page, 'pointerup', 1, boxStart.x, boxStart.y);
+  await expect(page.locator('#export-target input')).toHaveCount(1);
+  await dispatchTouch(page, 'pointerdown', 1, boxEnd.x - 18, boxEnd.y - 14);
+  await expect(loupe).toHaveAttribute('data-loupe-kind', 'drawing');
+  await dispatchTouch(page, 'pointermove', 1, boxEnd.x, boxEnd.y);
+  await dispatchTouch(page, 'pointerup', 1, boxEnd.x, boxEnd.y);
+  await expect(page.locator('#export-target input')).toHaveCount(2);
+
+  const boxHandle = page.locator('[data-dimension-handle="10"]');
+  await expect(boxHandle).toBeVisible();
+  const boxHandleBounds = await boxHandle.boundingBox();
+  expect(boxHandleBounds).not.toBeNull();
+  await dispatchTouch(
+    page,
+    'pointerdown',
+    1,
+    boxHandleBounds!.x + boxHandleBounds!.width / 2,
+    boxHandleBounds!.y + boxHandleBounds!.height / 2,
+    '[data-dimension-handle="10"]',
+  );
+  await expect(loupe).toHaveAttribute('data-loupe-kind', 'dimension');
+  await dispatchTouch(
+    page,
+    'pointerup',
+    1,
+    boxHandleBounds!.x + boxHandleBounds!.width / 2,
+    boxHandleBounds!.y + boxHandleBounds!.height / 2,
+    '[data-dimension-handle="10"]',
+  );
+  await expect(loupe).toBeHidden();
+
+  await page.getByRole('button', { name: 'Lock canvas view' }).click();
+  const reopenAllControls = page.getByRole('button', { name: 'Open all controls' });
+  if (await reopenAllControls.isVisible()) await reopenAllControls.click();
+  await page.getByRole('button', { name: 'Measure line' }).click();
+  const lockedStart = { x: bounds!.x + bounds!.width * 0.24, y: bounds!.y + bounds!.height * 0.78 };
+  await dispatchTouch(page, 'pointerdown', 1, lockedStart.x, lockedStart.y);
+  await expect(loupe).toBeVisible();
+  await dispatchTouch(page, 'pointerdown', 2, lockedStart.x + 90, lockedStart.y);
+  await expect(loupe).toBeHidden();
+  await dispatchTouch(page, 'pointermove', 1, lockedStart.x - 30, lockedStart.y + 20);
+  await dispatchTouch(page, 'pointermove', 2, lockedStart.x + 130, lockedStart.y + 20);
+  await dispatchTouch(page, 'pointerup', 2, lockedStart.x + 130, lockedStart.y + 20);
+  await dispatchTouch(page, 'pointerup', 1, lockedStart.x - 30, lockedStart.y + 20);
+  await expect(page.locator('#export-target input')).toHaveCount(2);
+});
+
 test('touch gestures pan and pinch the canvas without changing project coordinates', async ({ page }) => {
   await page.goto('/');
   await page.getByRole('button', { name: 'Continue as Guest' }).click();

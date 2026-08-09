@@ -1,6 +1,6 @@
 import { db, storage } from '../firebase';
-import { addDoc, collection, deleteDoc, doc, getDocs, limit, query, setDoc, where } from 'firebase/firestore';
-import { deleteObject, getBlob, getDownloadURL, ref as storageRef, uploadBytes } from 'firebase/storage';
+import { addDoc, collection, deleteDoc, doc, getDoc, getDocs, limit, query, setDoc, where } from 'firebase/firestore';
+import { deleteObject, getDownloadURL, listAll, ref as storageRef, uploadBytes } from 'firebase/storage';
 import { SignTemplate, SignType } from '../types';
 import { hashDataUri, dataUriToBlob } from './imageHash';
 import { resolveRef, isDriveRef } from './AssetResolver';
@@ -33,8 +33,10 @@ export interface NewTemplateInput {
 
 let sharedCache: SignTemplate[] | null = null;
 const templateImageCache = new Map<string, Promise<string>>();
+const templateDownloadUrlCache = new Map<string, string>();
 const TEMPLATE_IMAGE_TIMEOUT_MS = 15_000;
 const LIBRARY_METADATA_TIMEOUT_MS = 12_000;
+const PERSONAL_RECOVERY_TIMEOUT_MS = 5_000;
 const MAX_TEMPLATE_IMAGE_CACHE_ENTRIES = 32;
 
 const withTimeout = <T,>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> =>
@@ -74,6 +76,8 @@ const docToTemplate = (id: string, d: any, source: 'shared' | 'personal'): SignT
     rightsNote: d.rightsNote,
     version: d.version ?? 1,
     updatedAt: d.updatedAt,
+    deleting: d.deleting === true,
+    deletionId: d.deletionId,
 });
 
 const uploadLibraryImage = async (storagePath: string, dataUri: string): Promise<string> => {
@@ -101,40 +105,160 @@ export const materializeDataUri = async (image: string): Promise<string> => {
     });
 };
 
-const blobToDataUri = (blob: Blob): Promise<string> => new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result as string);
-    reader.onerror = () => reject(reader.error);
-    reader.readAsDataURL(blob);
-});
+export const refreshTemplateImageUrl = async (template: SignTemplate): Promise<string> => {
+    if (!template.storagePath) return template.image;
+    const imageUrl = await withTimeout(
+        getDownloadURL(storageRef(storage, template.storagePath)),
+        LIBRARY_METADATA_TIMEOUT_MS,
+        `Refreshing ${template.name}`,
+    );
+    templateDownloadUrlCache.set(template.storagePath, imageUrl);
+    return imageUrl;
+};
 
-// Library objects have stable Storage paths even when their persisted public
-// download token has expired. Read through the authenticated Firebase SDK.
+const loadTemplateDataUri = async (template: SignTemplate): Promise<string> => {
+    let firstError: unknown;
+    const cachedUrl = template.storagePath ? templateDownloadUrlCache.get(template.storagePath) : undefined;
+    const initialUrl = cachedUrl ?? template.image;
+
+    // Persisted Firebase download URLs are token-authenticated and do not need
+    // the signed-in user's auth token. Prefer that browser-compatible path.
+    if (initialUrl) {
+        try {
+            return await withTimeout(
+                materializeDataUri(initialUrl),
+                TEMPLATE_IMAGE_TIMEOUT_MS,
+                `Loading ${template.name}`,
+            );
+        } catch (error) {
+            firstError = error;
+            if (template.storagePath) templateDownloadUrlCache.delete(template.storagePath);
+        }
+    }
+
+    // Older records may hold a revoked token. Resolve a fresh URL through the
+    // stable Storage path, then retry the normal browser download path.
+    if (template.storagePath) {
+        try {
+            const refreshedUrl = await refreshTemplateImageUrl(template);
+            if (refreshedUrl) {
+                return await withTimeout(
+                    materializeDataUri(refreshedUrl),
+                    TEMPLATE_IMAGE_TIMEOUT_MS,
+                    `Loading ${template.name}`,
+                );
+            }
+        } catch (error) {
+            if (!firstError) firstError = error;
+        }
+    }
+
+    throw firstError instanceof Error ? firstError : new Error(`Could not load ${template.name}`);
+};
+
+// Materialize only when the canvas needs a self-contained image. Library cards
+// render their download URL directly and avoid a redundant authenticated blob
+// download for every thumbnail.
 export const materializeTemplateDataUri = async (template: SignTemplate): Promise<string> => {
     if (template.image.startsWith('data:')) return template.image;
-    if (template.storagePath) {
-        const cached = templateImageCache.get(template.storagePath);
+    const cacheKey = template.storagePath ?? template.image;
+    if (cacheKey) {
+        const cached = templateImageCache.get(cacheKey);
         if (cached) {
-            templateImageCache.delete(template.storagePath);
-            templateImageCache.set(template.storagePath, cached);
+            templateImageCache.delete(cacheKey);
+            templateImageCache.set(cacheKey, cached);
             return cached;
         }
-        const loading = withTimeout(
-            getBlob(storageRef(storage, template.storagePath)),
-            TEMPLATE_IMAGE_TIMEOUT_MS,
-            `Loading ${template.name}`,
-        ).then(blobToDataUri).catch(error => {
-            templateImageCache.delete(template.storagePath!);
+        const loading = loadTemplateDataUri(template).catch(error => {
+            templateImageCache.delete(cacheKey);
             throw error;
         });
         if (templateImageCache.size >= MAX_TEMPLATE_IMAGE_CACHE_ENTRIES) {
             const oldest = templateImageCache.keys().next().value;
             if (oldest) templateImageCache.delete(oldest);
         }
-        templateImageCache.set(template.storagePath, loading);
+        templateImageCache.set(cacheKey, loading);
         return loading;
     }
-    return withTimeout(materializeDataUri(template.image), TEMPLATE_IMAGE_TIMEOUT_MS, `Loading ${template.name}`);
+    throw new Error(`Could not load ${template.name}`);
+};
+
+const deleteStoragePath = async (storagePath: string): Promise<void> => {
+    try {
+        await deleteObject(storageRef(storage, storagePath));
+    } catch (error) {
+        if ((error as { code?: string })?.code !== 'storage/object-not-found') throw error;
+    }
+};
+
+const createOperationId = (): string => {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+    return `${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
+};
+
+const recoverPersonalUploads = async (uid: string, known: SignTemplate[]): Promise<SignTemplate[]> => {
+    const knownPaths = new Set(known.map(template => template.storagePath).filter(Boolean));
+    // Finish any cross-service deletion that was interrupted after its
+    // Firestore tombstone was written. Failures remain tombstoned and retry on
+    // the next open instead of resurfacing as recovered uploads.
+    await Promise.allSettled(known.filter(template => template.deleting).map(async template => {
+        if (!template.docId || !template.deletionId) return;
+        const templateDoc = doc(db, PERSONAL_COLLECTION, template.docId);
+        const beforeDelete = await getDoc(templateDoc);
+        const beforeData = beforeDelete.exists() ? beforeDelete.data() : null;
+        if (!beforeData || beforeData.deleting !== true || beforeData.deletionId !== template.deletionId) return;
+        if (template.storagePath) await deleteStoragePath(template.storagePath);
+        const afterDelete = await getDoc(templateDoc);
+        const afterData = afterDelete.exists() ? afterDelete.data() : null;
+        if (afterData?.deleting === true && afterData.deletionId === template.deletionId) {
+            await deleteDoc(templateDoc);
+        }
+    })).then(results => {
+        results.forEach(result => {
+            if (result.status === 'rejected') console.warn('Personal library deletion cleanup will retry:', result.reason);
+        });
+    });
+    const folder = storageRef(storage, `users/${uid}/library`);
+    const listing = await withTimeout(
+        listAll(folder),
+        PERSONAL_RECOVERY_TIMEOUT_MS,
+        'Checking uploaded signs',
+    );
+
+    const orphanRefs = listing.items
+        .filter(item => !knownPaths.has(item.fullPath))
+        .sort((a, b) => a.name.localeCompare(b.name));
+
+    return Promise.all(orphanRefs.map(async (item, index): Promise<SignTemplate> => {
+        let image = '';
+        try {
+            image = await withTimeout(
+                getDownloadURL(item),
+                PERSONAL_RECOVERY_TIMEOUT_MS,
+                'Recovering an uploaded sign',
+            );
+        } catch (error) {
+            console.warn(`Personal library upload ${item.fullPath} could not be recovered:`, error);
+        }
+        // Keep even a temporarily unavailable object visible. Its thumbnail
+        // and selection path can retry through storagePath, and the user can
+        // still delete it instead of having it silently disappear.
+        return {
+            id: `personal_${uid}_${item.name}`,
+            name: `Recovered upload ${index + 1}`,
+            category: 'Recovered',
+            image,
+            // The exact ratio is read from the materialized image when it is
+            // placed; these neutral values are not presented as mm.
+            width: 1,
+            height: 1,
+            source: 'personal',
+            storagePath: item.fullPath,
+            ownerUid: uid,
+            tags: ['recovered'],
+            recovered: true,
+        };
+    }));
 };
 
 export const LibraryService = {
@@ -165,12 +289,22 @@ export const LibraryService = {
             .sort((a, b) => a.name.localeCompare(b.name));
     },
 
+    // Recovery is intentionally separate from listPersonal so valid metadata
+    // appears immediately even if Storage listing is slow or unavailable.
+    recoverPersonalUploads: async (uid: string, known: SignTemplate[]): Promise<SignTemplate[]> => {
+        if (uid.startsWith('guest_')) return [];
+        return recoverPersonalUploads(uid, known);
+    },
+
     saveToPersonal: async (uid: string, input: NewTemplateInput): Promise<SignTemplate> => {
         const hash = await hashDataUri(input.dataUri);
-        const storagePath = `users/${uid}/library/${hash}`;
+        // Each save gets its own path and document. This prevents cleanup of a
+        // tombstoned upload from racing with a new save of identical artwork.
+        const uploadId = createOperationId();
+        const storagePath = `users/${uid}/library/${hash}_${uploadId}`;
         const imageUrl = await uploadLibraryImage(storagePath, input.dataUri);
 
-        const docId = `${uid}_${hash}`; // natural dedupe: same image saved twice = same doc
+        const docId = `${uid}_${hash}_${uploadId}`;
         const data = {
             name: input.name,
             category: input.category,
@@ -187,12 +321,25 @@ export const LibraryService = {
     },
 
     deletePersonal: async (template: SignTemplate): Promise<void> => {
-        if (!template.docId) return;
-        await deleteDoc(doc(db, PERSONAL_COLLECTION, template.docId));
-        if (template.storagePath) {
-            await deleteObject(storageRef(storage, template.storagePath))
-                .catch(e => console.warn('Library image delete skipped:', e));
+        if (!template.docId && !template.storagePath) return;
+        if (template.docId) {
+            // A tombstone keeps recovery from rediscovering the object if
+            // either half of this cross-service deletion needs to be retried.
+            const deletionId = createOperationId();
+            await setDoc(doc(db, PERSONAL_COLLECTION, template.docId), {
+                deleting: true,
+                deletionId,
+                updatedAt: Date.now(),
+            }, { merge: true });
         }
+        // Delete Storage first and surface failures. Otherwise a failed object
+        // delete followed by a successful metadata delete would be recovered
+        // as an apparent new upload on the next library load.
+        if (template.storagePath) await deleteStoragePath(template.storagePath);
+        // Recovered uploads have no Firestore record, so the Storage delete is
+        // sufficient. If this metadata delete fails, the tombstone makes the
+        // next attempt safe and keeps the broken record out of recovery.
+        if (template.docId) await deleteDoc(doc(db, PERSONAL_COLLECTION, template.docId));
     },
 
     // Admin-only (security rules enforce; UI hides it for everyone else)
@@ -229,7 +376,8 @@ export const LibraryService = {
         };
         if (storagePath) data.storagePath = storagePath;
         await setDoc(doc(db, SHARED_COLLECTION, template.docId), data, { merge: true });
-        if (replacingImage && template.storagePath && template.storagePath !== storagePath) await deleteObject(storageRef(storage, template.storagePath)).catch(() => undefined);
+        // Shared objects are content-addressed and immutable. Keep the old
+        // object: another current or legacy record may still reference it.
         sharedCache = null;
         return { ...docToTemplate(template.docId, data, 'shared'), image: replacingImage ? input.dataUri : template.image };
     },
@@ -237,12 +385,14 @@ export const LibraryService = {
     deleteShared: async (template: SignTemplate): Promise<void> => {
         if (!template.docId) return;
         await deleteDoc(doc(db, SHARED_COLLECTION, template.docId));
-        if (template.storagePath) {
-            await deleteObject(storageRef(storage, template.storagePath))
-                .catch(e => console.warn('Library image delete skipped:', e));
-        }
+        // Do not delete the content-addressed object here. Multiple records can
+        // legitimately share it, including legacy records without storagePath.
         sharedCache = null;
     },
 
-    invalidateCache: (): void => { sharedCache = null; templateImageCache.clear(); },
+    invalidateCache: (): void => {
+        sharedCache = null;
+        templateImageCache.clear();
+        templateDownloadUrlCache.clear();
+    },
 };

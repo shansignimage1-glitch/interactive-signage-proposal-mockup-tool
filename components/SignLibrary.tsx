@@ -3,7 +3,7 @@ import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { BRANDS } from '../data/brands';
 import { Dimension, SignTemplate, Sign, UserProfile, SIGN_TYPES, SignType } from '../types';
 import { Sparkles, X, LayoutGrid, Loader2, User as UserIcon, Trash2, UploadCloud, BookmarkPlus, Globe, LogIn, Search, Pencil, ImageOff } from 'lucide-react';
-import { LibraryService, isLibraryAdmin, materializeDataUri, materializeTemplateDataUri, NewTemplateInput } from '../services/LibraryService';
+import { LibraryService, isLibraryAdmin, materializeDataUri, refreshTemplateImageUrl, NewTemplateInput } from '../services/LibraryService';
 import { reportError } from '../services/monitoring';
 import { notify } from '../services/toast';
 
@@ -20,6 +20,7 @@ type LibTab = 'catalog' | 'personal';
 
 // Categories the ControlsPanel's mapCategoryToType understands
 const CATEGORY_OPTIONS = ['Fascia', 'Projecting', 'Pylon', 'Totem', 'Window'];
+const FILTER_CATEGORY_OPTIONS = [...CATEGORY_OPTIONS, 'Recovered'];
 
 const SignLibrary: React.FC<SignLibraryProps> = ({ isOpen, onClose, onSelect, activeDimension, user, activeSign }) => {
   const [selectedBrandId, setSelectedBrandId] = useState<string>(BRANDS[0].id);
@@ -54,6 +55,22 @@ const SignLibrary: React.FC<SignLibraryProps> = ({ isOpen, onClose, onSelect, ac
     let cancelled = false;
     const sharedVersionAtLoad = sharedMutationVersion.current;
     const personalVersionAtLoad = personalMutationVersion.current;
+    const mergeRecoveredUploads = (known: SignTemplate[]) => {
+      void LibraryService.recoverPersonalUploads(user!.uid, known).then(recovered => {
+        if (cancelled || personalMutationVersion.current !== personalVersionAtLoad || recovered.length === 0) return;
+        setPersonal(current => {
+          const currentPaths = new Set(current.map(template => template.storagePath).filter(Boolean));
+          const additions = recovered.filter(template => !currentPaths.has(template.storagePath));
+          return additions.length > 0
+            ? [...current, ...additions].sort((a, b) => a.name.localeCompare(b.name))
+            : current;
+        });
+      }).catch(error => {
+        if (!cancelled) {
+          setCloudError(current => current ?? `My Library recovery: ${error?.message ?? 'Could not check stored uploads'}`);
+        }
+      });
+    };
     setIsLoadingShared(true);
     setIsLoadingPersonal(true);
     setCloudError(null);
@@ -65,9 +82,14 @@ const SignLibrary: React.FC<SignLibraryProps> = ({ isOpen, onClose, onSelect, ac
       if (!cancelled) setIsLoadingShared(false);
     });
     void LibraryService.listPersonal(user!.uid).then(p => {
-      if (!cancelled && personalMutationVersion.current === personalVersionAtLoad) setPersonal(p);
+      if (!cancelled && personalMutationVersion.current === personalVersionAtLoad) {
+        setPersonal(p.filter(template => !template.deleting));
+        mergeRecoveredUploads(p);
+      }
     }).catch(e => {
-      if (!cancelled) setCloudError(current => current ?? `My Library: ${e?.message ?? 'Could not load uploads'}`);
+      if (!cancelled) {
+        setCloudError(current => current ?? `My Library: ${e?.message ?? 'Could not load uploads'}`);
+      }
     }).finally(() => {
       if (!cancelled) setIsLoadingPersonal(false);
     });
@@ -85,7 +107,8 @@ const SignLibrary: React.FC<SignLibraryProps> = ({ isOpen, onClose, onSelect, ac
     const textNum = parseInt(activeDimension.text.replace(/[^0-9]/g, ''));
     const hasTextNum = !isNaN(textNum) && textNum > 0;
 
-    const allTemplates = [...BRANDS.flatMap(b => b.templates), ...shared, ...personal];
+    const allTemplates = [...BRANDS.flatMap(b => b.templates), ...shared, ...personal]
+      .filter(template => !template.recovered);
     const scored = allTemplates.map(t => {
       const tRatio = t.width / t.height;
       let score = Math.abs(tRatio - dimRatio);
@@ -185,7 +208,7 @@ const SignLibrary: React.FC<SignLibraryProps> = ({ isOpen, onClose, onSelect, ac
   };
 
   const handleDelete = async (template: SignTemplate) => {
-    if (!template.docId) return;
+    if (!template.docId && !template.storagePath) return;
     setBusy(template.id);
     try {
       if (template.source === 'personal') {
@@ -319,7 +342,7 @@ const SignLibrary: React.FC<SignLibraryProps> = ({ isOpen, onClose, onSelect, ac
             <div className="flex-1 overflow-y-auto p-6 bg-gray-900">
                 <div className="flex gap-2 mb-5">
                     <div className="relative flex-1"><Search className="absolute left-3 top-2.5 w-4 h-4 text-gray-500" /><input value={query} onChange={e => { setQuery(e.target.value); setPage(1); }} placeholder="Search name, brand or tag" className="w-full bg-gray-800 border border-gray-700 rounded-lg pl-9 pr-3 py-2 text-sm text-white" /></div>
-                    <select value={categoryFilter} onChange={e => { setCategoryFilter(e.target.value); setPage(1); }} className="bg-gray-800 border border-gray-700 rounded-lg px-3 text-sm text-white"><option>All</option>{CATEGORY_OPTIONS.map(c => <option key={c}>{c}</option>)}</select>
+                    <select value={categoryFilter} onChange={e => { setCategoryFilter(e.target.value); setPage(1); }} className="bg-gray-800 border border-gray-700 rounded-lg px-3 text-sm text-white"><option>All</option>{FILTER_CATEGORY_OPTIONS.map(c => <option key={c}>{c}</option>)}</select>
                 </div>
 
                 {/* Suggestions */}
@@ -501,26 +524,41 @@ const SignLibrary: React.FC<SignLibraryProps> = ({ isOpen, onClose, onSelect, ac
 };
 
 const TemplateImage: React.FC<{ template: SignTemplate }> = ({ template }) => {
-    const directImage = !template.source || template.image.startsWith('data:') ? template.image : null;
-    const [src, setSrc] = useState<string | null>(directImage);
+    const [src, setSrc] = useState<string | null>(template.image || null);
     const [failed, setFailed] = useState(false);
+    const [didRefresh, setDidRefresh] = useState(false);
+    const requestVersion = useRef(0);
 
     useEffect(() => {
-        if (directImage) { setSrc(directImage); setFailed(false); return; }
-        let cancelled = false;
-        setSrc(null);
+        const version = ++requestVersion.current;
+        setSrc(template.image || null);
         setFailed(false);
-        void materializeTemplateDataUri(template).then(image => {
-            if (!cancelled) setSrc(image);
+        setDidRefresh(false);
+        if (!template.image && template.storagePath) {
+            void refreshTemplateImageUrl(template).then(image => {
+                if (requestVersion.current === version) { setSrc(image); setDidRefresh(true); }
+            }).catch(() => {
+                if (requestVersion.current === version) setFailed(true);
+            });
+        }
+        return () => { requestVersion.current += 1; };
+    }, [template.id, template.image, template.storagePath]);
+
+    const handleImageError = () => {
+        if (!template.storagePath || didRefresh) { setFailed(true); return; }
+        const version = ++requestVersion.current;
+        setDidRefresh(true);
+        setSrc(null);
+        void refreshTemplateImageUrl(template).then(image => {
+            if (requestVersion.current === version) setSrc(image);
         }).catch(() => {
-            if (!cancelled) setFailed(true);
+            if (requestVersion.current === version) setFailed(true);
         });
-        return () => { cancelled = true; };
-    }, [template.id, template.image, template.storagePath, directImage]);
+    };
 
     if (failed) return <div className="flex flex-col items-center gap-1 text-gray-500"><ImageOff className="h-6 w-6" /><span className="text-[10px]">Image unavailable</span></div>;
     if (!src) return <Loader2 className="h-5 w-5 animate-spin text-blue-400" aria-label={`Loading ${template.name} thumbnail`} />;
-    return <img src={src} alt={template.name} className="max-w-full max-h-full object-contain drop-shadow-2xl" />;
+    return <img src={src} alt={template.name} onError={handleImageError} className="max-w-full max-h-full object-contain drop-shadow-2xl" />;
 };
 
 const TemplateCard: React.FC<{ template: SignTemplate, onClick: () => void, isSuggestion?: boolean, onDelete?: () => void, onEdit?: () => void, deleting?: boolean }> = ({ template, onClick, isSuggestion, onDelete, onEdit, deleting }) => (
@@ -535,7 +573,9 @@ const TemplateCard: React.FC<{ template: SignTemplate, onClick: () => void, isSu
             <p className="text-white font-medium text-sm truncate">{template.name}</p>
             <div className="flex justify-between items-center mt-1">
                 <span className="text-xs text-gray-400">{template.category}</span>
-                <span className="text-[10px] text-gray-500 bg-black/50 px-1.5 py-0.5 rounded">{template.width}x{template.height}mm</span>
+                <span className="text-[10px] text-gray-500 bg-black/50 px-1.5 py-0.5 rounded">
+                    {template.recovered ? 'Original proportions' : `${template.width}x${template.height}mm`}
+                </span>
             </div>
         </div>
         {onDelete && (

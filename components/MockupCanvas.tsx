@@ -46,6 +46,34 @@ const SIGN_CORNER_HIT_SIZE = 52;
 const SIGN_CORNER_VISUAL_SIZE = 18;
 const SIGN_MOVE_HIT_SIZE = 60;
 const SIGN_MOVE_VISUAL_SIZE = 30;
+const PRECISION_LOUPE_SIZE = 128;
+const PRECISION_LOUPE_GAP = 32;
+const TOUCH_DRAW_THRESHOLD = 8;
+
+type PrecisionLoupeKind = 'calibration' | 'drawing' | 'dimension';
+
+interface PrecisionLoupeState {
+  clientX: number;
+  clientY: number;
+  point: Point;
+  pointerId: number;
+  kind: PrecisionLoupeKind;
+}
+
+const precisionLoupePosition = (clientX: number, clientY: number, viewportWidth: number, viewportHeight: number) => {
+    const safeEdge = 12;
+    const preferredLeft = clientX > viewportWidth / 2
+        ? clientX - PRECISION_LOUPE_SIZE - PRECISION_LOUPE_GAP
+        : clientX + PRECISION_LOUPE_GAP;
+    const preferredTop = clientY - PRECISION_LOUPE_SIZE - 38;
+    const fallbackTop = clientY + 38;
+    const top = preferredTop >= safeEdge ? preferredTop : fallbackTop;
+
+    return {
+        left: Math.min(Math.max(safeEdge, preferredLeft), Math.max(safeEdge, viewportWidth - PRECISION_LOUPE_SIZE - safeEdge)),
+        top: Math.min(Math.max(safeEdge, top), Math.max(safeEdge, viewportHeight - PRECISION_LOUPE_SIZE - safeEdge)),
+    };
+};
 
 const pointToSegmentDistance = (point: Point, start: Point, end: Point) => {
     const dx = end.x - start.x;
@@ -97,6 +125,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const loupeCanvasRef = useRef<HTMLCanvasElement>(null);
   const glRef = useRef<WebGLRenderingContext | null>(null);
   const programRef = useRef<WebGLProgram | null>(null);
   
@@ -124,13 +153,24 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
   const [tick, setTick] = useState(0); 
   const drawingStart = useRef<Point | null>(null);
   const drawingCurrent = useRef<Point | null>(null);
+  const drawingTouchRef = useRef<{
+    pointerId: number;
+    startClient: Point;
+    completesOnUp: boolean;
+  } | null>(null);
   const [calibrationDragIndex, setCalibrationDragIndex] = useState<number | null>(null);
-  const [calibrationLoupe, setCalibrationLoupe] = useState<{ clientX: number; clientY: number; point: Point } | null>(null);
-  useEffect(() => {
-    setIsDrawing(false);
-    drawingStart.current = null;
-    drawingCurrent.current = null;
-  }, [toolMode]);
+  const precisionPointerRef = useRef<{ pointerId: number; kind: PrecisionLoupeKind } | null>(null);
+  const [precisionLoupe, setPrecisionLoupe] = useState<PrecisionLoupeState | null>(null);
+
+  const showPrecisionLoupe = (kind: PrecisionLoupeKind, e: React.PointerEvent, point: Point) => {
+    precisionPointerRef.current = { pointerId: e.pointerId, kind };
+    setPrecisionLoupe({ clientX: e.clientX, clientY: e.clientY, point, pointerId: e.pointerId, kind });
+  };
+
+  const clearPrecisionLoupe = useCallback(() => {
+    precisionPointerRef.current = null;
+    setPrecisionLoupe(null);
+  }, []);
 
   const boxDragTargetsRef = useRef<{ x: 'start'|'end'|null, y: 'start'|'end'|null }>({ x: null, y: null });
   const textureCacheRef = useRef<Map<string, WebGLTexture>>(new Map());
@@ -183,6 +223,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
   const startCornersRef = useRef<[Point, Point, Point, Point] | null>(null);
   const dragSignIdRef = useRef<string | null>(null);
   const startDimRef = useRef<{ start: Point, end: Point } | null>(null);
+  const activeEditPointerRef = useRef<number | null>(null);
   const lastPanPos = useRef<Point>({ x: 0, y: 0 });
 
   // Helper to update revision rows dynamically
@@ -281,11 +322,13 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
             setIsDrawing(false);
             drawingStart.current = null;
             drawingCurrent.current = null;
+            drawingTouchRef.current = null;
+            clearPrecisionLoupe();
         }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [isDrawing]);
+  }, [clearPrecisionLoupe, isDrawing]);
 
   // --- Reset View & Calc Base Scale ---
   const fitToContainer = useCallback(() => {
@@ -333,7 +376,9 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
      setIsDrawing(false);
      drawingStart.current = null;
      drawingCurrent.current = null;
-  }, [toolMode]);
+     drawingTouchRef.current = null;
+     clearPrecisionLoupe();
+  }, [clearPrecisionLoupe, toolMode]);
 
   const getMousePos = (e: MouseEvent | React.MouseEvent | React.PointerEvent) => {
     if (!containerRef.current) return { x: 0, y: 0 };
@@ -392,6 +437,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
       startDistance: Math.max(1, distance(first, second)),
     };
     setActiveHandle(null);
+    activeEditPointerRef.current = null;
     startCornersRef.current = null;
     dragSignIdRef.current = null;
     startDimRef.current = null;
@@ -400,15 +446,15 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
       drawingStart.current = null;
       drawingCurrent.current = null;
     }
+    drawingTouchRef.current = null;
     setCalibrationDragIndex(null);
-    setCalibrationLoupe(null);
+    clearPrecisionLoupe();
     setIsNavigating(true);
   };
 
   const handleTouchPointerDownCapture = (e: React.PointerEvent<HTMLDivElement>) => {
     if (e.pointerType !== 'touch') return;
     if (e.target instanceof Element && e.target.closest('[data-canvas-ui]')) return;
-    if (viewLocked) return;
 
     const point = screenPoint(e.clientX, e.clientY);
     activePointersRef.current.set(e.pointerId, point);
@@ -423,6 +469,8 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
       return;
     }
 
+    if (viewLocked) return;
+
     if (isCropping) return;
     const shouldPan = toolMode === 'pan' ||
       (toolMode === 'select' && !isEditableAt(getMousePos(e), e.target));
@@ -436,7 +484,6 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
   };
 
   const handleTouchPointerMoveCapture = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (viewLocked) return;
     if (e.pointerType !== 'touch' || !activePointersRef.current.has(e.pointerId)) return;
     const point = screenPoint(e.clientX, e.clientY);
     activePointersRef.current.set(e.pointerId, point);
@@ -445,6 +492,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
 
     e.preventDefault();
     e.stopPropagation();
+    if (viewLocked) return;
     if (gesture.mode === 'pan') {
       if (gesture.pointerId !== e.pointerId) return;
       const dx = point.x - gesture.last.x;
@@ -1003,6 +1051,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
     e.preventDefault();
     e.stopPropagation();
     e.currentTarget.setPointerCapture(e.pointerId);
+    activeEditPointerRef.current = e.pointerId;
     
     // We update startMousePos just in case, but getMousePos depends on view/scale not event target
     startMousePos.current = getMousePos(e);
@@ -1029,6 +1078,9 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
                  else if ([14, 15, 16].includes(index)) targetY = isStartTop ? 'end' : 'start';
                  boxDragTargetsRef.current = { x: targetX, y: targetY };
              }
+             if (e.pointerType === 'touch' && (index === 0 || index === 1 || index >= 10)) {
+                 showPrecisionLoupe('dimension', e, startMousePos.current);
+             }
         }
     }
     setActiveHandle(index);
@@ -1040,6 +1092,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
       e.preventDefault();
       e.stopPropagation();
       e.currentTarget.setPointerCapture(e.pointerId);
+      activeEditPointerRef.current = e.pointerId;
       setActiveSign(sign.id);
       startMousePos.current = getMousePos(e);
       startCornersRef.current = [...sign.corners];
@@ -1054,7 +1107,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
       e.stopPropagation();
       e.currentTarget.setPointerCapture(e.pointerId);
       setCalibrationDragIndex(index);
-      setCalibrationLoupe({ clientX: e.clientX, clientY: e.clientY, point: calibrationDraft.points[index] });
+      showPrecisionLoupe('calibration', e, calibrationDraft.points[index]);
   };
 
   const handleCanvasPointerDown = (e: React.PointerEvent) => {
@@ -1062,7 +1115,16 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
       if (titleBlock.viewMode === 'sheet') return; // Disable interaction in sheet view
       if (toolMode === 'pan') return; // Let the outer viewport handler pan instead of selecting content
 
-      if (e.button === 2) { if (isDrawing) { setIsDrawing(false); drawingStart.current = null; drawingCurrent.current = null; return; } }
+      if (e.button === 2) {
+        if (isDrawing) {
+          setIsDrawing(false);
+          drawingStart.current = null;
+          drawingCurrent.current = null;
+          drawingTouchRef.current = null;
+          clearPrecisionLoupe();
+          return;
+        }
+      }
       const pos = getMousePos(e);
       if (toolMode === 'calibrate' || toolMode === 'calibrate_plane') {
         e.preventDefault(); e.stopPropagation();
@@ -1075,6 +1137,27 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
       }
       if (toolMode === 'draw_line' || toolMode === 'draw_box') {
         e.preventDefault(); e.stopPropagation();
+        if (e.pointerType === 'touch') {
+          try { e.currentTarget.setPointerCapture(e.pointerId); } catch { /* best effort on mobile browsers */ }
+          const completesOnUp = drawingStart.current !== null;
+          if (!drawingStart.current) {
+            setIsDrawing(true);
+            drawingStart.current = pos;
+            drawingCurrent.current = pos;
+            setActiveSign(null);
+            setActiveDimension('');
+          } else {
+            drawingCurrent.current = pos;
+            setTick(value => value + 1);
+          }
+          drawingTouchRef.current = {
+            pointerId: e.pointerId,
+            startClient: { x: e.clientX, y: e.clientY },
+            completesOnUp,
+          };
+          showPrecisionLoupe('drawing', e, pos);
+          return;
+        }
         if (!isDrawing) {
           setIsDrawing(true);
           drawingStart.current = pos;
@@ -1091,7 +1174,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
       }
       
       let hitFound = false;
-      if (state.showDimensions) { for (const dim of dimensions) { let isHit = false; if (dim.variant === 'box') { const x = Math.min(dim.start.x, dim.end.x); const y = Math.min(dim.start.y, dim.end.y); const w = Math.abs(dim.end.x - dim.start.x); const h = Math.abs(dim.end.y - dim.start.y); if (pos.x >= x && pos.x <= x + w && pos.y >= y && pos.y <= y + h) isHit = true; } else { const hitRadius = 20 / Math.max(baseScale * view.scale, 0.01); isHit = pointToSegmentDistance(pos, dim.start, dim.end) <= hitRadius; } if (isHit) { setActiveDimension(dim.id); if (dim.id === activeDimensionId) { e.currentTarget.setPointerCapture(e.pointerId); startMousePos.current = pos; startDimRef.current = { start: { ...dim.start }, end: { ...dim.end } }; setActiveHandle(2); } hitFound = true; return; } } }
+      if (state.showDimensions) { for (const dim of dimensions) { let isHit = false; if (dim.variant === 'box') { const x = Math.min(dim.start.x, dim.end.x); const y = Math.min(dim.start.y, dim.end.y); const w = Math.abs(dim.end.x - dim.start.x); const h = Math.abs(dim.end.y - dim.start.y); if (pos.x >= x && pos.x <= x + w && pos.y >= y && pos.y <= y + h) isHit = true; } else { const hitRadius = 20 / Math.max(baseScale * view.scale, 0.01); isHit = pointToSegmentDistance(pos, dim.start, dim.end) <= hitRadius; } if (isHit) { setActiveDimension(dim.id); if (dim.id === activeDimensionId) { e.currentTarget.setPointerCapture(e.pointerId); activeEditPointerRef.current = e.pointerId; startMousePos.current = pos; startDimRef.current = { start: { ...dim.start }, end: { ...dim.end } }; setActiveHandle(2); } hitFound = true; return; } } }
       if (!hitFound) {
         for (let i = signs.length - 1; i >= 0; i--) {
           const sign = signs[i];
@@ -1101,6 +1184,30 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
         }
       }
       if (!hitFound) { dragSignIdRef.current = null; setActiveSign(null); setActiveDimension(''); }
+  };
+
+  const updateDraggedDimension = (interactionHandle: number, pos: Point) => {
+      if (!activeDimensionId || !startDimRef.current) return false;
+      const dx = pos.x - startMousePos.current.x;
+      const dy = pos.y - startMousePos.current.y;
+      const start = startDimRef.current.start;
+      const end = startDimRef.current.end;
+
+      if (interactionHandle === 0) updateDimension(activeDimensionId, { start: { x: start.x + dx, y: start.y + dy } });
+      else if (interactionHandle === 1) updateDimension(activeDimensionId, { end: { x: end.x + dx, y: end.y + dy } });
+      else if (interactionHandle === 2) updateDimension(activeDimensionId, { start: { x: start.x + dx, y: start.y + dy }, end: { x: end.x + dx, y: end.y + dy } });
+      else if (interactionHandle >= 10) {
+          const targets = boxDragTargetsRef.current;
+          const newStart = { ...start };
+          const newEnd = { ...end };
+          if (targets.x === 'start') newStart.x += dx;
+          else if (targets.x === 'end') newEnd.x += dx;
+          if (targets.y === 'start') newStart.y += dy;
+          else if (targets.y === 'end') newEnd.y += dy;
+          updateDimension(activeDimensionId, { start: newStart, end: newEnd });
+      } else return false;
+
+      return true;
   };
 
   const handlePointerMove = (e: React.PointerEvent) => {
@@ -1113,13 +1220,14 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
         const point = getMousePos(e);
         next[calibrationDragIndex] = point;
         onCalibrationDraftPointsChange(next);
-        setCalibrationLoupe({ clientX: e.clientX, clientY: e.clientY, point });
+        showPrecisionLoupe('calibration', e, point);
         return;
     }
     
     // If we are dragging a handle, handle it here and stop propagation
     const interactionHandle = activeHandleRef.current;
     if (interactionHandle !== null) {
+        if (activeEditPointerRef.current !== null && activeEditPointerRef.current !== e.pointerId) return;
         e.preventDefault();
         e.stopPropagation();
         
@@ -1150,28 +1258,52 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
                 const newCorners = startCorners.map(p => ({ x: center.x + (p.x - center.x) * scale, y: center.y + (p.y - center.y) * scale })) as [Point, Point, Point, Point]; 
                 updateSignById(dragSignId, { corners: newCorners });
             }
-        } else if (activeDimensionId && startDimRef.current) {
-            const activeDim = dimensions.find(d => d.id === activeDimensionId);
-            if (!activeDim) return;
-            const start = startDimRef.current.start;
-            const end = startDimRef.current.end;
-            if (interactionHandle === 0) { updateDimension(activeDimensionId, { start: { x: start.x + dx, y: start.y + dy } }); }
-            else if (interactionHandle === 1) { updateDimension(activeDimensionId, { end: { x: end.x + dx, y: end.y + dy } }); }
-            else if (interactionHandle === 2) { updateDimension(activeDimensionId, { start: { x: start.x + dx, y: start.y + dy }, end: { x: end.x + dx, y: end.y + dy } }); }
-            else if (interactionHandle >= 10) { const targets = boxDragTargetsRef.current; const newStart = { ...start }; const newEnd = { ...end }; if (targets.x === 'start') newStart.x += dx; else if (targets.x === 'end') newEnd.x += dx; if (targets.y === 'start') newStart.y += dy; else if (targets.y === 'end') newEnd.y += dy; updateDimension(activeDimensionId, { start: newStart, end: newEnd }); }
+        } else if (updateDraggedDimension(interactionHandle, pos)) {
+            if (precisionPointerRef.current?.kind === 'dimension' && precisionPointerRef.current.pointerId === e.pointerId) {
+                showPrecisionLoupe('dimension', e, pos);
+            }
         }
         return;
     }
 
     const pos = getMousePos(e);
-    if (isDrawing && drawingStart.current) { drawingCurrent.current = pos; setTick(t => t + 1); return; }
+    if (isDrawing && drawingStart.current) {
+        drawingCurrent.current = pos;
+        setTick(t => t + 1);
+        if (drawingTouchRef.current?.pointerId === e.pointerId) showPrecisionLoupe('drawing', e, pos);
+        return;
+    }
   };
 
   const handlePointerUp = (e: React.PointerEvent) => {
+    if (activeHandleRef.current !== null && activeEditPointerRef.current !== null && activeEditPointerRef.current !== e.pointerId) return;
+
     // Capture release and cleanup
     if (e.currentTarget.hasPointerCapture(e.pointerId)) { 
         e.currentTarget.releasePointerCapture(e.pointerId); 
     }
+
+    const touchDrawing = drawingTouchRef.current;
+    if (touchDrawing?.pointerId === e.pointerId) {
+        const end = getMousePos(e);
+        drawingCurrent.current = end;
+        const moved = distance(touchDrawing.startClient, { x: e.clientX, y: e.clientY }) >= TOUCH_DRAW_THRESHOLD;
+        const shouldComplete = touchDrawing.completesOnUp || moved;
+        if (shouldComplete && drawingStart.current) {
+            onDrawComplete(drawingStart.current, end, toolMode === 'draw_box' ? 'box' : 'linear');
+            setIsDrawing(false);
+            drawingStart.current = null;
+            drawingCurrent.current = null;
+        } else {
+            setTick(value => value + 1);
+        }
+        drawingTouchRef.current = null;
+        clearPrecisionLoupe();
+        e.stopPropagation();
+        return;
+    }
+
+    if (activeHandleRef.current !== null) updateDraggedDimension(activeHandleRef.current, getMousePos(e));
     
     // Only stop propagation if we were dragging a handle
     if (activeHandleRef.current !== null) {
@@ -1179,7 +1311,8 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
     }
     
     setCalibrationDragIndex(null);
-    setCalibrationLoupe(null);
+    clearPrecisionLoupe();
+    activeEditPointerRef.current = null;
     setActiveHandle(null); startCornersRef.current = null; dragSignIdRef.current = null; startDimRef.current = null;
   };
 
@@ -1187,9 +1320,11 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
     setIsDrawing(false);
     drawingStart.current = null;
     drawingCurrent.current = null;
+    drawingTouchRef.current = null;
     setActiveHandle(null);
     setCalibrationDragIndex(null);
-    setCalibrationLoupe(null);
+    clearPrecisionLoupe();
+    activeEditPointerRef.current = null;
     startCornersRef.current = null;
     dragSignIdRef.current = null;
     startDimRef.current = null;
@@ -1287,6 +1422,63 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
   // In sheet view the scene div is further scaled by sceneScale, so annotation
   // strokes/labels must compensate for both transforms to stay constant on screen.
   const handleScale = 1 / (totalScale * (isSheetView ? sceneScale : 1));
+  const loupeScale = Math.min(8, Math.max(1.4, totalScale * (isSheetView ? sceneScale : 1) * 4));
+  const loupePosition = precisionLoupe
+      ? precisionLoupePosition(
+          precisionLoupe.clientX,
+          precisionLoupe.clientY,
+          typeof window === 'undefined' ? 1024 : window.innerWidth,
+          typeof window === 'undefined' ? 768 : window.innerHeight,
+        )
+      : null;
+  const loupeCenter = PRECISION_LOUPE_SIZE / 2;
+
+  useEffect(() => {
+    const source = canvasRef.current;
+    const target = loupeCanvasRef.current;
+    if (!precisionLoupe || !source || !target) return;
+
+    const frame = window.requestAnimationFrame(() => {
+      const context = target.getContext('2d');
+      if (!context) return;
+      const pixelRatio = Math.min(2, Math.max(1, window.devicePixelRatio || 1));
+      const targetPixels = Math.round(PRECISION_LOUPE_SIZE * pixelRatio);
+      if (target.width !== targetPixels || target.height !== targetPixels) {
+        target.width = targetPixels;
+        target.height = targetPixels;
+      }
+      context.setTransform(1, 0, 0, 1, 0, 0);
+      context.clearRect(0, 0, target.width, target.height);
+      context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+      context.imageSmoothingEnabled = true;
+      context.imageSmoothingQuality = 'high';
+
+      const sourceSize = PRECISION_LOUPE_SIZE / loupeScale;
+      const sourceLeft = precisionLoupe.point.x - sourceSize / 2;
+      const sourceTop = precisionLoupe.point.y - sourceSize / 2;
+      const clippedLeft = Math.max(0, sourceLeft);
+      const clippedTop = Math.max(0, sourceTop);
+      const clippedRight = Math.min(source.width, sourceLeft + sourceSize);
+      const clippedBottom = Math.min(source.height, sourceTop + sourceSize);
+      const clippedWidth = clippedRight - clippedLeft;
+      const clippedHeight = clippedBottom - clippedTop;
+      if (clippedWidth <= 0 || clippedHeight <= 0) return;
+
+      context.drawImage(
+        source,
+        clippedLeft,
+        clippedTop,
+        clippedWidth,
+        clippedHeight,
+        (clippedLeft - sourceLeft) * loupeScale,
+        (clippedTop - sourceTop) * loupeScale,
+        clippedWidth * loupeScale,
+        clippedHeight * loupeScale,
+      );
+    });
+
+    return () => window.cancelAnimationFrame(frame);
+  }, [loupeScale, precisionLoupe, signs, texturesLoaded]);
 
   // Filter fields by section
   const projectFields = titleBlock.fields.filter(f => f.section === 'project');
@@ -1329,32 +1521,126 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
       </div>
       {(toolMode === 'draw_line' || toolMode === 'draw_box') && (
         <div data-canvas-ui className="pointer-events-none absolute bottom-[max(1rem,env(safe-area-inset-bottom))] left-1/2 z-40 -translate-x-1/2 rounded-full border border-blue-400/40 bg-gray-950/90 px-4 py-2 text-center text-sm font-medium text-white shadow-xl backdrop-blur">
-          {isDrawing ? `Tap the opposite ${toolMode === 'draw_box' ? 'corner' : 'endpoint'} · ${viewLocked ? 'view locked' : 'pinch to zoom'}` : `Tap the first ${toolMode === 'draw_box' ? 'corner' : 'endpoint'}`}
+          {isDrawing
+            ? `Press and drag, or tap the opposite ${toolMode === 'draw_box' ? 'corner' : 'endpoint'} · ${viewLocked ? 'view locked' : 'pinch to zoom'}`
+            : `Tap the first ${toolMode === 'draw_box' ? 'corner' : 'endpoint'}, or press and drag`}
         </div>
       )}
-      {calibrationLoupe && images.background && (
+      {precisionLoupe && loupePosition && images.background && (
         <div
           data-canvas-ui
-          className="pointer-events-none fixed z-[195] h-28 w-28 overflow-hidden rounded-full border-4 border-white bg-gray-900 shadow-2xl ring-2 ring-amber-400"
+          data-testid="precision-loupe"
+          data-loupe-kind={precisionLoupe.kind}
+          aria-hidden="true"
+          className="pointer-events-none fixed z-[195] overflow-hidden rounded-full border-4 border-white bg-slate-950 shadow-2xl"
           style={{
-            left: Math.min(calibrationLoupe.clientX + 28, window.innerWidth - 124),
-            top: Math.max(12, calibrationLoupe.clientY - 132),
+            width: PRECISION_LOUPE_SIZE,
+            height: PRECISION_LOUPE_SIZE,
+            left: loupePosition.left,
+            top: loupePosition.top,
+            boxShadow: `0 0 0 3px ${precisionLoupe.kind === 'calibration' ? '#f59e0b' : '#38bdf8'}, 0 18px 42px rgba(0, 0, 0, 0.55)`,
           }}
         >
           <img
             src={images.background}
             alt=""
+            crossOrigin="anonymous"
             className="absolute max-w-none select-none"
             style={{
-              width: images.backgroundSize.width * 3,
-              height: images.backgroundSize.height * 3,
-              left: 56 - calibrationLoupe.point.x * 3,
-              top: 56 - calibrationLoupe.point.y * 3,
+              width: images.backgroundSize.width * loupeScale,
+              height: images.backgroundSize.height * loupeScale,
+              left: loupeCenter - precisionLoupe.point.x * loupeScale,
+              top: loupeCenter - precisionLoupe.point.y * loupeScale,
+              opacity: state.isNightMode ? 0.82 : 1,
+              filter: state.isNightMode ? 'brightness(0.32) contrast(1.32) saturate(0.72) hue-rotate(8deg)' : 'none',
             }}
           />
-          <span className="absolute left-1/2 top-2 h-[calc(100%-1rem)] w-px -translate-x-1/2 bg-amber-400 shadow-[0_0_0_1px_rgba(0,0,0,.6)]" />
-          <span className="absolute left-2 top-1/2 h-px w-[calc(100%-1rem)] -translate-y-1/2 bg-amber-400 shadow-[0_0_0_1px_rgba(0,0,0,.6)]" />
-          <span className="absolute left-1/2 top-1/2 h-2 w-2 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white bg-amber-500" />
+          {state.isNightMode && <span className="absolute inset-0 bg-slate-950/20" />}
+          <canvas
+            ref={loupeCanvasRef}
+            data-testid="precision-loupe-sign-layer"
+            width={PRECISION_LOUPE_SIZE}
+            height={PRECISION_LOUPE_SIZE}
+            className="absolute inset-0 h-full w-full"
+            style={{ filter: state.isNightMode ? 'brightness(1.16) saturate(1.22) drop-shadow(0 0 5px rgba(125,211,252,0.32))' : 'none' }}
+          />
+          <svg
+            className="absolute max-w-none overflow-visible"
+            viewBox={`0 0 ${images.backgroundSize.width} ${images.backgroundSize.height}`}
+            style={{
+              width: images.backgroundSize.width * loupeScale,
+              height: images.backgroundSize.height * loupeScale,
+              left: loupeCenter - precisionLoupe.point.x * loupeScale,
+              top: loupeCenter - precisionLoupe.point.y * loupeScale,
+            }}
+          >
+            {state.showDimensions && dimensions.map(dimension => dimension.variant === 'box' ? (
+              <rect
+                key={`loupe-${dimension.id}`}
+                x={Math.min(dimension.start.x, dimension.end.x)}
+                y={Math.min(dimension.start.y, dimension.end.y)}
+                width={Math.abs(dimension.end.x - dimension.start.x)}
+                height={Math.abs(dimension.end.y - dimension.start.y)}
+                fill={dimension.id === activeDimensionId ? 'rgba(56, 189, 248, 0.18)' : 'rgba(255, 255, 255, 0.08)'}
+                stroke={dimension.id === activeDimensionId ? '#38bdf8' : (dimension.color || '#ffffff')}
+                strokeWidth={2 / loupeScale}
+                strokeDasharray={`${5 / loupeScale} ${3 / loupeScale}`}
+              />
+            ) : (
+              <line
+                key={`loupe-${dimension.id}`}
+                x1={dimension.start.x}
+                y1={dimension.start.y}
+                x2={dimension.end.x}
+                y2={dimension.end.y}
+                stroke={dimension.id === activeDimensionId ? '#38bdf8' : (dimension.color || '#ffffff')}
+                strokeWidth={2 / loupeScale}
+              />
+            ))}
+            {drawingStart.current && drawingCurrent.current && (toolMode === 'draw_line' || toolMode === 'draw_box') && (
+              toolMode === 'draw_box' ? (
+                <rect
+                  x={Math.min(drawingStart.current.x, drawingCurrent.current.x)}
+                  y={Math.min(drawingStart.current.y, drawingCurrent.current.y)}
+                  width={Math.abs(drawingCurrent.current.x - drawingStart.current.x)}
+                  height={Math.abs(drawingCurrent.current.y - drawingStart.current.y)}
+                  fill="rgba(56, 189, 248, 0.2)"
+                  stroke="#38bdf8"
+                  strokeWidth={2 / loupeScale}
+                  strokeDasharray={`${5 / loupeScale} ${3 / loupeScale}`}
+                />
+              ) : (
+                <line
+                  x1={drawingStart.current.x}
+                  y1={drawingStart.current.y}
+                  x2={drawingCurrent.current.x}
+                  y2={drawingCurrent.current.y}
+                  stroke="#38bdf8"
+                  strokeWidth={2 / loupeScale}
+                />
+              )
+            )}
+            {calibrationDraft && calibrationDraft.points.length > 1 && (
+              <polyline
+                points={calibrationDraft.points.map(point => `${point.x},${point.y}`).join(' ')}
+                fill="none"
+                stroke="#f59e0b"
+                strokeWidth={2 / loupeScale}
+              />
+            )}
+          </svg>
+          <span
+            className="absolute left-1/2 top-2 h-[calc(100%-1rem)] w-px -translate-x-1/2 shadow-[0_0_0_1px_rgba(0,0,0,.7)]"
+            style={{ backgroundColor: precisionLoupe.kind === 'calibration' ? '#f59e0b' : '#38bdf8' }}
+          />
+          <span
+            className="absolute left-2 top-1/2 h-px w-[calc(100%-1rem)] -translate-y-1/2 shadow-[0_0_0_1px_rgba(0,0,0,.7)]"
+            style={{ backgroundColor: precisionLoupe.kind === 'calibration' ? '#f59e0b' : '#38bdf8' }}
+          />
+          <span
+            className="absolute left-1/2 top-1/2 h-2.5 w-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white"
+            style={{ backgroundColor: precisionLoupe.kind === 'calibration' ? '#f59e0b' : '#0ea5e9' }}
+          />
         </div>
       )}
 
@@ -1566,7 +1852,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
                                                 { x: minX, y: minY + h, index: 16, cursor: 'sw-resize' },
                                             ].map(handle => (
                                                 <g key={handle.index}>
-                                                    <circle cx={handle.x} cy={handle.y} r={24 * handleScale} fill="transparent" pointerEvents="all" style={{ cursor: handle.cursor }} onPointerDown={handlePointerDown(handle.index)} onPointerMove={handlePointerMove} onPointerUp={handlePointerUp} />
+                                                    <circle data-testid={`dimension-handle-${dim.id}-${handle.index}`} data-dimension-handle={handle.index} aria-label="Resize dimension block" cx={handle.x} cy={handle.y} r={24 * handleScale} fill="transparent" pointerEvents="all" style={{ cursor: handle.cursor }} onPointerDown={handlePointerDown(handle.index)} onPointerMove={handlePointerMove} onPointerUp={handlePointerUp} />
                                                     <circle cx={handle.x} cy={handle.y} r={9 * handleScale} fill="white" stroke={dimColor} strokeWidth={2.5 * handleScale} pointerEvents="none" />
                                                 </g>
                                             ))}
@@ -1602,7 +1888,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
                                                 { point: dim.end, index: 1 },
                                             ].map(handle => (
                                                 <g key={handle.index}>
-                                                    <circle cx={handle.point.x} cy={handle.point.y} r={24 * handleScale} fill="transparent" pointerEvents="all" className="cursor-move" onPointerDown={handlePointerDown(handle.index)} onPointerMove={handlePointerMove} onPointerUp={handlePointerUp} />
+                                                    <circle data-testid={`dimension-handle-${dim.id}-${handle.index}`} data-dimension-handle={handle.index} aria-label="Resize dimension endpoint" cx={handle.point.x} cy={handle.point.y} r={24 * handleScale} fill="transparent" pointerEvents="all" className="cursor-move" onPointerDown={handlePointerDown(handle.index)} onPointerMove={handlePointerMove} onPointerUp={handlePointerUp} />
                                                     <circle cx={handle.point.x} cy={handle.point.y} r={9 * handleScale} fill="white" stroke={dimColor} strokeWidth={2.5 * handleScale} pointerEvents="none" />
                                                 </g>
                                             ))}
