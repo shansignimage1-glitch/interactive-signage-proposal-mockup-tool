@@ -18,15 +18,15 @@ vi.mock('firebase/storage', () => ({
 vi.mock('../../services/imageHash', () => ({ hashDataUri: vi.fn(), dataUriToBlob: vi.fn() }));
 vi.mock('../../services/AssetResolver', () => ({ resolveRef: vi.fn(), isDriveRef: vi.fn(() => false) }));
 
-import { LibraryService } from '../../services/LibraryService';
+import { LibraryService, materializeTemplateDataUri } from '../../services/LibraryService';
 
-describe('LibraryService image hydration', () => {
+describe('LibraryService loading', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     LibraryService.invalidateCache();
   });
 
-  it('hydrates personal-library thumbnails from authenticated Storage blobs', async () => {
+  it('returns personal-library metadata without waiting for image blobs', async () => {
     mocks.getDocs.mockResolvedValue({
       docs: [{
         id: 'asset-1',
@@ -37,12 +37,31 @@ describe('LibraryService image hydration', () => {
         }),
       }],
     });
-    mocks.getBlob.mockResolvedValue(new Blob(['asset'], { type: 'image/png' }));
+    mocks.getBlob.mockReturnValue(new Promise(() => undefined));
 
     const templates = await LibraryService.listPersonal('user-1');
 
-    expect(mocks.getBlob).toHaveBeenCalledWith({ path: 'users/user-1/library/hash' });
+    expect(mocks.getBlob).not.toHaveBeenCalled();
     expect(templates).toHaveLength(1);
-    expect(templates[0].image).toBe('data:image/png;base64,YXNzZXQ=');
+    expect(templates[0].image).toBe('https://example.invalid/expired-token');
+  });
+
+  it('loads and deduplicates an authenticated thumbnail only when requested', async () => {
+    mocks.getBlob.mockResolvedValue(new Blob(['asset'], { type: 'image/png' }));
+    const template = {
+      id: 'personal_asset-1', name: 'Uploaded fascia', category: 'Fascia',
+      image: 'https://example.invalid/expired-token', width: 2000, height: 500,
+      source: 'personal' as const, storagePath: 'users/user-1/library/hash',
+    };
+
+    const [first, second] = await Promise.all([
+      materializeTemplateDataUri(template),
+      materializeTemplateDataUri(template),
+    ]);
+
+    expect(mocks.getBlob).toHaveBeenCalledTimes(1);
+    expect(mocks.getBlob).toHaveBeenCalledWith({ path: 'users/user-1/library/hash' });
+    expect(first).toBe('data:image/png;base64,YXNzZXQ=');
+    expect(second).toBe(first);
   });
 });

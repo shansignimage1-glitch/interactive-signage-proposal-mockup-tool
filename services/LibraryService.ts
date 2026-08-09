@@ -32,6 +32,19 @@ export interface NewTemplateInput {
 }
 
 let sharedCache: SignTemplate[] | null = null;
+const templateImageCache = new Map<string, Promise<string>>();
+const TEMPLATE_IMAGE_TIMEOUT_MS = 15_000;
+const LIBRARY_METADATA_TIMEOUT_MS = 12_000;
+const MAX_TEMPLATE_IMAGE_CACHE_ENTRIES = 32;
+
+const withTimeout = <T,>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> =>
+    new Promise<T>((resolve, reject) => {
+        const timer = window.setTimeout(() => reject(new Error(`${label} timed out`)), timeoutMs);
+        promise.then(
+            value => { window.clearTimeout(timer); resolve(value); },
+            error => { window.clearTimeout(timer); reject(error); },
+        );
+    });
 
 const storagePathFromUrl = (imageUrl: string): string | undefined => {
     try {
@@ -98,31 +111,43 @@ const blobToDataUri = (blob: Blob): Promise<string> => new Promise((resolve, rej
 // Library objects have stable Storage paths even when their persisted public
 // download token has expired. Read through the authenticated Firebase SDK.
 export const materializeTemplateDataUri = async (template: SignTemplate): Promise<string> => {
+    if (template.image.startsWith('data:')) return template.image;
     if (template.storagePath) {
-        return blobToDataUri(await getBlob(storageRef(storage, template.storagePath)));
+        const cached = templateImageCache.get(template.storagePath);
+        if (cached) {
+            templateImageCache.delete(template.storagePath);
+            templateImageCache.set(template.storagePath, cached);
+            return cached;
+        }
+        const loading = withTimeout(
+            getBlob(storageRef(storage, template.storagePath)),
+            TEMPLATE_IMAGE_TIMEOUT_MS,
+            `Loading ${template.name}`,
+        ).then(blobToDataUri).catch(error => {
+            templateImageCache.delete(template.storagePath!);
+            throw error;
+        });
+        if (templateImageCache.size >= MAX_TEMPLATE_IMAGE_CACHE_ENTRIES) {
+            const oldest = templateImageCache.keys().next().value;
+            if (oldest) templateImageCache.delete(oldest);
+        }
+        templateImageCache.set(template.storagePath, loading);
+        return loading;
     }
-    return materializeDataUri(template.image);
-};
-
-const hydrateTemplateImage = async (template: SignTemplate): Promise<SignTemplate> => {
-    if (!template.storagePath) return template;
-    try {
-        const blob = await getBlob(storageRef(storage, template.storagePath));
-        return { ...template, image: await blobToDataUri(blob) };
-    } catch {
-        // Keep metadata usable and let selection surface the authenticated
-        // Storage error if the underlying object itself is unavailable.
-        return template;
-    }
+    return withTimeout(materializeDataUri(template.image), TEMPLATE_IMAGE_TIMEOUT_MS, `Loading ${template.name}`);
 };
 
 export const LibraryService = {
 
     listShared: async (): Promise<SignTemplate[]> => {
         if (sharedCache) return sharedCache;
-        const snapshot = await getDocs(query(collection(db, SHARED_COLLECTION), limit(200)));
-        sharedCache = (await Promise.all(snapshot.docs
-            .map(doc => hydrateTemplateImage(docToTemplate(doc.id, doc.data(), 'shared')))))
+        const snapshot = await withTimeout(
+            getDocs(query(collection(db, SHARED_COLLECTION), limit(200))),
+            LIBRARY_METADATA_TIMEOUT_MS,
+            'Loading Shared Library',
+        );
+        sharedCache = snapshot.docs
+            .map(doc => docToTemplate(doc.id, doc.data(), 'shared'))
             .sort((a, b) => a.name.localeCompare(b.name));
         return sharedCache;
     },
@@ -130,9 +155,13 @@ export const LibraryService = {
     listPersonal: async (uid: string): Promise<SignTemplate[]> => {
         if (uid.startsWith('guest_')) return [];
         // No orderBy — avoids needing a composite index; sort client-side
-        const snapshot = await getDocs(query(collection(db, PERSONAL_COLLECTION), where('ownerUid', '==', uid), limit(200)));
-        return (await Promise.all(snapshot.docs
-            .map(doc => hydrateTemplateImage(docToTemplate(doc.id, doc.data(), 'personal')))))
+        const snapshot = await withTimeout(
+            getDocs(query(collection(db, PERSONAL_COLLECTION), where('ownerUid', '==', uid), limit(200))),
+            LIBRARY_METADATA_TIMEOUT_MS,
+            'Loading My Library',
+        );
+        return snapshot.docs
+            .map(doc => docToTemplate(doc.id, doc.data(), 'personal'))
             .sort((a, b) => a.name.localeCompare(b.name));
     },
 
@@ -215,5 +244,5 @@ export const LibraryService = {
         sharedCache = null;
     },
 
-    invalidateCache: (): void => { sharedCache = null; },
+    invalidateCache: (): void => { sharedCache = null; templateImageCache.clear(); },
 };

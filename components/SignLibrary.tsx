@@ -2,8 +2,8 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { BRANDS } from '../data/brands';
 import { Dimension, SignTemplate, Sign, UserProfile, SIGN_TYPES, SignType } from '../types';
-import { Sparkles, X, LayoutGrid, Loader2, User as UserIcon, Trash2, UploadCloud, BookmarkPlus, Globe, LogIn, Search, Pencil } from 'lucide-react';
-import { LibraryService, isLibraryAdmin, materializeDataUri, NewTemplateInput } from '../services/LibraryService';
+import { Sparkles, X, LayoutGrid, Loader2, User as UserIcon, Trash2, UploadCloud, BookmarkPlus, Globe, LogIn, Search, Pencil, ImageOff } from 'lucide-react';
+import { LibraryService, isLibraryAdmin, materializeDataUri, materializeTemplateDataUri, NewTemplateInput } from '../services/LibraryService';
 import { reportError } from '../services/monitoring';
 import { notify } from '../services/toast';
 
@@ -27,7 +27,8 @@ const SignLibrary: React.FC<SignLibraryProps> = ({ isOpen, onClose, onSelect, ac
 
   const [shared, setShared] = useState<SignTemplate[]>([]);
   const [personal, setPersonal] = useState<SignTemplate[]>([]);
-  const [isLoadingCloud, setIsLoadingCloud] = useState(false);
+  const [isLoadingShared, setIsLoadingShared] = useState(false);
+  const [isLoadingPersonal, setIsLoadingPersonal] = useState(false);
   const [cloudError, setCloudError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null); // template id or action key
   const [query, setQuery] = useState('');
@@ -53,19 +54,22 @@ const SignLibrary: React.FC<SignLibraryProps> = ({ isOpen, onClose, onSelect, ac
     let cancelled = false;
     const sharedVersionAtLoad = sharedMutationVersion.current;
     const personalVersionAtLoad = personalMutationVersion.current;
-    setIsLoadingCloud(true);
+    setIsLoadingShared(true);
+    setIsLoadingPersonal(true);
     setCloudError(null);
-    Promise.all([
-      LibraryService.listShared(),
-      LibraryService.listPersonal(user!.uid),
-    ]).then(([s, p]) => {
-      if (cancelled) return;
-      if (sharedMutationVersion.current === sharedVersionAtLoad) setShared(s);
-      if (personalMutationVersion.current === personalVersionAtLoad) setPersonal(p);
+    void LibraryService.listShared().then(s => {
+      if (!cancelled && sharedMutationVersion.current === sharedVersionAtLoad) setShared(s);
     }).catch(e => {
-      if (!cancelled) setCloudError(e?.message ?? 'Could not load cloud library');
+      if (!cancelled) setCloudError(current => current ?? `Shared Library: ${e?.message ?? 'Could not load catalog'}`);
     }).finally(() => {
-      if (!cancelled) setIsLoadingCloud(false);
+      if (!cancelled) setIsLoadingShared(false);
+    });
+    void LibraryService.listPersonal(user!.uid).then(p => {
+      if (!cancelled && personalMutationVersion.current === personalVersionAtLoad) setPersonal(p);
+    }).catch(e => {
+      if (!cancelled) setCloudError(current => current ?? `My Library: ${e?.message ?? 'Could not load uploads'}`);
+    }).finally(() => {
+      if (!cancelled) setIsLoadingPersonal(false);
     });
     return () => { cancelled = true; };
   }, [isOpen, isGuest, user?.uid]);
@@ -211,6 +215,9 @@ const SignLibrary: React.FC<SignLibraryProps> = ({ isOpen, onClose, onSelect, ac
   const pageSize = 12;
   const pageCount = Math.max(1, Math.ceil(filteredTemplates.length / pageSize));
   const visibleTemplates = filteredTemplates.slice((page - 1) * pageSize, page * pageSize);
+  const isLoadingCurrent = tab === 'personal'
+    ? isLoadingPersonal
+    : selectedBrandId === SHARED_BRAND_ID && isLoadingShared;
 
   const editShared = (template: SignTemplate) => {
     setFormError(null);
@@ -238,7 +245,7 @@ const SignLibrary: React.FC<SignLibraryProps> = ({ isOpen, onClose, onSelect, ac
                 <div className="flex bg-gray-900 rounded-lg border border-gray-700 overflow-hidden ml-2">
                     <button onClick={() => setTab('catalog')} className={`px-3 py-1.5 text-xs font-semibold transition-colors ${tab === 'catalog' ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white'}`}>Catalog</button>
                     <button onClick={() => setTab('personal')} className={`px-3 py-1.5 text-xs font-semibold transition-colors flex items-center gap-1 ${tab === 'personal' ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white'}`}>
-                        <UserIcon className="w-3 h-3" /> My Library {personal.length > 0 && <span className="bg-black/40 rounded px-1">{personal.length}</span>}
+                        <UserIcon className="w-3 h-3" /> My Library {isLoadingPersonal ? <Loader2 className="h-3 w-3 animate-spin" /> : personal.length > 0 && <span className="bg-black/40 rounded px-1">{personal.length}</span>}
                     </button>
                 </div>
             </div>
@@ -281,7 +288,7 @@ const SignLibrary: React.FC<SignLibraryProps> = ({ isOpen, onClose, onSelect, ac
                                             <Globe className="w-4 h-4 text-blue-300" />
                                         </div>
                                         <span className="font-medium">Shared Library</span>
-                                        {isLoadingCloud
+                                        {isLoadingShared
                                             ? <Loader2 className="w-3 h-3 animate-spin ml-auto" />
                                             : <span className="text-xs ml-auto opacity-70">{shared.length}</span>}
                                     </button>
@@ -336,7 +343,7 @@ const SignLibrary: React.FC<SignLibraryProps> = ({ isOpen, onClose, onSelect, ac
                 {tab === 'catalog' ? (
                     <div>
                         <h3 className="text-lg font-semibold text-white mb-4">{catalogTitle}</h3>
-                        {selectedBrandId === SHARED_BRAND_ID && shared.length === 0 && !isLoadingCloud && (
+                        {selectedBrandId === SHARED_BRAND_ID && shared.length === 0 && !isLoadingShared && (
                             <p className="text-sm text-gray-500">No shared templates yet.{admin ? ' Use "Save Current Sign" and tick "Publish to shared library" to add the first one.' : ''}</p>
                         )}
                         <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
@@ -384,12 +391,12 @@ const SignLibrary: React.FC<SignLibraryProps> = ({ isOpen, onClose, onSelect, ac
                                 ))}
                             </div>
                         )}
-                        {!isGuest && personal.length === 0 && !isLoadingCloud && (
+                        {!isGuest && personal.length === 0 && !isLoadingPersonal && (
                             <p className="text-sm text-gray-500 mt-4">Nothing saved yet — upload an image or use "Save Current Sign".</p>
                         )}
                     </div>
                 )}
-                {!isLoadingCloud && currentTemplates.length > 0 && filteredTemplates.length === 0 && (
+                {!isLoadingCurrent && currentTemplates.length > 0 && filteredTemplates.length === 0 && (
                     <p className="text-center text-sm text-gray-500 py-12">No templates match this search or category.</p>
                 )}
                 {filteredTemplates.length > pageSize && <div className="flex justify-center items-center gap-3 mt-6"><button disabled={page <= 1} onClick={() => setPage(p => p - 1)} className="px-3 py-1 bg-gray-800 rounded disabled:opacity-30">Previous</button><span className="text-xs text-gray-400">{page} / {pageCount}</span><button disabled={page >= pageCount} onClick={() => setPage(p => p + 1)} className="px-3 py-1 bg-gray-800 rounded disabled:opacity-30">Next</button></div>}
@@ -493,13 +500,36 @@ const SignLibrary: React.FC<SignLibraryProps> = ({ isOpen, onClose, onSelect, ac
   );
 };
 
+const TemplateImage: React.FC<{ template: SignTemplate }> = ({ template }) => {
+    const directImage = !template.source || template.image.startsWith('data:') ? template.image : null;
+    const [src, setSrc] = useState<string | null>(directImage);
+    const [failed, setFailed] = useState(false);
+
+    useEffect(() => {
+        if (directImage) { setSrc(directImage); setFailed(false); return; }
+        let cancelled = false;
+        setSrc(null);
+        setFailed(false);
+        void materializeTemplateDataUri(template).then(image => {
+            if (!cancelled) setSrc(image);
+        }).catch(() => {
+            if (!cancelled) setFailed(true);
+        });
+        return () => { cancelled = true; };
+    }, [template.id, template.image, template.storagePath, directImage]);
+
+    if (failed) return <div className="flex flex-col items-center gap-1 text-gray-500"><ImageOff className="h-6 w-6" /><span className="text-[10px]">Image unavailable</span></div>;
+    if (!src) return <Loader2 className="h-5 w-5 animate-spin text-blue-400" aria-label={`Loading ${template.name} thumbnail`} />;
+    return <img src={src} alt={template.name} className="max-w-full max-h-full object-contain drop-shadow-2xl" />;
+};
+
 const TemplateCard: React.FC<{ template: SignTemplate, onClick: () => void, isSuggestion?: boolean, onDelete?: () => void, onEdit?: () => void, deleting?: boolean }> = ({ template, onClick, isSuggestion, onDelete, onEdit, deleting }) => (
     <div
         onClick={onClick}
         className={`group relative aspect-video bg-gray-800 rounded-lg border overflow-hidden cursor-pointer transition-all hover:scale-[1.02] ${isSuggestion ? 'border-yellow-500/50 ring-1 ring-yellow-500/20' : 'border-gray-700 hover:border-blue-500'}`}
     >
         <div className="absolute inset-0 p-4 flex items-center justify-center">
-            <img src={template.image} alt={template.name} className="max-w-full max-h-full object-contain drop-shadow-2xl" />
+            <TemplateImage template={template} />
         </div>
         <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/90 to-transparent p-3 pt-8">
             <p className="text-white font-medium text-sm truncate">{template.name}</p>

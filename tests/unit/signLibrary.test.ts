@@ -12,6 +12,7 @@ const libraryMocks = vi.hoisted(() => ({
   deletePersonal: vi.fn(),
   deleteShared: vi.fn(),
   materializeDataUri: vi.fn(),
+  materializeTemplateDataUri: vi.fn(),
 }));
 const feedbackMocks = vi.hoisted(() => ({
   notify: vi.fn(),
@@ -30,6 +31,7 @@ vi.mock('../../services/LibraryService', () => ({
   },
   isLibraryAdmin: (user?: { isAdmin?: boolean } | null) => user?.isAdmin === true,
   materializeDataUri: libraryMocks.materializeDataUri,
+  materializeTemplateDataUri: libraryMocks.materializeTemplateDataUri,
 }));
 vi.mock('../../services/toast', () => ({ notify: feedbackMocks.notify }));
 vi.mock('../../services/monitoring', () => ({ reportError: feedbackMocks.reportError }));
@@ -68,6 +70,7 @@ describe('SignLibrary save editor', () => {
     libraryMocks.listShared.mockResolvedValue([]);
     libraryMocks.listPersonal.mockResolvedValue([]);
     libraryMocks.materializeDataUri.mockResolvedValue(activeSign.image);
+    libraryMocks.materializeTemplateDataUri.mockResolvedValue(activeSign.image);
     libraryMocks.saveToPersonal.mockResolvedValue({
       id: 'personal-user-123',
       docId: 'user-123_hash',
@@ -193,6 +196,33 @@ describe('SignLibrary save editor', () => {
     });
 
     expect(document.querySelector('img[alt="Reception Letters"]')).not.toBeNull();
+  });
+
+  it('shows My Library even while Shared Library is still loading', async () => {
+    const neverResolvingSharedLoad = new Promise<[]>(() => undefined);
+    libraryMocks.listShared.mockReturnValueOnce(neverResolvingSharedLoad);
+    libraryMocks.listPersonal.mockResolvedValueOnce([{
+      id: 'personal-upload', source: 'personal', ownerUid: user.uid,
+      name: 'Uploaded sign', category: 'Fascia', image: 'https://example.com/upload.png',
+      storagePath: 'users/user-123/library/upload', width: 2000, height: 500,
+    }]);
+
+    await act(async () => {
+      root.render(React.createElement(SignLibrary, {
+        isOpen: false, onClose: vi.fn(), onSelect: vi.fn(), user, activeSign,
+      }));
+    });
+    await act(async () => {
+      root.render(React.createElement(SignLibrary, {
+        isOpen: true, onClose: vi.fn(), onSelect: vi.fn(), user, activeSign,
+      }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await act(async () => findButton('My Library').click());
+
+    expect(document.querySelector('img[alt="Uploaded sign"]')).not.toBeNull();
+    expect(document.querySelector('[aria-label="Loading Uploaded sign thumbnail"]')).toBeNull();
   });
 
   it('keeps the editor and its metadata visible when cloud save fails', async () => {
