@@ -518,3 +518,44 @@ test('background upload retains its full source dimensions for editing', async (
   await expect.poll(async () => (await loupeBoundary()).inside).toBeGreaterThan(200);
   await page.mouse.up();
 });
+
+test('uploaded PNG signs retain enough source pixels for sharp canvas rendering', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-chromium', 'High-resolution sign import is covered once in the desktop browser.');
+
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Continue as Guest' }).click();
+  const sourceWidth = 4096;
+  const sourceHeight = 1024;
+  const pngDataUrl = await page.evaluate(({ width, height }) => {
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const context = canvas.getContext('2d')!;
+    context.clearRect(0, 0, width, height);
+    context.fillStyle = '#ffffff';
+    context.fillRect(64, 64, width - 128, height - 128);
+    context.fillStyle = '#0f172a';
+    context.font = 'bold 420px Arial';
+    context.textAlign = 'center';
+    context.textBaseline = 'middle';
+    context.fillText('SHARP SIGN', width / 2, height / 2);
+    return canvas.toDataURL('image/png');
+  }, { width: sourceWidth, height: sourceHeight });
+
+  await page.getByRole('button', { name: 'Upload', exact: true }).click();
+  await page.locator('input[type="file"][accept="image/*"]').setInputFiles({
+    name: 'sharp-sign.png',
+    mimeType: 'image/png',
+    buffer: Buffer.from(pngDataUrl.split(',')[1], 'base64'),
+  });
+  const confirmCrop = page.getByTestId('confirm-image-crop');
+  await confirmCrop.click();
+  await expect(confirmCrop).toBeHidden();
+
+  const uploadedSign = page.locator('img[src^="data:image/png;base64"]').last();
+  await expect(uploadedSign).toBeVisible();
+  await expect.poll(() => uploadedSign.evaluate(image => ({
+    width: (image as HTMLImageElement).naturalWidth,
+    height: (image as HTMLImageElement).naturalHeight,
+  }))).toEqual({ width: sourceWidth, height: sourceHeight });
+});

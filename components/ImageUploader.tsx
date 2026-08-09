@@ -10,6 +10,7 @@ interface ImageUploaderProps {
   onClose: () => void;
   onImageReady: (dataUrl: string) => void;
   preserveSourcePixels?: boolean;
+  maxOutputDimension?: number;
 }
 
 type Step = 'select' | 'camera' | 'crop';
@@ -21,7 +22,13 @@ const HANDLE_RADIUS = 8;
 const HIT_RADIUS = 50; // Increased to 50px for better tablet touch sensitivity
 const MAX_FULL_RESOLUTION_CROP_PIXELS = 12_000_000;
 
-const ImageUploader: React.FC<ImageUploaderProps> = ({ isOpen, onClose, onImageReady, preserveSourcePixels = false }) => {
+const ImageUploader: React.FC<ImageUploaderProps> = ({
+  isOpen,
+  onClose,
+  onImageReady,
+  preserveSourcePixels = false,
+  maxOutputDimension = 1024,
+}) => {
   const [step, setStep] = useState<Step>('select');
   const [sourceImage, setSourceImage] = useState<string | null>(null);
   const [videoStream, setVideoStream] = useState<MediaStream | null>(null);
@@ -438,10 +445,9 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({ isOpen, onClose, onImageR
         return;
     }
 
-    const MAX_OPTIMIZED_DIMENSION = 1024;
     const scale = preserveSourcePixels
-        ? 1
-        : Math.min(1, MAX_OPTIMIZED_DIMENSION / Math.max(sourceCropWidth, sourceCropHeight));
+      ? 1
+      : Math.min(1, maxOutputDimension / Math.max(sourceCropWidth, sourceCropHeight));
     const outputWidth = Math.max(1, Math.round(sourceCropWidth * scale));
     const outputHeight = Math.max(1, Math.round(sourceCropHeight * scale));
 

@@ -234,7 +234,10 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
     // Background photos remain at source resolution throughout editing. The
     // cloud-save pipeline creates its smaller transport copy later, without
     // replacing this full-resolution local working image.
-    if (uploadTarget !== 'background') {
+    // Sign artwork is already bounded to a GPU-safe 4K edge by ImageUploader.
+    // Do not run it through the generic photo compressor again: that path can
+    // convert transparent PNG artwork to lossy WebP and soften text/logo edges.
+    if (uploadTarget === 'reference') {
       try { dataUrl = await optimizeDataUri(rawDataUrl, 3072); }
       catch (error) { notify(error instanceof Error ? error.message : 'Could not optimize this image.', 'error'); return; }
     }
@@ -1426,6 +1429,7 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
         onClose={() => setIsUploaderOpen(false)}
         onImageReady={handleImageReady}
         preserveSourcePixels={uploadTarget === 'background'}
+        maxOutputDimension={uploadTarget === 'sign' ? 4096 : 1024}
       />
       
       <SignLibrary
