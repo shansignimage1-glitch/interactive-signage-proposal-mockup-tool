@@ -3,11 +3,13 @@ import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { Camera, Upload, X, Check, RotateCcw, ZoomIn, ZoomOut, Move } from 'lucide-react';
 import { notify } from '../services/toast';
 import { reportError } from '../services/monitoring';
+import { MAX_SOURCE_BYTES, MAX_SOURCE_PIXELS } from '../services/imageProcessing';
 
 interface ImageUploaderProps {
   isOpen: boolean;
   onClose: () => void;
   onImageReady: (dataUrl: string) => void;
+  preserveSourcePixels?: boolean;
 }
 
 type Step = 'select' | 'camera' | 'crop';
@@ -17,11 +19,14 @@ interface Point { x: number; y: number; }
 
 const HANDLE_RADIUS = 8;
 const HIT_RADIUS = 50; // Increased to 50px for better tablet touch sensitivity
+const MAX_FULL_RESOLUTION_CROP_PIXELS = 12_000_000;
 
-const ImageUploader: React.FC<ImageUploaderProps> = ({ isOpen, onClose, onImageReady }) => {
+const ImageUploader: React.FC<ImageUploaderProps> = ({ isOpen, onClose, onImageReady, preserveSourcePixels = false }) => {
   const [step, setStep] = useState<Step>('select');
   const [sourceImage, setSourceImage] = useState<string | null>(null);
   const [videoStream, setVideoStream] = useState<MediaStream | null>(null);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [isDecoding, setIsDecoding] = useState(false);
   
   // Camera Refs
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -29,6 +34,7 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({ isOpen, onClose, onImageR
   // Crop State
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const imageRef = useRef<HTMLImageElement | null>(null);
+  const processingGenerationRef = useRef(0);
   
   // Crop Geometry (in Image Pixel Coordinates)
   const [cropRect, setCropRect] = useState<Rect>({ x: 0, y: 0, w: 0, h: 0 });
@@ -45,12 +51,16 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({ isOpen, onClose, onImageR
 
   useEffect(() => {
     if (!isOpen) {
+      processingGenerationRef.current += 1;
       stopCamera();
       setStep('select');
       setSourceImage(null);
+      imageRef.current = null;
       setCropRect({ x: 0, y: 0, w: 0, h: 0 });
       setZoom(1);
       setPan({ x: 0, y: 0 });
+      setIsProcessing(false);
+      setIsDecoding(false);
     }
   }, [isOpen]);
 
@@ -64,28 +74,48 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({ isOpen, onClose, onImageR
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
       const file = e.target.files[0];
+      if (file.size > MAX_SOURCE_BYTES) {
+        notify('This photo is larger than 40 MB. Use the device photo editor to reduce its file size first.', 'error');
+        e.target.value = '';
+        return;
+      }
+      const selectionGeneration = ++processingGenerationRef.current;
+      imageRef.current = null;
+      setIsDecoding(true);
       const reader = new FileReader();
       reader.onload = (evt) => {
+        if (processingGenerationRef.current !== selectionGeneration) return;
         if (typeof evt.target?.result === 'string') {
           setSourceImage(evt.target.result);
           setStep('crop');
         }
+      };
+      reader.onerror = () => {
+        if (processingGenerationRef.current !== selectionGeneration) return;
+        setIsDecoding(false);
+        notify('This image could not be read.', 'error');
       };
       reader.readAsDataURL(file);
     }
   };
 
   const startCamera = async () => {
+    const cameraGeneration = ++processingGenerationRef.current;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+      if (processingGenerationRef.current !== cameraGeneration) {
+        stream.getTracks().forEach(track => track.stop());
+        return;
+      }
       setVideoStream(stream);
       setStep('camera');
       setTimeout(() => {
-        if (videoRef.current) {
+        if (processingGenerationRef.current === cameraGeneration && videoRef.current) {
           videoRef.current.srcObject = stream;
         }
       }, 100);
     } catch (err) {
+      if (processingGenerationRef.current !== cameraGeneration) return;
       reportError('camera', err);
       notify('Could not access camera. Please allow camera permission and try again.', 'error');
     }
@@ -99,8 +129,11 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({ isOpen, onClose, onImageR
       canvas.height = vid.videoHeight;
       const ctx = canvas.getContext('2d');
       if (ctx) {
+        processingGenerationRef.current += 1;
+        imageRef.current = null;
+        setIsDecoding(true);
         ctx.drawImage(vid, 0, 0);
-        setSourceImage(canvas.toDataURL('image/jpeg'));
+        setSourceImage(canvas.toDataURL('image/jpeg', 0.98));
         stopCamera();
         setStep('crop');
       }
@@ -126,8 +159,20 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({ isOpen, onClose, onImageR
   // Initialize Canvas & Image
   useEffect(() => {
     if (step === 'crop' && sourceImage) {
+      const decodeGeneration = processingGenerationRef.current;
       const img = new Image();
       img.onload = () => {
+        if (processingGenerationRef.current !== decodeGeneration) return;
+        const sourceWidth = img.naturalWidth || img.width;
+        const sourceHeight = img.naturalHeight || img.height;
+        if (sourceWidth * sourceHeight > MAX_SOURCE_PIXELS) {
+          notify('This photo exceeds 80 megapixels and cannot be processed safely on this device.', 'error');
+          imageRef.current = null;
+          setSourceImage(null);
+          setStep('select');
+          setIsDecoding(false);
+          return;
+        }
         imageRef.current = img;
         
         // Initial Fit
@@ -148,16 +193,26 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({ isOpen, onClose, onImageR
            setZoom(fitZoom);
            setPan({ x: 0, y: 0 });
 
-           // Default Crop: 80% of image centered
-           const cw = img.width * 0.8;
-           const ch = img.height * 0.8;
-           setCropRect({
-               x: (img.width - cw) / 2,
-               y: (img.height - ch) / 2,
-               w: cw,
-               h: ch
-           });
+            // Start with the complete source selected. Cropping must be an
+            // explicit user choice; silently trimming the image discards pixels.
+            const cw = img.width;
+            const ch = img.height;
+            setCropRect({
+                x: 0,
+                y: 0,
+                w: cw,
+                h: ch
+            });
+            setIsDecoding(false);
         }
+      };
+      img.onerror = () => {
+        if (processingGenerationRef.current !== decodeGeneration) return;
+        notify('This image format could not be decoded on this device.', 'error');
+        imageRef.current = null;
+        setSourceImage(null);
+        setStep('select');
+        setIsDecoding(false);
       };
       img.src = sourceImage;
     }
@@ -356,41 +411,90 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({ isOpen, onClose, onImageR
     (e.target as Element).releasePointerCapture(e.pointerId);
   };
 
-  const processCrop = () => {
-    if (!imageRef.current) return;
-    
-    // Max dimension for output to prevent mobile canvas crashes (textures > 4096 often fail, 1024 is safe and fast)
-    const MAX_DIM = 1024;
-    
-    let w = cropRect.w;
-    let h = cropRect.h;
-    
-    // Prevent zero dimension issues
-    if (w <= 0 || h <= 0) return;
+  const processCrop = async () => {
+    const image = imageRef.current;
+    if (!image) return;
 
-    if (w > MAX_DIM || h > MAX_DIM) {
-        const scale = Math.min(MAX_DIM / w, MAX_DIM / h);
-        w = Math.round(w * scale);
-        h = Math.round(h * scale);
+    const sourceWidth = image.naturalWidth || image.width;
+    const sourceHeight = image.naturalHeight || image.height;
+    const sourceX = Math.max(0, Math.min(sourceWidth - 1, Math.round(cropRect.x)));
+    const sourceY = Math.max(0, Math.min(sourceHeight - 1, Math.round(cropRect.y)));
+    let sourceCropWidth = Math.max(1, Math.round(cropRect.w));
+    let sourceCropHeight = Math.max(1, Math.round(cropRect.h));
+    sourceCropWidth = Math.min(sourceCropWidth, sourceWidth - sourceX);
+    sourceCropHeight = Math.min(sourceCropHeight, sourceHeight - sourceY);
+
+    const isFullFrame = sourceX === 0
+        && sourceY === 0
+        && sourceCropWidth === sourceWidth
+        && sourceCropHeight === sourceHeight;
+
+    // Browser-portable raster formats can pass through byte-for-byte when the
+    // full frame is selected. This avoids a second source-sized canvas and the
+    // large PNG expansion that would otherwise occur for phone JPEGs.
+    if (preserveSourcePixels && isFullFrame && sourceImage && /^data:image\/(?:png|jpe?g|webp|avif);/i.test(sourceImage)) {
+        onImageReady(sourceImage);
+        onClose();
+        return;
     }
-    
-    const canvas = document.createElement('canvas');
-    canvas.width = w;
-    canvas.height = h;
-    
-    const ctx = canvas.getContext('2d');
-    if (ctx) {
+
+    const MAX_OPTIMIZED_DIMENSION = 1024;
+    const scale = preserveSourcePixels
+        ? 1
+        : Math.min(1, MAX_OPTIMIZED_DIMENSION / Math.max(sourceCropWidth, sourceCropHeight));
+    const outputWidth = Math.max(1, Math.round(sourceCropWidth * scale));
+    const outputHeight = Math.max(1, Math.round(sourceCropHeight * scale));
+
+    if (preserveSourcePixels && outputWidth * outputHeight > MAX_FULL_RESOLUTION_CROP_PIXELS) {
+        notify('This full-resolution crop is too large for this device. Tighten the crop area, or use the complete image without cropping.', 'error');
+        return;
+    }
+
+    const processingGeneration = ++processingGenerationRef.current;
+    setIsProcessing(true);
+    try {
+        const canvas = document.createElement('canvas');
+        canvas.width = outputWidth;
+        canvas.height = outputHeight;
+
+        const ctx = canvas.getContext('2d');
+        if (!ctx) throw new Error('This device could not allocate the full-resolution crop canvas.');
         // High quality scaling
         ctx.imageSmoothingEnabled = true;
         ctx.imageSmoothingQuality = 'high';
         
         ctx.drawImage(
-            imageRef.current,
-            cropRect.x, cropRect.y, cropRect.w, cropRect.h,
-            0, 0, w, h
+            image,
+            sourceX, sourceY, sourceCropWidth, sourceCropHeight,
+            0, 0, outputWidth, outputHeight
         );
-        onImageReady(canvas.toDataURL('image/png'));
+        const sourceMime = sourceImage?.match(/^data:(image\/(?:png|jpe?g|webp|avif));/i)?.[1]?.toLowerCase();
+        const outputMime = sourceMime === 'image/jpeg' || sourceMime === 'image/jpg'
+            ? 'image/jpeg'
+            : sourceMime === 'image/webp'
+                ? 'image/webp'
+                : 'image/png';
+        const result = await new Promise<string>((resolve, reject) => {
+            canvas.toBlob(blob => {
+                if (!blob) { reject(new Error('The full-resolution crop could not be encoded.')); return; }
+                if (blob.size > MAX_SOURCE_BYTES) {
+                    reject(new Error('This full-resolution crop exceeds 40 MB. Tighten the crop area and try again.'));
+                    return;
+                }
+                const reader = new FileReader();
+                reader.onload = () => resolve(reader.result as string);
+                reader.onerror = () => reject(reader.error ?? new Error('The full-resolution crop could not be read.'));
+                reader.readAsDataURL(blob);
+            }, outputMime, 0.96);
+        });
+        if (processingGenerationRef.current !== processingGeneration) return;
+        onImageReady(result);
         onClose();
+    } catch (error) {
+        reportError('image-crop', error, { outputWidth, outputHeight, preserveSourcePixels });
+        notify(error instanceof Error ? error.message : 'This crop could not be processed at full resolution.', 'error');
+    } finally {
+        if (processingGenerationRef.current === processingGeneration) setIsProcessing(false);
     }
   };
 
@@ -406,7 +510,7 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({ isOpen, onClose, onImageR
             {step === 'camera' && 'Take Photo'}
             {step === 'crop' && 'Crop & Convert'}
           </h3>
-          <button onClick={onClose} className="text-gray-400 hover:text-white transition-colors">
+          <button onClick={onClose} disabled={isProcessing} className="text-gray-400 hover:text-white disabled:cursor-wait disabled:opacity-40 transition-colors">
             <X className="w-5 h-5" />
           </button>
         </div>
@@ -493,7 +597,15 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({ isOpen, onClose, onImageR
         <div className="p-4 border-t border-gray-700 bg-gray-900 flex justify-between">
            {step !== 'select' && (
              <button 
-                onClick={() => { stopCamera(); setStep('select'); }}
+                onClick={() => {
+                  processingGenerationRef.current += 1;
+                  stopCamera();
+                  imageRef.current = null;
+                  setSourceImage(null);
+                  setIsDecoding(false);
+                  setStep('select');
+                }}
+                disabled={isProcessing}
                 className="flex items-center gap-2 px-4 py-2 text-gray-400 hover:text-white hover:bg-gray-800 rounded transition-colors"
              >
                 <RotateCcw className="w-4 h-4" /> Back
@@ -505,10 +617,13 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({ isOpen, onClose, onImageR
            {step === 'crop' && (
              <button 
                 onClick={processCrop}
-                className="flex items-center gap-2 px-6 py-2 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded shadow-lg shadow-blue-900/20 transition-all"
+                data-testid="confirm-image-crop"
+                aria-label="Crop & Save PNG"
+                disabled={isProcessing || isDecoding || !imageRef.current}
+                className="flex items-center gap-2 px-6 py-2 bg-blue-600 hover:bg-blue-500 disabled:cursor-wait disabled:opacity-60 text-white font-semibold rounded shadow-lg shadow-blue-900/20 transition-all"
              >
                 <Check className="w-4 h-4" /> 
-                Crop & Save PNG
+                 {isDecoding ? 'Preparing full resolution…' : isProcessing ? 'Processing full resolution…' : preserveSourcePixels ? 'Use full-resolution crop' : 'Crop & Save PNG'}
              </button>
            )}
         </div>

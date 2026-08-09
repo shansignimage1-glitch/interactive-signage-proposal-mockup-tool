@@ -330,3 +330,191 @@ test('sign controls have iPad-sized targets and move on the first drag', async (
   await page.getByRole('button', { name: 'Nudge sign right' }).click();
   await expect.poll(async () => (await moveHandle.boundingBox())!.x).toBeGreaterThan(beforeNudge!.x);
 });
+
+test('desktop Select & adjust handles show a precision magnifier', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-chromium', 'Desktop pointer precision coverage.');
+
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Continue as Guest' }).click();
+  await page.getByRole('button', { name: 'Select & adjust' }).click();
+
+  const loupe = page.getByTestId('precision-loupe');
+  const corner = page.getByTestId('sign-corner-handle-0');
+  const cornerBefore = await corner.boundingBox();
+  expect(cornerBefore).not.toBeNull();
+  const cornerStart = {
+    x: cornerBefore!.x + cornerBefore!.width / 2,
+    y: cornerBefore!.y + cornerBefore!.height / 2,
+  };
+
+  await page.mouse.move(cornerStart.x, cornerStart.y);
+  await page.mouse.down();
+  await expect(loupe).toBeVisible();
+  await expect(loupe).toHaveAttribute('data-loupe-kind', 'sign');
+  const firstLoupeStyle = await loupe.getAttribute('style');
+  await page.mouse.move(cornerStart.x + 28, cornerStart.y + 18);
+  await expect.poll(() => loupe.getAttribute('style')).not.toBe(firstLoupeStyle);
+  await page.mouse.up();
+  await expect(loupe).toBeHidden();
+  await expect.poll(async () => (await corner.boundingBox())!.x).toBeGreaterThan(cornerBefore!.x + 20);
+
+  const moveHandle = page.getByTestId('sign-move-handle');
+  const moveBounds = await moveHandle.boundingBox();
+  expect(moveBounds).not.toBeNull();
+  await page.mouse.move(moveBounds!.x + moveBounds!.width / 2, moveBounds!.y + moveBounds!.height / 2);
+  await page.mouse.down();
+  await expect(loupe).toBeHidden();
+  await page.mouse.up();
+
+  const scaleHandle = page.getByTestId('sign-scale-handle');
+  const scaleBounds = await scaleHandle.boundingBox();
+  expect(scaleBounds).not.toBeNull();
+  await page.mouse.move(scaleBounds!.x + scaleBounds!.width / 2, scaleBounds!.y + scaleBounds!.height / 2);
+  await page.mouse.down();
+  await expect(loupe).toBeHidden();
+  await page.mouse.up();
+
+  await calibrateCanvas(page);
+  const surface = page.locator('#export-target');
+  const surfaceBounds = await surface.boundingBox();
+  expect(surfaceBounds).not.toBeNull();
+  await page.getByRole('button', { name: 'Measure line' }).click();
+  await surface.click({ position: { x: surfaceBounds!.width * 0.3, y: surfaceBounds!.height * 0.7 } });
+  await surface.click({ position: { x: surfaceBounds!.width * 0.65, y: surfaceBounds!.height * 0.7 } });
+  await page.getByRole('button', { name: 'Select & adjust' }).click();
+
+  const dimensionHandle = page.locator('[data-dimension-handle="0"]').first();
+  const dimensionBefore = await dimensionHandle.boundingBox();
+  expect(dimensionBefore).not.toBeNull();
+  await page.mouse.move(
+    dimensionBefore!.x + dimensionBefore!.width / 2,
+    dimensionBefore!.y + dimensionBefore!.height / 2,
+  );
+  await page.mouse.down();
+  await expect(loupe).toHaveAttribute('data-loupe-kind', 'dimension');
+  await page.mouse.move(dimensionBefore!.x + dimensionBefore!.width / 2 + 24, dimensionBefore!.y + dimensionBefore!.height / 2 + 12);
+  await page.mouse.up();
+  await expect(loupe).toBeHidden();
+  await expect.poll(async () => (await dimensionHandle.boundingBox())!.x).toBeGreaterThan(dimensionBefore!.x + 16);
+
+  const dimensionEndHandle = page.locator('[data-dimension-handle="1"]').first();
+  const movedStartBefore = await dimensionHandle.boundingBox();
+  const movedEndBefore = await dimensionEndHandle.boundingBox();
+  expect(movedStartBefore).not.toBeNull();
+  expect(movedEndBefore).not.toBeNull();
+  const lineMovePoint = {
+    x: movedStartBefore!.x + movedStartBefore!.width / 2
+      + ((movedEndBefore!.x + movedEndBefore!.width / 2) - (movedStartBefore!.x + movedStartBefore!.width / 2)) * 0.35,
+    y: movedStartBefore!.y + movedStartBefore!.height / 2
+      + ((movedEndBefore!.y + movedEndBefore!.height / 2) - (movedStartBefore!.y + movedStartBefore!.height / 2)) * 0.35,
+  };
+  await page.mouse.move(lineMovePoint.x, lineMovePoint.y);
+  await page.mouse.down();
+  await expect(loupe).toBeHidden();
+  await page.mouse.move(lineMovePoint.x + 20, lineMovePoint.y + 10);
+  await page.mouse.up();
+  await expect.poll(async () => (await dimensionHandle.boundingBox())!.x).toBeGreaterThan(movedStartBefore!.x + 14);
+  await expect.poll(async () => (await dimensionEndHandle.boundingBox())!.x).toBeGreaterThan(movedEndBefore!.x + 14);
+
+  await page.getByRole('button', { name: 'Width × height' }).click();
+  await surface.click({ position: { x: surfaceBounds!.width * 0.45, y: surfaceBounds!.height * 0.32 } });
+  await surface.click({ position: { x: surfaceBounds!.width * 0.72, y: surfaceBounds!.height * 0.54 } });
+  await page.getByRole('button', { name: 'Select & adjust' }).click();
+  const boxCorner = page.locator('[data-dimension-handle="10"]');
+  const boxCornerBefore = await boxCorner.boundingBox();
+  expect(boxCornerBefore).not.toBeNull();
+  await page.mouse.move(boxCornerBefore!.x + boxCornerBefore!.width / 2, boxCornerBefore!.y + boxCornerBefore!.height / 2);
+  await page.mouse.down();
+  await expect(loupe).toHaveAttribute('data-loupe-kind', 'dimension');
+  await page.mouse.move(boxCornerBefore!.x + boxCornerBefore!.width / 2 - 18, boxCornerBefore!.y + boxCornerBefore!.height / 2 - 12);
+  await page.mouse.up();
+  await expect(loupe).toBeHidden();
+  await expect.poll(async () => (await boxCorner.boundingBox())!.x).toBeLessThan(boxCornerBefore!.x - 10);
+});
+
+test('background upload retains its full source dimensions for editing', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-chromium', 'Full-resolution import is covered once in the desktop browser.');
+
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Continue as Guest' }).click();
+  const moreControls = page.getByRole('button', { name: 'Open all controls' });
+  if (await moreControls.isVisible()) await moreControls.click();
+  await page.getByRole('button', { name: 'New Image / Camera' }).click();
+
+  const sourceWidth = 4608;
+  const sourceHeight = 2592;
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${sourceWidth}" height="${sourceHeight}" viewBox="0 0 ${sourceWidth} ${sourceHeight}"><rect width="100%" height="100%" fill="#314158"/><circle cx="2304" cy="1296" r="520" fill="#38bdf8"/></svg>`;
+  await page.locator('input[type="file"][accept="image/*"]').setInputFiles({
+    name: 'full-resolution-background.svg',
+    mimeType: 'image/svg+xml',
+    buffer: Buffer.from(svg),
+  });
+
+  const confirmCrop = page.getByTestId('confirm-image-crop');
+  await expect(confirmCrop).toContainText('Use full-resolution crop');
+  await confirmCrop.click();
+  await expect(confirmCrop).toBeHidden();
+  const background = page.locator('#export-target img[alt="Background"]');
+  await expect(background).toBeVisible();
+  await expect.poll(() => background.evaluate(image => ({
+    width: (image as HTMLImageElement).naturalWidth,
+    height: (image as HTMLImageElement).naturalHeight,
+  }))).toEqual({ width: sourceWidth, height: sourceHeight });
+  await expect.poll(() => page.locator('#export-target').evaluate(element => ({
+    width: Number.parseFloat((element as HTMLElement).style.width),
+    height: Number.parseFloat((element as HTMLElement).style.height),
+  }))).toEqual({ width: sourceWidth, height: sourceHeight });
+
+  const signCanvas = page.locator('#export-target canvas').first();
+  const preview = await signCanvas.evaluate(canvas => ({
+    width: (canvas as HTMLCanvasElement).width,
+    height: (canvas as HTMLCanvasElement).height,
+  }));
+  expect(preview).toEqual({ width: 2730, height: 1536 });
+  expect(preview.width * preview.height).toBeLessThanOrEqual(4_194_304);
+
+  await page.getByTitle('Crop Background').click();
+  await expect(page.getByRole('button', { name: 'Apply crop' })).toBeVisible();
+  await page.getByRole('button', { name: 'Apply crop' }).click();
+  await expect(page.getByRole('button', { name: 'Apply crop' })).toBeHidden();
+  await expect.poll(() => background.evaluate(image => (image as HTMLImageElement).naturalWidth)).toBe(sourceWidth);
+
+  await page.getByRole('button', { name: 'Select & adjust' }).click();
+  const corner = page.getByTestId('sign-corner-handle-0');
+  const cornerBounds = await corner.boundingBox();
+  expect(cornerBounds).not.toBeNull();
+  await page.mouse.move(cornerBounds!.x + cornerBounds!.width / 2, cornerBounds!.y + cornerBounds!.height / 2);
+  await page.mouse.down();
+  const precisionLoupe = page.getByTestId('precision-loupe');
+  await expect(precisionLoupe).toHaveAttribute('data-loupe-kind', 'sign');
+  const loupeLayout = await page.evaluate(() => {
+    const element = document.querySelector('[data-testid="precision-loupe"]')!;
+    const crosshair = document.querySelector('[data-testid="precision-loupe-crosshair-center"]')!;
+    const loupeRect = element.getBoundingClientRect();
+    const crosshairRect = crosshair.getBoundingClientRect();
+    return {
+      borderWidth: getComputedStyle(element).borderLeftWidth,
+      loupeCenter: { x: loupeRect.left + loupeRect.width / 2, y: loupeRect.top + loupeRect.height / 2 },
+      crosshairCenter: { x: crosshairRect.left + crosshairRect.width / 2, y: crosshairRect.top + crosshairRect.height / 2 },
+    };
+  });
+  expect(loupeLayout.borderWidth).toBe('0px');
+  expect(loupeLayout.crosshairCenter.x).toBeCloseTo(loupeLayout.loupeCenter.x, 3);
+  expect(loupeLayout.crosshairCenter.y).toBeCloseTo(loupeLayout.loupeCenter.y, 3);
+  const loupeBoundary = () => page.getByTestId('precision-loupe-sign-layer').evaluate(node => {
+    const canvas = node as HTMLCanvasElement;
+    const context = canvas.getContext('2d');
+    if (!context) return { outside: 0, inside: 0 };
+    const center = Math.floor(canvas.width / 2);
+    // Sample immediately across the corner/crosshair intersection. A wider
+    // sample would miss a few-pixel border-box offset in the loupe layers.
+    const offset = Math.max(2, Math.floor(canvas.width * 0.025));
+    return {
+      outside: context.getImageData(center - offset, center - offset, 1, 1).data[3],
+      inside: context.getImageData(center + offset, center + offset, 1, 1).data[3],
+    };
+  });
+  await expect.poll(async () => (await loupeBoundary()).outside).toBe(0);
+  await expect.poll(async () => (await loupeBoundary()).inside).toBeGreaterThan(200);
+  await page.mouse.up();
+});

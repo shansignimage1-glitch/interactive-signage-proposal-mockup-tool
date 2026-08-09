@@ -230,9 +230,14 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
   };
 
   const handleImageReady = async (rawDataUrl: string) => {
-    let dataUrl: string;
-    try { dataUrl = await optimizeDataUri(rawDataUrl, uploadTarget === 'background' ? 4096 : 3072); }
-    catch (error) { notify(error instanceof Error ? error.message : 'Could not optimize this image.', 'error'); return; }
+    let dataUrl = rawDataUrl;
+    // Background photos remain at source resolution throughout editing. The
+    // cloud-save pipeline creates its smaller transport copy later, without
+    // replacing this full-resolution local working image.
+    if (uploadTarget !== 'background') {
+      try { dataUrl = await optimizeDataUri(rawDataUrl, 3072); }
+      catch (error) { notify(error instanceof Error ? error.message : 'Could not optimize this image.', 'error'); return; }
+    }
     if (uploadTarget === 'sign') {
         let targetSignId = activeCanvas.activeSignId;
         let activeSign = activeCanvas.signs.find(s => s.id === targetSignId);
@@ -1420,6 +1425,7 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
         isOpen={isUploaderOpen}
         onClose={() => setIsUploaderOpen(false)}
         onImageReady={handleImageReady}
+        preserveSourcePixels={uploadTarget === 'background'}
       />
       
       <SignLibrary

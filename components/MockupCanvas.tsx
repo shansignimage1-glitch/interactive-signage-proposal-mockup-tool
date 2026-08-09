@@ -5,6 +5,8 @@ import { hexToRgb, isPointInPolygon, distance, computeHomography } from '../util
 import { measureLine, measureBox } from '../utils/measure';
 import { buildElementMask } from '../utils/elementDetection';
 import { reportError } from '../services/monitoring';
+import { notify } from '../services/toast';
+import { MAX_SOURCE_BYTES } from '../services/imageProcessing';
 import { ZoomIn, ZoomOut, Maximize, Check, X, Lock, Unlock } from 'lucide-react';
 import { ToolMode } from '../App';
 import { TITLE_BLOCK_TEMPLATES } from '../data/titleBlockTemplates';
@@ -49,8 +51,11 @@ const SIGN_MOVE_VISUAL_SIZE = 30;
 const PRECISION_LOUPE_SIZE = 128;
 const PRECISION_LOUPE_GAP = 32;
 const TOUCH_DRAW_THRESHOLD = 8;
+const MAX_WEBGL_PREVIEW_DIMENSION = 4096;
+const MAX_WEBGL_PREVIEW_PIXELS = 4_194_304;
+const MAX_FULL_RESOLUTION_CROP_PIXELS = 12_000_000;
 
-type PrecisionLoupeKind = 'calibration' | 'drawing' | 'dimension';
+type PrecisionLoupeKind = 'calibration' | 'drawing' | 'dimension' | 'sign';
 
 interface PrecisionLoupeState {
   clientX: number;
@@ -72,6 +77,19 @@ const precisionLoupePosition = (clientX: number, clientY: number, viewportWidth:
     return {
         left: Math.min(Math.max(safeEdge, preferredLeft), Math.max(safeEdge, viewportWidth - PRECISION_LOUPE_SIZE - safeEdge)),
         top: Math.min(Math.max(safeEdge, top), Math.max(safeEdge, viewportHeight - PRECISION_LOUPE_SIZE - safeEdge)),
+    };
+};
+
+const webGlPreviewSize = (gl: WebGLRenderingContext, sourceWidth: number, sourceHeight: number) => {
+    const viewport = gl.getParameter(gl.MAX_VIEWPORT_DIMS) as Int32Array | number[] | null;
+    const renderbufferLimit = Number(gl.getParameter(gl.MAX_RENDERBUFFER_SIZE)) || MAX_WEBGL_PREVIEW_DIMENSION;
+    const maxWidth = Math.max(1, Math.min(MAX_WEBGL_PREVIEW_DIMENSION, renderbufferLimit, viewport?.[0] ?? MAX_WEBGL_PREVIEW_DIMENSION));
+    const maxHeight = Math.max(1, Math.min(MAX_WEBGL_PREVIEW_DIMENSION, renderbufferLimit, viewport?.[1] ?? MAX_WEBGL_PREVIEW_DIMENSION));
+    const pixelScale = Math.sqrt(MAX_WEBGL_PREVIEW_PIXELS / Math.max(1, sourceWidth * sourceHeight));
+    const scale = Math.min(1, maxWidth / sourceWidth, maxHeight / sourceHeight, pixelScale);
+    return {
+        width: Math.max(1, Math.floor(sourceWidth * scale)),
+        height: Math.max(1, Math.floor(sourceHeight * scale)),
     };
 };
 
@@ -147,6 +165,8 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
   // Crop State
   const [cropRect, setCropRect] = useState<{ x: number, y: number, w: number, h: number } | null>(null);
   const [cropDragMode, setCropDragMode] = useState<'move' | 'nw' | 'ne' | 'sw' | 'se' | null>(null);
+  const [isCropProcessing, setIsCropProcessing] = useState(false);
+  const cropOperationRef = useRef(0);
   
   // Drawing State (Dimensions)
   const [isDrawing, setIsDrawing] = useState(false);
@@ -161,6 +181,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
   const [calibrationDragIndex, setCalibrationDragIndex] = useState<number | null>(null);
   const precisionPointerRef = useRef<{ pointerId: number; kind: PrecisionLoupeKind } | null>(null);
   const [precisionLoupe, setPrecisionLoupe] = useState<PrecisionLoupeState | null>(null);
+  const [webGlGeneration, setWebGlGeneration] = useState(0);
 
   const showPrecisionLoupe = (kind: PrecisionLoupeKind, e: React.PointerEvent, point: Point) => {
     precisionPointerRef.current = { pointerId: e.pointerId, kind };
@@ -369,6 +390,9 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
   useEffect(() => {
     if (isCropping) {
         setCropRect({ x: 0, y: 0, w: images.backgroundSize.width, h: images.backgroundSize.height });
+    } else {
+        cropOperationRef.current += 1;
+        setIsCropProcessing(false);
     }
   }, [isCropping, images.backgroundSize]);
 
@@ -638,8 +662,24 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
     if (!canvas) return;
     setCanvasRef(canvas);
 
+    const removeContextListeners = () => {
+      canvas.removeEventListener('webglcontextlost', handleContextLost);
+      canvas.removeEventListener('webglcontextrestored', handleContextRestored);
+    };
+    const handleContextLost = (event: Event) => {
+      event.preventDefault();
+      glRef.current = null;
+    };
+    const handleContextRestored = () => {
+      textureCacheRef.current.clear();
+      elementCacheRef.current.clear();
+      setWebGlGeneration(generation => generation + 1);
+    };
+    canvas.addEventListener('webglcontextlost', handleContextLost);
+    canvas.addEventListener('webglcontextrestored', handleContextRestored);
+
     const gl = canvas.getContext('webgl', { preserveDrawingBuffer: true, alpha: true });
-    if (!gl) return;
+    if (!gl) return removeContextListeners;
     glRef.current = gl;
 
     gl.enable(gl.BLEND);
@@ -689,7 +729,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
 
     const vs = createShader(gl.VERTEX_SHADER, vsSource);
     const fs = createShader(gl.FRAGMENT_SHADER, fsSource);
-    if (!vs || !fs) return;
+    if (!vs || !fs) return removeContextListeners;
 
     const program = gl.createProgram()!;
     gl.attachShader(program, vs);
@@ -697,7 +737,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
     gl.linkProgram(program);
     if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
       reportError('webgl-program', new Error(gl.getProgramInfoLog(program) ?? 'Shader program linking failed'));
-      return;
+      return removeContextListeners;
     }
 
     programRef.current = program;
@@ -784,7 +824,8 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
         };
       } else reportError('webgl-element-program', new Error(gl.getProgramInfoLog(elemProgram) ?? 'Element shader linking failed'));
     }
-  }, [setCanvasRef]);
+    return removeContextListeners;
+  }, [setCanvasRef, webGlGeneration]);
 
   useEffect(() => {
     const gl = glRef.current;
@@ -824,7 +865,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
         };
       }
     });
-  }, [signs]);
+  }, [signs, webGlGeneration]);
 
   // Build/evict static per-element geometry. Keyed by an elementsVersion that
   // covers ONLY contours + image — depth and enabled changes are uniforms at
@@ -896,7 +937,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
 
       cache.set(sign.id, { version, faceBuffer, elements });
     });
-  }, [signs]);
+  }, [signs, webGlGeneration]);
 
   const render = useCallback(() => {
     const gl = glRef.current;
@@ -904,9 +945,12 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
     const canvas = canvasRef.current;
     if (!gl || !program || !canvas) return;
 
-    if (canvas.width !== images.backgroundSize.width || canvas.height !== images.backgroundSize.height) {
-        canvas.width = images.backgroundSize.width;
-        canvas.height = images.backgroundSize.height;
+    const sourceWidth = Math.max(1, Math.round(images.backgroundSize.width));
+    const sourceHeight = Math.max(1, Math.round(images.backgroundSize.height));
+    const previewSize = webGlPreviewSize(gl, sourceWidth, sourceHeight);
+    if (canvas.width !== previewSize.width || canvas.height !== previewSize.height) {
+        canvas.width = previewSize.width;
+        canvas.height = previewSize.height;
     }
     
     gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
@@ -920,7 +964,10 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
     const texBuffer = texBufferRef.current;
     if (!uniforms || !posBuffer || !texBuffer) return;
 
-    gl.uniform2f(uniforms.resolution, gl.canvas.width, gl.canvas.height);
+    // Geometry stays in full-resolution background coordinates while the GPU
+    // backing buffer is capped to a device-safe preview size. The DOM photo
+    // underneath remains untouched and retains all source pixels for editing.
+    gl.uniform2f(uniforms.resolution, sourceWidth, sourceHeight);
 
     // Set up texCoord attrib once — buffer data is static, set during init
     gl.bindBuffer(gl.ARRAY_BUFFER, texBuffer);
@@ -985,7 +1032,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
           c
         );
         gl.uniformMatrix3fv(eLocs.H, false, [Hm[0], Hm[3], Hm[6], Hm[1], Hm[4], Hm[7], Hm[2], Hm[5], Hm[8]]);
-        gl.uniform2f(eLocs.resolution, gl.canvas.width, gl.canvas.height);
+        gl.uniform2f(eLocs.resolution, sourceWidth, sourceHeight);
         gl.uniform2f(eLocs.signSize, sw, sh);
         gl.uniform1i(eLocs.image, 0);
         gl.uniform1i(eLocs.mask, 1);
@@ -1061,6 +1108,9 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
         if (activeSign) {
             startCornersRef.current = [...activeSign.corners];
             dragSignIdRef.current = activeSign.id;
+            if (index >= 0 && index < 4) {
+                showPrecisionLoupe('sign', e, startMousePos.current);
+            }
         }
     } else if (activeDimensionId) {
         dragSignIdRef.current = null;
@@ -1078,9 +1128,9 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
                  else if ([14, 15, 16].includes(index)) targetY = isStartTop ? 'end' : 'start';
                  boxDragTargetsRef.current = { x: targetX, y: targetY };
              }
-             if (e.pointerType === 'touch' && (index === 0 || index === 1 || index >= 10)) {
-                 showPrecisionLoupe('dimension', e, startMousePos.current);
-             }
+              if (index === 0 || index === 1 || index >= 10) {
+                  showPrecisionLoupe('dimension', e, startMousePos.current);
+              }
         }
     }
     setActiveHandle(index);
@@ -1244,6 +1294,9 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
                 const newCorners = [...activeSign.corners] as [Point, Point, Point, Point]; 
                 newCorners[interactionHandle] = pos;
                 updateSignById(dragSignId, { corners: newCorners });
+                if (precisionPointerRef.current?.kind === 'sign' && precisionPointerRef.current.pointerId === e.pointerId) {
+                    showPrecisionLoupe('sign', e, pos);
+                }
             } 
             else if (interactionHandle === 4) {
                 const movedCorners = startCorners.map(p => ({ x: p.x + dx, y: p.y + dy })) as [Point, Point, Point, Point]; 
@@ -1333,16 +1386,84 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
 
   const confirmCrop = () => {
     if (!cropRect) return;
-    const tempCanvas = document.createElement('canvas');
-    const ctx = tempCanvas.getContext('2d');
+    const sourceWidth = Math.max(1, Math.round(images.backgroundSize.width));
+    const sourceHeight = Math.max(1, Math.round(images.backgroundSize.height));
+    const cropX = Math.max(0, Math.min(sourceWidth - 1, Math.round(cropRect.x)));
+    const cropY = Math.max(0, Math.min(sourceHeight - 1, Math.round(cropRect.y)));
+    const cropWidth = Math.min(sourceWidth - cropX, Math.max(1, Math.round(cropRect.w)));
+    const cropHeight = Math.min(sourceHeight - cropY, Math.max(1, Math.round(cropRect.h)));
+    const fullFrame = cropX === 0 && cropY === 0 && cropWidth === sourceWidth && cropHeight === sourceHeight;
+
+    if (fullFrame) {
+        onCropConfirm(images.background, { x: 0, y: 0 }, { width: sourceWidth, height: sourceHeight });
+        return;
+    }
+    if (cropWidth * cropHeight > MAX_FULL_RESOLUTION_CROP_PIXELS) {
+        notify('This full-resolution crop is too large for this device. Tighten the crop area, or keep the complete image.', 'error');
+        return;
+    }
+
+    const operation = ++cropOperationRef.current;
+    setIsCropProcessing(true);
     const img = new Image();
-    img.crossOrigin = "anonymous";
+    img.crossOrigin = 'anonymous';
     img.onload = () => {
-        tempCanvas.width = cropRect.w;
-        tempCanvas.height = cropRect.h;
-        ctx?.drawImage(img, cropRect.x, cropRect.y, cropRect.w, cropRect.h, 0, 0, cropRect.w, cropRect.h);
-        const newUrl = tempCanvas.toDataURL();
-        onCropConfirm(newUrl, { x: cropRect.x, y: cropRect.y }, { width: cropRect.w, height: cropRect.h });
+        if (cropOperationRef.current !== operation) return;
+        try {
+            const tempCanvas = document.createElement('canvas');
+            tempCanvas.width = cropWidth;
+            tempCanvas.height = cropHeight;
+            const ctx = tempCanvas.getContext('2d');
+            if (!ctx) throw new Error('This device could not allocate the full-resolution crop canvas.');
+            ctx.drawImage(img, cropX, cropY, cropWidth, cropHeight, 0, 0, cropWidth, cropHeight);
+            const sourceMime = images.background.match(/^data:(image\/(?:png|jpe?g|webp|avif));/i)?.[1]?.toLowerCase();
+            const outputMime = sourceMime === 'image/jpeg' || sourceMime === 'image/jpg'
+                ? 'image/jpeg'
+                : sourceMime === 'image/webp'
+                    ? 'image/webp'
+                    : sourceMime === 'image/png'
+                        ? 'image/png'
+                        : 'image/webp';
+            tempCanvas.toBlob(blob => {
+                if (cropOperationRef.current !== operation) return;
+                if (!blob) {
+                    setIsCropProcessing(false);
+                    notify('The full-resolution crop could not be encoded.', 'error');
+                    return;
+                }
+                if (blob.size > MAX_SOURCE_BYTES) {
+                    setIsCropProcessing(false);
+                    notify('This full-resolution crop exceeds 40 MB. Tighten the crop area and try again.', 'error');
+                    return;
+                }
+                const reader = new FileReader();
+                reader.onload = () => {
+                    if (cropOperationRef.current !== operation) return;
+                    setIsCropProcessing(false);
+                    onCropConfirm(
+                        reader.result as string,
+                        { x: cropX, y: cropY },
+                        { width: tempCanvas.width, height: tempCanvas.height },
+                    );
+                };
+                reader.onerror = () => {
+                    if (cropOperationRef.current !== operation) return;
+                    setIsCropProcessing(false);
+                    notify('The full-resolution crop could not be read.', 'error');
+                };
+                reader.readAsDataURL(blob);
+            }, outputMime, 0.96);
+        } catch (error) {
+            if (cropOperationRef.current !== operation) return;
+            setIsCropProcessing(false);
+            reportError('background-crop', error, { cropWidth, cropHeight });
+            notify(error instanceof Error ? error.message : 'This crop could not be processed at full resolution.', 'error');
+        }
+    };
+    img.onerror = () => {
+        if (cropOperationRef.current !== operation) return;
+        setIsCropProcessing(false);
+        notify('The background image could not be loaded for cropping.', 'error');
     };
     img.src = images.background;
   };
@@ -1458,18 +1579,21 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
       const sourceTop = precisionLoupe.point.y - sourceSize / 2;
       const clippedLeft = Math.max(0, sourceLeft);
       const clippedTop = Math.max(0, sourceTop);
-      const clippedRight = Math.min(source.width, sourceLeft + sourceSize);
-      const clippedBottom = Math.min(source.height, sourceTop + sourceSize);
+      const clippedRight = Math.min(images.backgroundSize.width, sourceLeft + sourceSize);
+      const clippedBottom = Math.min(images.backgroundSize.height, sourceTop + sourceSize);
       const clippedWidth = clippedRight - clippedLeft;
       const clippedHeight = clippedBottom - clippedTop;
       if (clippedWidth <= 0 || clippedHeight <= 0) return;
 
+      const backingScaleX = source.width / Math.max(1, images.backgroundSize.width);
+      const backingScaleY = source.height / Math.max(1, images.backgroundSize.height);
+
       context.drawImage(
         source,
-        clippedLeft,
-        clippedTop,
-        clippedWidth,
-        clippedHeight,
+        clippedLeft * backingScaleX,
+        clippedTop * backingScaleY,
+        clippedWidth * backingScaleX,
+        clippedHeight * backingScaleY,
         (clippedLeft - sourceLeft) * loupeScale,
         (clippedTop - sourceTop) * loupeScale,
         clippedWidth * loupeScale,
@@ -1478,7 +1602,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
     });
 
     return () => window.cancelAnimationFrame(frame);
-  }, [loupeScale, precisionLoupe, signs, texturesLoaded]);
+  }, [images.backgroundSize, loupeScale, precisionLoupe, signs, texturesLoaded]);
 
   // Filter fields by section
   const projectFields = titleBlock.fields.filter(f => f.section === 'project');
@@ -1526,18 +1650,36 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
             : `Tap the first ${toolMode === 'draw_box' ? 'corner' : 'endpoint'}, or press and drag`}
         </div>
       )}
+      {isCropping && cropRect && (
+        <div data-canvas-ui className="absolute bottom-[max(1rem,env(safe-area-inset-bottom))] left-1/2 z-[80] flex -translate-x-1/2 items-center gap-2 rounded-xl border border-sky-400/40 bg-slate-950/95 p-2 shadow-2xl backdrop-blur">
+          <span className="hidden px-2 text-xs font-semibold text-sky-200 sm:inline">Full-resolution crop</span>
+          <button
+            type="button"
+            disabled={isCropProcessing}
+            onClick={() => { cropOperationRef.current += 1; setIsCropProcessing(false); onCancelCrop(); }}
+            className="rounded-lg border border-slate-600 px-4 py-2 text-sm font-semibold text-slate-200 hover:bg-slate-800 disabled:cursor-wait disabled:opacity-40"
+          >Cancel</button>
+          <button
+            type="button"
+            disabled={isCropProcessing}
+            onClick={confirmCrop}
+            className="rounded-lg bg-sky-500 px-4 py-2 text-sm font-bold text-slate-950 hover:bg-sky-400 disabled:cursor-wait disabled:opacity-60"
+          >{isCropProcessing ? 'Processing…' : 'Apply crop'}</button>
+        </div>
+      )}
       {precisionLoupe && loupePosition && images.background && (
         <div
           data-canvas-ui
           data-testid="precision-loupe"
           data-loupe-kind={precisionLoupe.kind}
           aria-hidden="true"
-          className="pointer-events-none fixed z-[195] overflow-hidden rounded-full border-4 border-white bg-slate-950 shadow-2xl"
+          className="pointer-events-none fixed z-[195] overflow-hidden rounded-full bg-slate-950 shadow-2xl"
           style={{
             width: PRECISION_LOUPE_SIZE,
             height: PRECISION_LOUPE_SIZE,
             left: loupePosition.left,
             top: loupePosition.top,
+            outline: '4px solid white',
             boxShadow: `0 0 0 3px ${precisionLoupe.kind === 'calibration' ? '#f59e0b' : '#38bdf8'}, 0 18px 42px rgba(0, 0, 0, 0.55)`,
           }}
         >
@@ -1638,6 +1780,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
             style={{ backgroundColor: precisionLoupe.kind === 'calibration' ? '#f59e0b' : '#38bdf8' }}
           />
           <span
+            data-testid="precision-loupe-crosshair-center"
             className="absolute left-1/2 top-1/2 h-2.5 w-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white"
             style={{ backgroundColor: precisionLoupe.kind === 'calibration' ? '#f59e0b' : '#0ea5e9' }}
           />
@@ -1775,6 +1918,30 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
                     }}
                 />
             )}
+            {isCropping && cropRect && (
+                <svg
+                    aria-hidden="true"
+                    className="pointer-events-none absolute inset-0 z-30 h-full w-full overflow-visible"
+                    viewBox={`0 0 ${images.backgroundSize.width} ${images.backgroundSize.height}`}
+                >
+                    <defs>
+                        <mask id="background-crop-mask">
+                            <rect width={images.backgroundSize.width} height={images.backgroundSize.height} fill="white" />
+                            <rect x={cropRect.x} y={cropRect.y} width={cropRect.w} height={cropRect.h} fill="black" />
+                        </mask>
+                    </defs>
+                    <rect width={images.backgroundSize.width} height={images.backgroundSize.height} fill="rgba(2, 6, 23, 0.68)" mask="url(#background-crop-mask)" />
+                    <rect x={cropRect.x} y={cropRect.y} width={cropRect.w} height={cropRect.h} fill="none" stroke="#38bdf8" strokeWidth={3 * handleScale} strokeDasharray={`${8 * handleScale} ${4 * handleScale}`} />
+                    {[
+                        { x: cropRect.x, y: cropRect.y },
+                        { x: cropRect.x + cropRect.w, y: cropRect.y },
+                        { x: cropRect.x + cropRect.w, y: cropRect.y + cropRect.h },
+                        { x: cropRect.x, y: cropRect.y + cropRect.h },
+                    ].map((point, index) => (
+                        <circle key={index} cx={point.x} cy={point.y} r={10 * handleScale} fill="#f8fafc" stroke="#0ea5e9" strokeWidth={3 * handleScale} />
+                    ))}
+                </svg>
+            )}
             {state.isNightMode && (
                 <div
                     aria-hidden="true"
@@ -1785,7 +1952,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
                     }}
                 />
             )}
-            <canvas ref={canvasRef} width={images.backgroundSize.width} height={images.backgroundSize.height} className="absolute inset-0 z-10 w-full h-full pointer-events-none" style={{ opacity: isCropping ? 0.3 : 1, filter: state.isNightMode ? 'brightness(1.16) saturate(1.22) drop-shadow(0 0 9px rgba(125,211,252,0.32))' : 'none', transition: 'filter 320ms ease' }} />
+            <canvas ref={canvasRef} className="absolute inset-0 z-10 w-full h-full pointer-events-none" style={{ opacity: isCropping ? 0.3 : 1, filter: state.isNightMode ? 'brightness(1.16) saturate(1.22) drop-shadow(0 0 9px rgba(125,211,252,0.32))' : 'none', transition: 'filter 320ms ease' }} />
             {!isCropping && (
             <>
                 <svg className="absolute inset-0 z-20 w-full h-full overflow-visible pointer-events-none" viewBox={`0 0 ${images.backgroundSize.width} ${images.backgroundSize.height}`}>
