@@ -10,6 +10,7 @@ import { ToolMode } from '../App';
 import { TITLE_BLOCK_TEMPLATES } from '../data/titleBlockTemplates';
 import { notify } from '../services/toast';
 import { optimizeDataUri } from '../services/imageProcessing';
+import { materializeDataUri } from '../services/LibraryService';
 
 interface ControlsPanelProps {
   state: MockupState;
@@ -164,8 +165,11 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
   
   // Sync view mode with tab (Only 'page' tab enables sheet view)
   useEffect(() => {
-      updateState({ titleBlock: { ...state.titleBlock, viewMode: activeTab === 'page' ? 'sheet' : 'canvas' } });
-  }, [activeTab]);
+      const viewMode = activeTab === 'page' ? 'sheet' : 'canvas';
+      if (state.titleBlock.viewMode !== viewMode) {
+          updateState({ titleBlock: { ...state.titleBlock, viewMode } });
+      }
+  }, [activeTab, state.titleBlock.viewMode]);
 
   const handleVoiceInput = (target: 'dimension' | 'notes' | 'ref_note' = 'dimension') => {
     if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
@@ -306,7 +310,17 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
       return 'fascia_non_ill';
   };
 
-  const handleLibrarySelect = (template: SignTemplate) => {
+  const handleLibrarySelect = async (template: SignTemplate) => {
+      let image = template.image;
+      try {
+          // Cloud URLs may display in a normal <img> but fail WebGL's CORS rules.
+          // A local data URI is stable in the canvas and in saved projects.
+          if (template.source) image = await materializeDataUri(template.image);
+      } catch (error) {
+          notify(error instanceof Error ? error.message : 'Could not load this library sign.', 'error');
+          return;
+      }
+
       // 1. If we have an active Dimension that is a BOX, we fit the new sign to that box.
       if (activeDimension && activeDimension.variant === 'box') {
           const id = Date.now().toString();
@@ -321,15 +335,15 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
           const newSign: Sign = {
               id,
               name: template.name,
-              image: template.image,
+              image,
               corners: [
                   { x: minX, y: minY },
                   { x: maxX, y: minY },
                   { x: maxX, y: maxY },
                   { x: minX, y: maxY }
               ],
-              signType: mapCategoryToType(template.category),
-              extrusionEnabled: true,
+              signType: template.signType ?? mapCategoryToType(template.category),
+              extrusionEnabled: false,
               extrusionDepth: 15,
               extrusionAngle: 45,
               opacity: 1,
@@ -345,7 +359,7 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
           });
       } 
       else if (activeCanvas.activeSignId) {
-          updateActiveSign({ image: template.image, name: template.name, elements: undefined, elementsSourceSize: undefined });
+          updateActiveSign({ image, name: template.name, signType: template.signType ?? mapCategoryToType(template.category), extrusionEnabled: false, elements: undefined, elementsSourceSize: undefined });
       }
       else {
           const id = Date.now().toString();
@@ -358,15 +372,15 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
           const newSign: Sign = {
               id,
               name: template.name,
-              image: template.image,
+              image,
               corners: [
                   { x: cx - w/2, y: cy - h/2 },
                   { x: cx + w/2, y: cy - h/2 },
                   { x: cx + w/2, y: cy + h/2 },
                   { x: cx - w/2, y: cy + h/2 }
               ],
-              signType: mapCategoryToType(template.category),
-              extrusionEnabled: true,
+              signType: template.signType ?? mapCategoryToType(template.category),
+              extrusionEnabled: false,
               extrusionDepth: 15,
               extrusionAngle: 45,
               opacity: 1,
@@ -1354,19 +1368,23 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
           )}
         </div>
 
-        <div className={`${mobilePanelExpanded ? 'block' : 'hidden'} flex-shrink-0 border-t border-gray-700 bg-gray-800 px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-3 lg:block lg:p-6`}>
+        <div className={`${mobilePanelExpanded ? 'block' : 'hidden'} flex-shrink-0 border-t border-gray-700 bg-gray-800 px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-3 lg:block lg:px-3 lg:py-3`}>
+          <div className="grid grid-cols-2 gap-2">
           <button
             onClick={() => onDownload('device')}
-            className="w-full flex items-center justify-center gap-2 bg-blue-600 hover:bg-blue-500 text-white py-3 rounded-lg font-semibold transition-colors shadow-lg shadow-blue-900/20"
+            aria-label="Download PDF/PNG to device"
+            className="flex min-h-9 items-center justify-center gap-1.5 rounded-md bg-blue-600 px-2 py-2 text-xs font-semibold text-white transition-colors hover:bg-blue-500"
+            title="Download PDF or PNG to this device"
           >
-            <Download className="w-5 h-5" />
-            Download PDF/PNG to device
+            <Download className="h-4 w-4" />
+            Download
           </button>
           {!state.user?.uid.startsWith('guest_') && (
-            <button onClick={() => onDownload('drive')} className="w-full mt-2 flex items-center justify-center gap-2 bg-gray-700 hover:bg-gray-600 text-white py-2.5 rounded-lg text-sm font-semibold transition-colors border border-gray-600">
-              <HardDrive className="w-4 h-4" /> Save PDF/PNG to selected drive
+            <button onClick={() => onDownload('drive')} aria-label="Save PDF/PNG to selected drive" className="flex min-h-9 items-center justify-center gap-1.5 rounded-md border border-gray-600 bg-gray-700 px-2 py-2 text-xs font-semibold text-white transition-colors hover:bg-gray-600" title="Save PDF or PNG to the selected cloud drive">
+              <HardDrive className="h-4 w-4" /> Save to drive
             </button>
           )}
+          </div>
           <nav className="mt-2 flex justify-center gap-4 text-[11px] text-gray-500 lg:hidden" aria-label="Legal and support">
             <a href="#/privacy">Privacy</a><a href="#/terms">Terms</a><a href="#/support">Support</a>
           </nav>
