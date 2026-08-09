@@ -10,7 +10,7 @@ import { ToolMode } from '../App';
 import { TITLE_BLOCK_TEMPLATES } from '../data/titleBlockTemplates';
 import { notify } from '../services/toast';
 import { optimizeDataUri } from '../services/imageProcessing';
-import { materializeDataUri } from '../services/LibraryService';
+import { materializeTemplateDataUri } from '../services/LibraryService';
 
 interface ControlsPanelProps {
   state: MockupState;
@@ -315,7 +315,7 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
       try {
           // Cloud URLs may display in a normal <img> but fail WebGL's CORS rules.
           // A local data URI is stable in the canvas and in saved projects.
-          if (template.source) image = await materializeDataUri(template.image);
+          if (template.source) image = await materializeTemplateDataUri(template);
       } catch (error) {
           notify(error instanceof Error ? error.message : 'Could not load this library sign.', 'error');
           return;

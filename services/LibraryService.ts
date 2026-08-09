@@ -1,6 +1,6 @@
 import { db, storage } from '../firebase';
 import { addDoc, collection, deleteDoc, doc, getDocs, limit, query, setDoc, where } from 'firebase/firestore';
-import { deleteObject, getDownloadURL, ref as storageRef, uploadBytes } from 'firebase/storage';
+import { deleteObject, getBlob, getDownloadURL, ref as storageRef, uploadBytes } from 'firebase/storage';
 import { SignTemplate, SignType } from '../types';
 import { hashDataUri, dataUriToBlob } from './imageHash';
 import { resolveRef, isDriveRef } from './AssetResolver';
@@ -33,6 +33,15 @@ export interface NewTemplateInput {
 
 let sharedCache: SignTemplate[] | null = null;
 
+const storagePathFromUrl = (imageUrl: string): string | undefined => {
+    try {
+        const match = new URL(imageUrl).pathname.match(/\/o\/([^/]+)$/);
+        return match ? decodeURIComponent(match[1]) : undefined;
+    } catch {
+        return undefined;
+    }
+};
+
 const docToTemplate = (id: string, d: any, source: 'shared' | 'personal'): SignTemplate => ({
     id: `${source}_${id}`,
     docId: id,
@@ -42,7 +51,9 @@ const docToTemplate = (id: string, d: any, source: 'shared' | 'personal'): SignT
     width: d.widthMm ?? 2000,
     height: d.heightMm ?? 500,
     source,
-    storagePath: d.storagePath,
+    // Older records may only contain a Firebase download URL. Recover the
+    // stable object path so revoked/rotated download tokens can be refreshed.
+    storagePath: d.storagePath ?? storagePathFromUrl(d.imageUrl ?? ''),
     ownerUid: d.ownerUid,
     brand: d.brand,
     tags: d.tags ?? [],
@@ -77,13 +88,41 @@ export const materializeDataUri = async (image: string): Promise<string> => {
     });
 };
 
+const blobToDataUri = (blob: Blob): Promise<string> => new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result as string);
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(blob);
+});
+
+// Library objects have stable Storage paths even when their persisted public
+// download token has expired. Read through the authenticated Firebase SDK.
+export const materializeTemplateDataUri = async (template: SignTemplate): Promise<string> => {
+    if (template.storagePath) {
+        return blobToDataUri(await getBlob(storageRef(storage, template.storagePath)));
+    }
+    return materializeDataUri(template.image);
+};
+
+const hydrateTemplateImage = async (template: SignTemplate): Promise<SignTemplate> => {
+    if (!template.storagePath) return template;
+    try {
+        const blob = await getBlob(storageRef(storage, template.storagePath));
+        return { ...template, image: await blobToDataUri(blob) };
+    } catch {
+        // Keep metadata usable and let selection surface the authenticated
+        // Storage error if the underlying object itself is unavailable.
+        return template;
+    }
+};
+
 export const LibraryService = {
 
     listShared: async (): Promise<SignTemplate[]> => {
         if (sharedCache) return sharedCache;
         const snapshot = await getDocs(query(collection(db, SHARED_COLLECTION), limit(200)));
-        sharedCache = snapshot.docs
-            .map(doc => docToTemplate(doc.id, doc.data(), 'shared'))
+        sharedCache = (await Promise.all(snapshot.docs
+            .map(doc => hydrateTemplateImage(docToTemplate(doc.id, doc.data(), 'shared')))))
             .sort((a, b) => a.name.localeCompare(b.name));
         return sharedCache;
     },
@@ -92,8 +131,8 @@ export const LibraryService = {
         if (uid.startsWith('guest_')) return [];
         // No orderBy — avoids needing a composite index; sort client-side
         const snapshot = await getDocs(query(collection(db, PERSONAL_COLLECTION), where('ownerUid', '==', uid), limit(200)));
-        return snapshot.docs
-            .map(doc => docToTemplate(doc.id, doc.data(), 'personal'))
+        return (await Promise.all(snapshot.docs
+            .map(doc => hydrateTemplateImage(docToTemplate(doc.id, doc.data(), 'personal')))))
             .sort((a, b) => a.name.localeCompare(b.name));
     },
 
@@ -115,7 +154,7 @@ export const LibraryService = {
             brand: input.brand ?? '', tags: input.tags ?? [], signType: input.signType ?? 'fascia_non_ill', rightsNote: input.rightsNote ?? '', version: 1, updatedAt: Date.now(),
         };
         await setDoc(doc(db, PERSONAL_COLLECTION, docId), data);
-        return docToTemplate(docId, data, 'personal');
+        return { ...docToTemplate(docId, data, 'personal'), image: input.dataUri };
     },
 
     deletePersonal: async (template: SignTemplate): Promise<void> => {
@@ -145,7 +184,7 @@ export const LibraryService = {
         };
         const docRef = await addDoc(collection(db, SHARED_COLLECTION), data);
         sharedCache = null; // refetch next time
-        return docToTemplate(docRef.id, data, 'shared');
+        return { ...docToTemplate(docRef.id, data, 'shared'), image: input.dataUri };
     },
 
     updateShared: async (template: SignTemplate, input: NewTemplateInput): Promise<SignTemplate> => {
@@ -163,7 +202,7 @@ export const LibraryService = {
         await setDoc(doc(db, SHARED_COLLECTION, template.docId), data, { merge: true });
         if (replacingImage && template.storagePath && template.storagePath !== storagePath) await deleteObject(storageRef(storage, template.storagePath)).catch(() => undefined);
         sharedCache = null;
-        return docToTemplate(template.docId, data, 'shared');
+        return { ...docToTemplate(template.docId, data, 'shared'), image: replacingImage ? input.dataUri : template.image };
     },
 
     deleteShared: async (template: SignTemplate): Promise<void> => {
