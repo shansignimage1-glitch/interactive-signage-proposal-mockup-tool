@@ -731,7 +731,10 @@ const App: React.FC = () => {
   useEffect(() => {
       if (!calibrationDraft) return;
       if (calibrationDraft.stage === 'place' && calibrationDraft.method) {
-          setToolMode(calibrationDraft.method === 'plane' ? 'calibrate_plane' : 'calibrate');
+          const calibrationTool = calibrationDraft.method === 'plane' ? 'calibrate_plane' : 'calibrate';
+          // Pan is a deliberate temporary navigation mode during calibration.
+          // Keep it selected until the user returns to Select & adjust.
+          if (toolMode !== 'pan' && toolMode !== calibrationTool) setToolMode(calibrationTool);
       } else if (toolMode === 'calibrate' || toolMode === 'calibrate_plane') {
           setToolMode('select');
       }

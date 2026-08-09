@@ -128,7 +128,7 @@ const CalibrationWizard: React.FC<CalibrationWizardProps> = ({
               <span className="rounded-full bg-gray-800 px-2 py-1 text-[11px] font-semibold text-gray-300">{placed}/{requiredPoints} points</span>
             </div>
             <p className="mt-1 text-sm text-gray-300">{instruction}</p>
-            <p className="mt-1 text-xs text-gray-500">Pinch to zoom. Large invisible touch targets make each point easier to grab.</p>
+            <p className="mt-1 text-xs text-gray-500">Pinch to zoom and move · choose Pan view to drag the photo · return to Select & adjust to place points.</p>
           </div>
         </div>
         <div className="mt-3 grid grid-cols-4 gap-2">
@@ -146,9 +146,16 @@ const CalibrationWizard: React.FC<CalibrationWizardProps> = ({
     );
   }
 
+  const isNavigableDetails = draft.stage === 'details';
+
   return (
-    <div className="fixed inset-0 z-[200] grid place-items-center bg-black/75 p-4 backdrop-blur-sm" onClick={onCancel}>
-      <div className="w-full max-w-lg rounded-2xl border border-gray-700 bg-gray-950 p-5 shadow-2xl" onClick={event => event.stopPropagation()}>
+    <div
+      className={isNavigableDetails
+        ? 'pointer-events-none fixed inset-0 z-[190] flex items-end justify-center p-4 lg:pl-[324px]'
+        : 'fixed inset-0 z-[200] grid place-items-center bg-black/75 p-4 backdrop-blur-sm'}
+      onClick={isNavigableDetails ? undefined : onCancel}
+    >
+      <div className={`pointer-events-auto w-full max-w-lg rounded-2xl border border-gray-700 bg-gray-950 p-5 shadow-2xl ${isNavigableDetails ? 'max-h-[min(72vh,620px)] overflow-y-auto border-amber-400/40 bg-gray-950/95 backdrop-blur-xl' : ''}`} onClick={event => event.stopPropagation()}>
         <div className="flex items-start justify-between gap-3">
           <div>
             <p className="text-xs font-bold uppercase tracking-[0.18em] text-amber-400">Set real-world scale</p>
@@ -179,6 +186,9 @@ const CalibrationWizard: React.FC<CalibrationWizardProps> = ({
 
         {draft.stage === 'details' && draft.method && (
           <>
+            <div className="mb-2 rounded-lg border border-blue-400/20 bg-blue-500/10 px-3 py-2 text-xs text-blue-100">
+              The photo remains live: drag empty space to pan, pinch or scroll to zoom, and use the controls on the right.
+            </div>
             <button onClick={() => patch({ stage: 'place' })} className="mt-3 flex min-h-11 items-center gap-1 text-sm text-gray-300 hover:text-white"><ArrowLeft className="h-4 w-4" /> Adjust points</button>
             <label className="mt-2 block text-xs font-bold uppercase tracking-wider text-gray-500">Reference object</label>
             <select value={draft.presetId} onChange={event => selectPreset(event.target.value)} className="mt-1 min-h-12 w-full rounded-xl border border-gray-700 bg-gray-900 px-3 text-sm text-white focus:border-blue-500 focus:outline-none">
