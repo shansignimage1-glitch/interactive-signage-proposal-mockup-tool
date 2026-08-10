@@ -40,8 +40,7 @@ const withTimeout = <T,>(promise: Promise<T>, timeoutMs: number, label: string):
   });
 const DEFAULT_AVATAR = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='32' height='32'%3E%3Crect width='32' height='32' rx='16' fill='%23374151'/%3E%3Ccircle cx='16' cy='12' r='5' fill='%239ca3af'/%3E%3Cpath d='M7 29c1-7 5-10 9-10s8 3 9 10' fill='%239ca3af'/%3E%3C/svg%3E";
 
-// Demo images — building facade + a clean SVG sign face
-const DEFAULT_BG ='https://images.unsplash.com/photo-1486325212027-8081e485255e?w=1920&h=1080&fit=crop&auto=format&q=80';
+// Neutral canvas shown until the user uploads a background photo.
 const BLANK_BG = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='1920' height='1080'%3E%3Crect width='1920' height='1080' fill='%23e5e7eb'/%3E%3C/svg%3E";
 // SVG sign face: deep-blue fascia with white channel letters
 const DEFAULT_FG = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='800' height='260'%3E%3Crect width='800' height='260' fill='%231e3a8a'/%3E%3Crect x='8' y='8' width='784' height='244' fill='none' stroke='%2393c5fd' stroke-width='4' rx='2'/%3E%3Ctext x='400' y='138' text-anchor='middle' dominant-baseline='middle' font-family='Arial Black%2CArial%2Csans-serif' font-size='88' font-weight='900' fill='white' letter-spacing='8'%3ESIGN IMAGE%3C/text%3E%3Ctext x='400' y='216' text-anchor='middle' dominant-baseline='middle' font-family='Arial%2Csans-serif' font-size='26' fill='%2393c5fd' letter-spacing='18'%3ESIGNAGE SOLUTIONS%3C/text%3E%3C/svg%3E";
@@ -68,7 +67,7 @@ const createDefaultSign = (id: string, cx: number, cy: number, index: number): S
 const createDefaultCanvas = (index: number): Canvas => ({
     id: `canvas-${Date.now()}`,
     name: `View ${index + 1}`,
-    backgroundImage: DEFAULT_BG,
+    backgroundImage: BLANK_BG,
     backgroundSize: { width: 1920, height: 1080 },
     signs: [],
     activeSignId: null,
@@ -77,6 +76,13 @@ const createDefaultCanvas = (index: number): Canvas => ({
     sheetTitle: `ELEVATION ${index + 1}`,
     sheetNumber: `A-${100 + index + 1}`
 });
+
+const renumberDefaultCanvases = (canvases: Canvas[]): Canvas[] => canvases.map((canvas, index) => ({
+    ...canvas,
+    name: /^View \d+$/.test(canvas.name) ? `View ${index + 1}` : canvas.name,
+    sheetTitle: /^ELEVATION \d+$/.test(canvas.sheetTitle) ? `ELEVATION ${index + 1}` : canvas.sheetTitle,
+    sheetNumber: /^A-\d+$/.test(canvas.sheetNumber) ? `A-${101 + index}` : canvas.sheetNumber,
+}));
 
 export type ToolMode = 'select' | 'pan' | 'draw_line' | 'draw_box' | 'calibrate' | 'calibrate_plane';
 
@@ -618,10 +624,14 @@ const App: React.FC = () => {
           notify('Project must have at least one view.', 'warning');
           return;
       }
-      const newCanvases = state.canvases.filter(c => c.id !== state.activeCanvasId);
+      const deletedIndex = state.canvases.findIndex(c => c.id === state.activeCanvasId);
+      const newCanvases = renumberDefaultCanvases(
+          state.canvases.filter(c => c.id !== state.activeCanvasId)
+      );
+      const nextActiveIndex = Math.min(Math.max(deletedIndex, 0), newCanvases.length - 1);
       updateStateWithHistory({
           canvases: newCanvases,
-          activeCanvasId: newCanvases[0].id
+          activeCanvasId: newCanvases[nextActiveIndex].id
       });
   };
 

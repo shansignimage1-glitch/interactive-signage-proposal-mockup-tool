@@ -41,6 +41,38 @@ test('projects can be explicitly saved, renamed, and permanently deleted', async
   });
   expect(cleanState).toEqual({ signs: 0, dimensions: 0, calibration: null, notes: '', references: 0, revisions: 0, populatedFields: 0 });
 
+  await page.getByRole('button', { name: 'View 1', exact: true }).click();
+  await page.getByRole('button', { name: 'Add New View' }).click();
+  await expect(page.getByRole('button', { name: 'View 2', exact: true })).toBeVisible();
+  await page.waitForTimeout(3_500);
+  const newView = await page.evaluate(async () => {
+    const id = localStorage.getItem('signagepro_guest_project_id');
+    const request = indexedDB.open('SignageProDB', 4);
+    const db = await new Promise<IDBDatabase>((resolve, reject) => { request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error); });
+    const get = db.transaction('projects', 'readonly').objectStore('projects').get(id!);
+    const project = await new Promise<any>((resolve, reject) => { get.onsuccess = () => resolve(get.result); get.onerror = () => reject(get.error); });
+    return project.canvases[1];
+  });
+  expect(newView.backgroundImage).toContain("fill='%23e5e7eb'");
+  expect(newView.signs).toHaveLength(0);
+  expect(newView.dimensions).toHaveLength(0);
+  expect(newView.calibration ?? null).toBeNull();
+
+  await page.getByRole('button', { name: 'View 2', exact: true }).click();
+  await page.getByRole('button', { name: 'View 1', exact: true }).click();
+  await page.getByTitle('Delete current view').click();
+  await expect(page.getByRole('button', { name: 'View 1', exact: true })).toBeVisible();
+  await page.waitForTimeout(3_500);
+  const viewsAfterDelete = await page.evaluate(async () => {
+    const id = localStorage.getItem('signagepro_guest_project_id');
+    const request = indexedDB.open('SignageProDB', 4);
+    const db = await new Promise<IDBDatabase>((resolve, reject) => { request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error); });
+    const get = db.transaction('projects', 'readonly').objectStore('projects').get(id!);
+    const project = await new Promise<any>((resolve, reject) => { get.onsuccess = () => resolve(get.result); get.onerror = () => reject(get.error); });
+    return project.canvases.map((canvas: any) => ({ name: canvas.name, sheetTitle: canvas.sheetTitle, sheetNumber: canvas.sheetNumber }));
+  });
+  expect(viewsAfterDelete).toEqual([{ name: 'View 1', sheetTitle: 'ELEVATION 1', sheetNumber: 'A-101' }]);
+
   await page.getByRole('button', { name: 'Manage projects' }).click();
   await expect(manager.getByText('Project Lifecycle Test', { exact: true })).toBeVisible();
 
