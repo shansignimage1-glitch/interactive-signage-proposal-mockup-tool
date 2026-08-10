@@ -13,9 +13,9 @@ export default defineConfig(() => {
       plugins: [
         react(), tailwindcss(),
         VitePWA({
-          // Prompt before reloading so an update cannot discard an open
-          // project or library form. PwaUpdatePrompt owns the registration.
-          registerType: 'prompt',
+          // Production fixes must replace stale installed-PWA bundles without
+          // relying on a dismissible prompt that can leave clients behind.
+          registerType: 'autoUpdate',
           includeAssets: ['icon.svg'],
           manifest: {
             name: 'SignagePro', short_name: 'SignagePro',
@@ -33,6 +33,8 @@ export default defineConfig(() => {
             globPatterns: ['**/*.{js,css,html,svg,png,woff2}'],
             maximumFileSizeToCacheInBytes: 1_500_000,
             cleanupOutdatedCaches: true,
+            skipWaiting: true,
+            clientsClaim: true,
           },
         }),
       ],

@@ -1697,7 +1697,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
           >{isCropProcessing ? 'Processing…' : 'Apply crop'}</button>
         </div>
       )}
-      {precisionLoupe && loupePosition && images.background && (
+      {precisionLoupe && loupePosition && (
         <div
           data-canvas-ui
           data-testid="precision-loupe"
@@ -1713,20 +1713,22 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
             boxShadow: `0 0 0 3px ${precisionLoupe.kind === 'calibration' ? '#f59e0b' : '#38bdf8'}, 0 18px 42px rgba(0, 0, 0, 0.55)`,
           }}
         >
-          <img
-            src={images.background}
-            alt=""
-            crossOrigin="anonymous"
-            className="absolute max-w-none select-none"
-            style={{
-              width: images.backgroundSize.width * loupeScale,
-              height: images.backgroundSize.height * loupeScale,
-              left: loupeCenter - precisionLoupe.point.x * loupeScale,
-              top: loupeCenter - precisionLoupe.point.y * loupeScale,
-              opacity: state.isNightMode ? 0.82 : 1,
-              filter: state.isNightMode ? 'brightness(0.32) contrast(1.32) saturate(0.72) hue-rotate(8deg)' : 'none',
-            }}
-          />
+          {images.background && (
+            <img
+              src={images.background}
+              alt=""
+              crossOrigin="anonymous"
+              className="absolute max-w-none select-none"
+              style={{
+                width: images.backgroundSize.width * loupeScale,
+                height: images.backgroundSize.height * loupeScale,
+                left: loupeCenter - precisionLoupe.point.x * loupeScale,
+                top: loupeCenter - precisionLoupe.point.y * loupeScale,
+                opacity: state.isNightMode ? 0.82 : 1,
+                filter: state.isNightMode ? 'brightness(0.32) contrast(1.32) saturate(0.72) hue-rotate(8deg)' : 'none',
+              }}
+            />
+          )}
           {state.isNightMode && <span className="absolute inset-0 bg-slate-950/20" />}
           <canvas
             ref={loupeCanvasRef}
@@ -1926,7 +1928,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
         
         {/* --- SCENE WRAPPER --- */}
         <div 
-            className="absolute inset-0 transition-transform duration-300 ease-in-out"
+            className="absolute inset-0 bg-white transition-transform duration-300 ease-in-out"
             style={{
                 transform: `translate(${sceneTx}px, ${sceneTy}px) scale(${sceneScale})`,
                 transformOrigin: '0 0',

@@ -40,8 +40,6 @@ const withTimeout = <T,>(promise: Promise<T>, timeoutMs: number, label: string):
   });
 const DEFAULT_AVATAR = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='32' height='32'%3E%3Crect width='32' height='32' rx='16' fill='%23374151'/%3E%3Ccircle cx='16' cy='12' r='5' fill='%239ca3af'/%3E%3Cpath d='M7 29c1-7 5-10 9-10s8 3 9 10' fill='%239ca3af'/%3E%3C/svg%3E";
 
-// Neutral canvas shown until the user uploads a background photo.
-const BLANK_BG = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='1920' height='1080'%3E%3Crect width='1920' height='1080' fill='%23e5e7eb'/%3E%3C/svg%3E";
 // SVG sign face: deep-blue fascia with white channel letters
 const DEFAULT_FG = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='800' height='260'%3E%3Crect width='800' height='260' fill='%231e3a8a'/%3E%3Crect x='8' y='8' width='784' height='244' fill='none' stroke='%2393c5fd' stroke-width='4' rx='2'/%3E%3Ctext x='400' y='138' text-anchor='middle' dominant-baseline='middle' font-family='Arial Black%2CArial%2Csans-serif' font-size='88' font-weight='900' fill='white' letter-spacing='8'%3ESIGN IMAGE%3C/text%3E%3Ctext x='400' y='216' text-anchor='middle' dominant-baseline='middle' font-family='Arial%2Csans-serif' font-size='26' fill='%2393c5fd' letter-spacing='18'%3ESIGNAGE SOLUTIONS%3C/text%3E%3C/svg%3E";
 
@@ -67,7 +65,7 @@ const createDefaultSign = (id: string, cx: number, cy: number, index: number): S
 const createDefaultCanvas = (index: number): Canvas => ({
     id: `canvas-${Date.now()}`,
     name: `View ${index + 1}`,
-    backgroundImage: BLANK_BG,
+    backgroundImage: '',
     backgroundSize: { width: 1920, height: 1080 },
     signs: [],
     activeSignId: null,
@@ -79,7 +77,7 @@ const createDefaultCanvas = (index: number): Canvas => ({
 
 const renumberDefaultCanvases = (canvases: Canvas[]): Canvas[] => canvases.map((canvas, index) => ({
     ...canvas,
-    name: /^View \d+$/.test(canvas.name) ? `View ${index + 1}` : canvas.name,
+    name: `View ${index + 1}`,
     sheetTitle: /^ELEVATION \d+$/.test(canvas.sheetTitle) ? `ELEVATION ${index + 1}` : canvas.sheetTitle,
     sheetNumber: /^A-\d+$/.test(canvas.sheetNumber) ? `A-${101 + index}` : canvas.sheetNumber,
 }));
@@ -87,39 +85,24 @@ const renumberDefaultCanvases = (canvases: Canvas[]): Canvas[] => canvases.map((
 export type ToolMode = 'select' | 'pan' | 'draw_line' | 'draw_box' | 'calibrate' | 'calibrate_plane';
 
 const DEFAULT_FIELDS: TitleBlockField[] = [
-    { id: '1', label: 'PROJECT TITLE', value: 'FASCIA SIGNAGE PROPOSAL', section: 'project' },
-    { id: '2', label: 'CLIENT', value: 'Sign Image Demo Client', section: 'project' },
-    { id: '3', label: 'ADDRESS', value: '1 Business Park, City Centre', section: 'project' },
-    { id: '4', label: 'DRAWN BY', value: 'Sign Image', section: 'drawing' },
+    { id: '1', label: 'PROJECT TITLE', value: '', section: 'project' },
+    { id: '2', label: 'CLIENT', value: '', section: 'project' },
+    { id: '3', label: 'ADDRESS', value: '', section: 'project' },
+    { id: '4', label: 'DRAWN BY', value: '', section: 'drawing' },
     { id: '5', label: 'CHECKED BY', value: '', section: 'drawing' },
-    { id: '6', label: 'DATE', value: new Date().toLocaleDateString(), section: 'drawing' },
-    { id: '7', label: 'SCALE', value: 'N.T.S.', section: 'drawing' },
-    { id: '8', label: 'SHEET TITLE', value: 'ELEVATION 1', section: 'sheet' },
-    { id: '9', label: 'SHEET NO.', value: 'A-101', section: 'sheet' },
+    { id: '6', label: 'DATE', value: '', section: 'drawing' },
+    { id: '7', label: 'SCALE', value: '', section: 'drawing' },
+    { id: '8', label: 'SHEET TITLE', value: '', section: 'sheet' },
+    { id: '9', label: 'SHEET NO.', value: '', section: 'sheet' },
 ];
 
 const getInitialState = (): MockupState => {
     const initialCanvas = createDefaultCanvas(0);
-    const signId = Date.now().toString();
-    // Position sign on building with subtle perspective warp — shows off the WebGL feature
-    initialCanvas.signs.push({
-        ...createDefaultSign(signId, 960, 400, 0),
-        corners: [
-            { x: 480, y: 310 },
-            { x: 1440, y: 328 },
-            { x: 1432, y: 508 },
-            { x: 488, y: 490 },
-        ],
-        extrusionAngle: 38,
-        extrusionDepth: 18,
-        sideColor: '#1e3a8a',
-    });
-    initialCanvas.activeSignId = signId;
 
     return {
         user: null,
         projectId: `proj_${Date.now()}`,
-        projectName: 'Sign Image Demo',
+        projectName: 'Untitled Project',
         canvases: [initialCanvas],
         activeCanvasId: initialCanvas.id,
         isNightMode: false,
@@ -133,9 +116,7 @@ const getInitialState = (): MockupState => {
             style: TITLE_BLOCK_TEMPLATES[0],
             logoImage: null,
             fields: DEFAULT_FIELDS,
-            revisions: [
-                { id: '1', rev: 'A', date: new Date().toLocaleDateString(), description: 'ISSUED FOR APPROVAL', drawnBy: 'JD' }
-            ]
+            revisions: []
         },
         savedTemplates: [],
         notes: '',
@@ -149,7 +130,7 @@ const getInitialState = (): MockupState => {
 const createCleanProjectState = (user: UserProfile | null, isOnline: boolean): MockupState => {
     const base = getInitialState();
     const canvas = createDefaultCanvas(0);
-    canvas.backgroundImage = BLANK_BG;
+    canvas.backgroundImage = '';
     canvas.signs = [];
     canvas.activeSignId = null;
     canvas.dimensions = [];

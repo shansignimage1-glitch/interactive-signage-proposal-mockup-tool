@@ -28,6 +28,14 @@ const transform = (page: Page) => page.locator('#export-target').evaluate(elemen
   return { x: matrix.m41, y: matrix.m42, scale: matrix.a };
 });
 
+const addPlaceholderSign = async (page: Page) => {
+  const openAllControls = page.getByRole('button', { name: 'Open all controls' });
+  if (await openAllControls.isVisible()) await openAllControls.click();
+  const signsHeader = page.getByTestId('controls-panel').getByRole('heading', { name: 'Signs' }).locator('..');
+  await signsHeader.getByRole('button').last().click();
+  await expect(page.locator('[data-testid^="sign-hit-area-"]')).toHaveCount(1);
+};
+
 const calibrateCanvas = async (page: Page) => {
   const openAllControls = page.getByRole('button', { name: 'Open all controls' });
   if (await openAllControls.isVisible()) await openAllControls.click();
@@ -49,6 +57,7 @@ test('touch drawing and dimension resize handles show a finger-offset precision 
 
   await page.goto('/');
   await page.getByRole('button', { name: 'Continue as Guest' }).click();
+  await addPlaceholderSign(page);
   await page.evaluate(() => {
     Element.prototype.setPointerCapture = () => undefined;
     Element.prototype.releasePointerCapture = () => undefined;
@@ -217,6 +226,7 @@ test('touch gestures pan and pinch the canvas without changing project coordinat
 test('view lock freezes pan and zoom while sign editing stays interactive', async ({ page }) => {
   await page.goto('/');
   await page.getByRole('button', { name: 'Continue as Guest' }).click();
+  await addPlaceholderSign(page);
   await page.evaluate(() => {
     Element.prototype.setPointerCapture = () => undefined;
     Element.prototype.releasePointerCapture = () => undefined;
@@ -278,6 +288,7 @@ test('view lock freezes pan and zoom while sign editing stays interactive', asyn
 test('sign controls have iPad-sized targets and move on the first drag', async ({ page }) => {
   await page.goto('/');
   await page.getByRole('button', { name: 'Continue as Guest' }).click();
+  await addPlaceholderSign(page);
   await page.getByRole('button', { name: 'Select & adjust' }).click();
   await page.evaluate(() => {
     Element.prototype.setPointerCapture = () => undefined;
@@ -336,6 +347,7 @@ test('desktop Select & adjust handles show a precision magnifier', async ({ page
 
   await page.goto('/');
   await page.getByRole('button', { name: 'Continue as Guest' }).click();
+  await addPlaceholderSign(page);
   await page.getByRole('button', { name: 'Select & adjust' }).click();
 
   const loupe = page.getByTestId('precision-loupe');
@@ -459,6 +471,7 @@ test('background upload retains its full source dimensions for editing', async (
 
   await page.goto('/');
   await page.getByRole('button', { name: 'Continue as Guest' }).click();
+  await addPlaceholderSign(page);
   const moreControls = page.getByRole('button', { name: 'Open all controls' });
   if (await moreControls.isVisible()) await moreControls.click();
   await page.getByRole('button', { name: 'New Image / Camera' }).click();
@@ -546,6 +559,7 @@ test('uploaded PNG signs retain enough source pixels for sharp canvas rendering'
 
   await page.goto('/');
   await page.getByRole('button', { name: 'Continue as Guest' }).click();
+  await addPlaceholderSign(page);
   const sourceWidth = 4096;
   const sourceHeight = 1024;
   const pngDataUrl = await page.evaluate(({ width, height }) => {

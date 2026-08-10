@@ -4,6 +4,9 @@ test('projects can be explicitly saved, renamed, and permanently deleted', async
   test.skip(testInfo.project.name !== 'desktop-chromium', 'Project persistence lifecycle is covered once.');
   await page.goto('/');
   await page.getByRole('button', { name: 'Continue as Guest' }).click();
+  await expect(page.locator('[data-testid^="sign-hit-area-"]')).toHaveCount(0);
+  await expect(page.getByAltText('Background')).toHaveCount(0);
+  await expect(page.getByTestId('controls-panel').getByText('Untitled Project', { exact: true })).toBeVisible();
 
   await page.getByRole('button', { name: 'Manage projects' }).click();
   const manager = page.getByRole('heading', { name: 'Project Manager' }).locator('..').locator('..');
@@ -53,12 +56,13 @@ test('projects can be explicitly saved, renamed, and permanently deleted', async
     const project = await new Promise<any>((resolve, reject) => { get.onsuccess = () => resolve(get.result); get.onerror = () => reject(get.error); });
     return project.canvases[1];
   });
-  expect(newView.backgroundImage).toContain("fill='%23e5e7eb'");
+  expect(newView.backgroundImage).toBe('');
   expect(newView.signs).toHaveLength(0);
   expect(newView.dimensions).toHaveLength(0);
   expect(newView.calibration ?? null).toBeNull();
 
-  await page.getByRole('button', { name: 'View 2', exact: true }).click();
+  await page.getByPlaceholder('View Name').fill('Rear Facade');
+  await page.getByRole('button', { name: 'Rear Facade', exact: true }).click();
   await page.getByRole('button', { name: 'View 1', exact: true }).click();
   await page.getByTitle('Delete current view').click();
   await expect(page.getByRole('button', { name: 'View 1', exact: true })).toBeVisible();
