@@ -12,7 +12,7 @@ const ProjectManager = React.lazy(() => import('./components/ProjectManager'));
 const ElementStudio = React.lazy(() => import('./components/ElementStudio'));
 const DriveSettings = React.lazy(() => import('./components/DriveSettings'));
 const AccountSettings = React.lazy(() => import('./components/AccountSettings'));
-import { MockupState, AppImages, Point, Sign, Dimension, TitleBlock, TitleBlockField, Canvas, Calibration, SignElement, Size, ConnectorStatus, CloudProvider } from './types';
+import { MockupState, AppImages, Point, Sign, Dimension, TitleBlock, TitleBlockField, Canvas, Calibration, SignElement, Size, ConnectorStatus, CloudProvider, UserProfile } from './types';
 import { getActiveConnector, getPreferredProvider, setConnectorUid, connectors, getConnectorForRef } from './services/driveConnectors';
 import { distance } from './utils/math';
 import { measureLine, measureBox, getMmPerPx } from './utils/measure';
@@ -42,6 +42,7 @@ const DEFAULT_AVATAR = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/
 
 // Demo images — building facade + a clean SVG sign face
 const DEFAULT_BG ='https://images.unsplash.com/photo-1486325212027-8081e485255e?w=1920&h=1080&fit=crop&auto=format&q=80';
+const BLANK_BG = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='1920' height='1080'%3E%3Crect width='1920' height='1080' fill='%23e5e7eb'/%3E%3C/svg%3E";
 // SVG sign face: deep-blue fascia with white channel letters
 const DEFAULT_FG = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='800' height='260'%3E%3Crect width='800' height='260' fill='%231e3a8a'/%3E%3Crect x='8' y='8' width='784' height='244' fill='none' stroke='%2393c5fd' stroke-width='4' rx='2'/%3E%3Ctext x='400' y='138' text-anchor='middle' dominant-baseline='middle' font-family='Arial Black%2CArial%2Csans-serif' font-size='88' font-weight='900' fill='white' letter-spacing='8'%3ESIGN IMAGE%3C/text%3E%3Ctext x='400' y='216' text-anchor='middle' dominant-baseline='middle' font-family='Arial%2Csans-serif' font-size='26' fill='%2393c5fd' letter-spacing='18'%3ESIGNAGE SOLUTIONS%3C/text%3E%3C/svg%3E";
 
@@ -136,6 +137,41 @@ const getInitialState = (): MockupState => {
         lastSaved: Date.now(),
         isOnline: navigator.onLine,
         isSyncing: false
+    };
+};
+
+const createCleanProjectState = (user: UserProfile | null, isOnline: boolean): MockupState => {
+    const base = getInitialState();
+    const canvas = createDefaultCanvas(0);
+    canvas.backgroundImage = BLANK_BG;
+    canvas.signs = [];
+    canvas.activeSignId = null;
+    canvas.dimensions = [];
+    canvas.activeDimensionId = null;
+    canvas.calibration = null;
+    canvas.sheetTitle = '';
+    canvas.sheetNumber = '';
+    return {
+        ...base,
+        user,
+        projectId: `proj_${Date.now()}`,
+        projectName: 'Untitled Project',
+        canvases: [canvas],
+        activeCanvasId: canvas.id,
+        titleBlock: {
+            ...base.titleBlock,
+            enabled: false,
+            logoImage: null,
+            fields: base.titleBlock.fields.map(field => ({ ...field, value: '' })),
+            revisions: [],
+        },
+        savedTemplates: [],
+        notes: '',
+        referenceImages: [],
+        lastSaved: Date.now(),
+        isOnline,
+        isSyncing: false,
+        cloudRevision: undefined,
     };
 };
 
@@ -957,6 +993,43 @@ const App: React.FC = () => {
       triggerBackendSync(newState);
   };
 
+  const handleProjectRename = async (projectId: string, name: string) => {
+      const trimmedName = name.trim();
+      if (!trimmedName) throw new Error('Project name is required.');
+      const stored = projectId === state.projectId ? state : await StorageService.loadProjectLocal(projectId);
+      if (!stored) throw new Error('Project could not be found.');
+      const renamed = { ...stored, user: state.user, projectName: trimmedName, lastSaved: Date.now() };
+      await StorageService.saveProjectLocal(renamed);
+      if (projectId === state.projectId) setState(renamed);
+      if (state.user) triggerBackendSync(renamed);
+  };
+
+  const handleProjectDelete = async (projectId: string) => {
+      await StorageService.deleteProjectLocal(projectId);
+      if (state.user && !state.user.uid.startsWith('guest_')) {
+          await StorageService.deleteProjectCloud(state.user.uid, projectId);
+      }
+      if (projectId !== state.projectId) return;
+
+      if (syncTimeoutRef.current) clearTimeout(syncTimeoutRef.current);
+      const replacement = { ...getInitialState(), user: state.user, isOnline: state.isOnline, isSyncing: false };
+      if (state.user?.uid.startsWith('guest_')) localStorage.setItem(GUEST_PROJECT_ID_KEY, replacement.projectId);
+      startSession(replacement);
+      await StorageService.saveProjectLocal(replacement);
+  };
+
+  const handleNewProject = async () => {
+      if (syncTimeoutRef.current) clearTimeout(syncTimeoutRef.current);
+      setCalibrationDraft(null);
+      setShowCalibrationReference(false);
+      setIsCropping(false);
+      const cleanState = createCleanProjectState(state.user, state.isOnline);
+      if (state.user?.uid.startsWith('guest_')) localStorage.setItem(GUEST_PROJECT_ID_KEY, cleanState.projectId);
+      startSession(cleanState);
+      await StorageService.saveProjectLocal(cleanState);
+      notify('New clean project started.', 'success');
+  };
+
   // --- Render ---
   if (isAuthLoading) {
       return (
@@ -1185,6 +1258,9 @@ const App: React.FC = () => {
                 currentState={state}
                 onLoadProject={handleProjectLoad}
                 onSaveProject={handleProjectSave}
+                onRenameProject={handleProjectRename}
+                onDeleteProject={handleProjectDelete}
+                onNewProject={handleNewProject}
             />
           </Suspense>
       )}

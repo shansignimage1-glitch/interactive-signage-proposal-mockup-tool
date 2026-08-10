@@ -631,3 +631,45 @@ test('background upload can optionally level a drawn horizontal at full editing 
   await page.getByTestId('confirm-image-crop').click();
   await expect(page.getByText('Select Image Source')).toBeHidden();
 });
+
+test('photo location requires confirmation before populating the title-block address', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-chromium', 'The permission and confirmation flow is covered once.');
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, 'geolocation', {
+      configurable: true,
+      value: { getCurrentPosition: (success: PositionCallback) => success({ coords: { latitude: -33.9249, longitude: 18.4241, accuracy: 8 } } as GeolocationPosition) },
+    });
+  });
+  await page.route('**/api/geocode', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({ address: '1 Test Street, Cape Town, South Africa', placeId: 'place-1' }),
+  }));
+
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Continue as Guest' }).click();
+  const openAllControls = page.getByRole('button', { name: 'Open all controls' });
+  if (await openAllControls.isVisible()) await openAllControls.click();
+  await page.getByRole('button', { name: /New Image \/ Camera/ }).click();
+  const locationToggle = page.getByRole('switch', { name: 'Use photo location' });
+  await locationToggle.click();
+  await expect(locationToggle).toHaveAttribute('aria-checked', 'true');
+
+  const image = await page.evaluate(() => {
+    const canvas = document.createElement('canvas');
+    canvas.width = 800; canvas.height = 500;
+    const context = canvas.getContext('2d')!;
+    context.fillStyle = '#cbd5e1'; context.fillRect(0, 0, canvas.width, canvas.height);
+    return canvas.toDataURL('image/png');
+  });
+  await page.locator('input[type="file"][accept="image/*"]').setInputFiles({ name: 'no-gps.png', mimeType: 'image/png', buffer: Buffer.from(image.split(',')[1], 'base64') });
+  const panel = page.getByTestId('photo-location-panel');
+  await expect(panel).toContainText('no embedded GPS');
+  await panel.getByRole('button', { name: 'Use current location' }).click();
+  const address = panel.getByRole('textbox', { name: 'Detected photo address' });
+  await expect(address).toHaveValue('1 Test Street, Cape Town, South Africa');
+  await panel.getByRole('button', { name: 'Use address' }).click();
+  await expect(panel.getByRole('button', { name: 'Address confirmed' })).toBeVisible();
+  await page.getByTestId('confirm-image-crop').click();
+  await expect(page.getByText('Title-block address updated from the confirmed photo location.')).toBeVisible();
+});

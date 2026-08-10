@@ -10,7 +10,7 @@ SignagePro is a React 19 proposal and mockup application for signage companies. 
 - The installable PWA caches the app shell; offline signed-in edits are queued in IndexedDB and uploaded when connectivity returns.
 - The dedicated Firebase project `sunny-ship-437805-c5` provides Google authentication, Firestore metadata and Firebase Storage fallback. Never point this app at the shared `signimage-cc` project.
 - Optional Google Drive, OneDrive and Dropbox connectors store user-owned project images and exports.
-- Vercel functions under `api/` proxy Gemini requests so the API key never enters the browser bundle.
+- Vercel functions under `api/` proxy Gemini and Google Maps requests so server API keys never enter the browser bundle.
 - html2canvas and jsPDF are bundled and dynamically imported only during export.
 - Optional Sentry browser monitoring is dynamically loaded when `VITE_SENTRY_DSN` is set.
 
@@ -26,6 +26,7 @@ Copy `.env.example` to `.env.local`.
 | `VITE_SENTRY_DSN` | browser | Optional error-reporting DSN |
 | `VITE_APP_VERSION` | browser | Release identifier sent to monitoring |
 | `GEMINI_API_KEY` | server only | Vercel AI functions; never prefix with `VITE_` |
+| `GOOGLE_MAPS_API_KEY` | server only | Google Maps Geocoding API v4 for confirmed photo-location addresses |
 
 ## Firebase and OAuth setup
 
@@ -38,6 +39,8 @@ firebase deploy --only firestore:rules,firestore:indexes,storage
 Cloud-drive registrations:
 
 - Google: web OAuth client with `drive.file`; add localhost and production JavaScript origins.
+
+For photo-address lookup, enable **Geocoding API** in Google Cloud, restrict the key to that API, and add `GOOGLE_MAPS_API_KEY` to Vercel Production and Preview environments. The browser sends only coordinates to the authenticated server endpoint; uploaded photo data remains local.
 - Microsoft: Entra SPA with `Files.ReadWrite.AppFolder` and `User.Read`; add exact SPA redirect URLs.
 - Dropbox: scoped App Folder application with `files.content.read` and `files.content.write`; add exact redirect URLs.
 

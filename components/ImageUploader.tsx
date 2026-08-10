@@ -1,10 +1,11 @@
 
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Camera, Upload, X, Check, RotateCcw, ZoomIn, ZoomOut, Move, Gauge, ScanLine } from 'lucide-react';
+import { Camera, Upload, X, Check, RotateCcw, ZoomIn, ZoomOut, Move, Gauge, ScanLine, MapPin, LocateFixed } from 'lucide-react';
 import { notify } from '../services/toast';
 import { reportError } from '../services/monitoring';
 import { MAX_SOURCE_BYTES, MAX_SOURCE_PIXELS } from '../services/imageProcessing';
 import { levelCorrectionDegrees, levelImage } from '../services/imageLeveling';
+import { coordinatesFromPhoto, currentCoordinates, reverseGeocode } from '../services/PhotoLocationService';
 
 interface ImageUploaderProps {
   isOpen: boolean;
@@ -13,6 +14,8 @@ interface ImageUploaderProps {
   preserveSourcePixels?: boolean;
   maxOutputDimension?: number;
   enableLeveling?: boolean;
+  enableLocation?: boolean;
+  onAddressReady?: (address: string) => void;
 }
 
 type Step = 'select' | 'camera' | 'level' | 'crop';
@@ -31,6 +34,8 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({
   preserveSourcePixels = false,
   maxOutputDimension = 1024,
   enableLeveling = false,
+  enableLocation = false,
+  onAddressReady,
 }) => {
   const [step, setStep] = useState<Step>('select');
   const [sourceImage, setSourceImage] = useState<string | null>(null);
@@ -41,6 +46,11 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({
   const [deviceRoll, setDeviceRoll] = useState<number | null>(null);
   const [levelLine, setLevelLine] = useState<{ start: Point; end: Point } | null>(null);
   const [isDrawingLevel, setIsDrawingLevel] = useState(false);
+  const [usePhotoLocation, setUsePhotoLocation] = useState(false);
+  const [locationStatus, setLocationStatus] = useState<'idle' | 'locating' | 'ready' | 'missing' | 'error'>('idle');
+  const [locationMessage, setLocationMessage] = useState('');
+  const [address, setAddress] = useState('');
+  const [addressConfirmed, setAddressConfirmed] = useState(false);
   
   // Camera Refs
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -79,6 +89,11 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({
       setDeviceRoll(null);
       setLevelLine(null);
       setIsDrawingLevel(false);
+      setUsePhotoLocation(false);
+      setLocationStatus('idle');
+      setLocationMessage('');
+      setAddress('');
+      setAddressConfirmed(false);
     }
   }, [isOpen]);
 
@@ -104,6 +119,38 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({
     setLevelPhoto(next);
   };
 
+  const resolveCoordinates = async (coordinates: { latitude: number; longitude: number; accuracy?: number }, source: 'photo' | 'device') => {
+    setLocationStatus('locating');
+    setLocationMessage(source === 'photo' ? 'Reading the photo location…' : 'Getting the device location…');
+    setAddressConfirmed(false);
+    try {
+      const resolved = await reverseGeocode(coordinates, source);
+      setAddress(resolved.address);
+      setLocationStatus('ready');
+      setLocationMessage(source === 'photo' ? 'Address found in the photo GPS data.' : 'Address found from the device location.');
+    } catch (error) {
+      setLocationStatus('error');
+      setLocationMessage(error instanceof Error ? error.message : 'The address could not be determined.');
+    }
+  };
+
+  const useCurrentLocation = async () => {
+    setLocationStatus('locating');
+    setLocationMessage('Waiting for location permission…');
+    try { await resolveCoordinates(await currentCoordinates(), 'device'); }
+    catch (error) {
+      setLocationStatus('error');
+      setLocationMessage(error instanceof Error ? error.message : 'The current location could not be determined.');
+    }
+  };
+
+  const togglePhotoLocation = () => {
+    const next = !usePhotoLocation;
+    setUsePhotoLocation(next);
+    setAddressConfirmed(false);
+    if (!next) { setLocationStatus('idle'); setLocationMessage(''); setAddress(''); }
+  };
+
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
       const file = e.target.files[0];
@@ -113,6 +160,18 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({
         return;
       }
       const selectionGeneration = ++processingGenerationRef.current;
+      if (usePhotoLocation) {
+        setLocationStatus('locating');
+        setLocationMessage('Checking the photo for GPS coordinates…');
+        void coordinatesFromPhoto(file).then(coordinates => {
+          if (processingGenerationRef.current !== selectionGeneration) return;
+          if (coordinates) void resolveCoordinates(coordinates, 'photo');
+          else {
+            setLocationStatus('missing');
+            setLocationMessage('This photo has no embedded GPS location. You can use the device location instead.');
+          }
+        });
+      }
       imageRef.current = null;
       setIsDecoding(true);
       const reader = new FileReader();
@@ -141,6 +200,7 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({
         return;
       }
       setVideoStream(stream);
+      if (usePhotoLocation) void useCurrentLocation();
       setStep('camera');
       setTimeout(() => {
         if (processingGenerationRef.current === cameraGeneration && videoRef.current) {
@@ -571,6 +631,7 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({
     // full frame is selected. This avoids a second source-sized canvas and the
     // large PNG expansion that would otherwise occur for phone JPEGs.
     if (preserveSourcePixels && isFullFrame && sourceImage && /^data:image\/(?:png|jpe?g|webp|avif);/i.test(sourceImage)) {
+        if (addressConfirmed && address.trim()) onAddressReady?.(address.trim());
         onImageReady(sourceImage);
         onClose();
         return;
@@ -625,6 +686,7 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({
             }, outputMime, 0.96);
         });
         if (processingGenerationRef.current !== processingGeneration) return;
+        if (addressConfirmed && address.trim()) onAddressReady?.(address.trim());
         onImageReady(result);
         onClose();
     } catch (error) {
@@ -674,6 +736,22 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({
                   <span aria-hidden="true" className={`relative h-6 w-11 rounded-full transition-colors ${levelPhoto ? 'bg-amber-400' : 'bg-gray-600'}`}><span className={`absolute top-1 h-4 w-4 rounded-full bg-white shadow transition-transform ${levelPhoto ? 'translate-x-6' : 'translate-x-1'}`} /></span>
                 </button>
               )}
+              {enableLocation && (
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={usePhotoLocation}
+                  aria-label="Use photo location"
+                  onClick={togglePhotoLocation}
+                  className={`flex min-h-14 items-center justify-between rounded-xl border px-4 py-3 text-left transition-all ${usePhotoLocation ? 'border-emerald-400 bg-emerald-400/10 shadow-[0_0_24px_rgba(52,211,153,.12)]' : 'border-gray-600 bg-gray-900/60 hover:border-gray-500'}`}
+                >
+                  <span className="flex items-center gap-3">
+                    <span className={`grid h-9 w-9 place-items-center rounded-lg ${usePhotoLocation ? 'bg-emerald-400 text-gray-950' : 'bg-gray-700 text-gray-300'}`}><MapPin className="h-5 w-5" /></span>
+                    <span><strong className="block text-sm text-white">Use photo location</strong><span className="block text-xs text-gray-400">Suggest the title-block address</span></span>
+                  </span>
+                  <span aria-hidden="true" className={`relative h-6 w-11 rounded-full transition-colors ${usePhotoLocation ? 'bg-emerald-400' : 'bg-gray-600'}`}><span className={`absolute top-1 h-4 w-4 rounded-full bg-white shadow transition-transform ${usePhotoLocation ? 'translate-x-6' : 'translate-x-1'}`} /></span>
+                </button>
+              )}
               <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 sm:gap-6">
               <label className="group flex min-h-28 cursor-pointer flex-col items-center justify-center gap-3 rounded-xl border-2 border-dashed border-gray-600 bg-gray-700/50 p-4 transition-all hover:border-blue-500 hover:bg-gray-700 sm:gap-4 sm:p-8">
                 <div className="p-4 bg-gray-800 rounded-full group-hover:bg-blue-600 transition-colors">
@@ -716,6 +794,27 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({
                    <div className="w-12 h-12 rounded-full bg-white" />
                  </button>
                </div>
+            </div>
+          )}
+
+          {(step === 'level' || step === 'crop') && usePhotoLocation && (
+            <div data-testid="photo-location-panel" className="mb-3 w-full rounded-xl border border-emerald-400/25 bg-emerald-950/25 p-3">
+              <div className="flex items-start gap-3">
+                <span className={`grid h-9 w-9 shrink-0 place-items-center rounded-lg ${addressConfirmed ? 'bg-emerald-400 text-gray-950' : 'bg-gray-900 text-emerald-300'}`}><MapPin className="h-5 w-5" /></span>
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center justify-between gap-2"><p className="text-sm font-semibold text-white">Photo address</p>{locationStatus === 'locating' && <span className="text-[10px] font-bold uppercase tracking-wider text-emerald-300">Locating…</span>}</div>
+                  <p className="mt-0.5 text-xs text-gray-400">{locationMessage || 'Location will be used only after you confirm the address.'}</p>
+                  {locationStatus === 'ready' && (
+                    <div className="mt-2 flex flex-col gap-2 sm:flex-row">
+                      <input aria-label="Detected photo address" value={address} onChange={event => { setAddress(event.target.value); setAddressConfirmed(false); }} className="min-h-10 flex-1 rounded-lg border border-gray-600 bg-gray-950 px-3 text-sm text-white outline-none focus:border-emerald-400" />
+                      <button type="button" onClick={() => setAddressConfirmed(true)} disabled={!address.trim()} className={`min-h-10 rounded-lg px-4 text-sm font-bold transition ${addressConfirmed ? 'bg-emerald-950 text-emerald-300 ring-1 ring-emerald-400/40' : 'bg-emerald-400 text-gray-950 hover:bg-emerald-300'} disabled:opacity-40`}>{addressConfirmed ? 'Address confirmed' : 'Use address'}</button>
+                    </div>
+                  )}
+                  {(locationStatus === 'missing' || locationStatus === 'error') && (
+                    <button type="button" onClick={useCurrentLocation} className="mt-2 inline-flex min-h-9 items-center gap-2 rounded-lg border border-emerald-400/35 bg-gray-900 px-3 text-xs font-semibold text-emerald-300 hover:bg-emerald-950"><LocateFixed className="h-4 w-4" /> Use current location</button>
+                  )}
+                </div>
+              </div>
             </div>
           )}
 

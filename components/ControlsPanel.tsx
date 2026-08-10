@@ -332,6 +332,14 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
     }
   };
 
+  const handlePhotoAddressReady = (address: string) => {
+    const fields = state.titleBlock.fields.map(field =>
+      field.label.trim().toUpperCase() === 'ADDRESS' ? { ...field, value: address } : field
+    );
+    updateStateWithHistory({ titleBlock: { ...state.titleBlock, fields } });
+    notify('Title-block address updated from the confirmed photo location.', 'success');
+  };
+
   const mapCategoryToType = (cat: string): SignType => {
       const c = cat.toLowerCase();
       if (c.includes('projecting')) return 'blade_sign';
@@ -586,10 +594,12 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
           <div className="flex items-center gap-1 flex-shrink-0">
              <button 
                 onClick={onOpenProjectManager} 
-                className="p-1.5 text-blue-400 hover:text-white hover:bg-gray-700 transition-colors rounded"
+                aria-label="Manage projects"
+                className="inline-flex min-h-9 items-center gap-1.5 rounded-lg px-2 text-blue-300 transition-colors hover:bg-gray-700 hover:text-white"
                 title="Manage Projects"
              >
                 <FolderOpen className="w-4 h-4" />
+                <span className="hidden text-xs font-semibold xl:inline">Projects</span>
              </button>
              <div className="w-px h-4 bg-gray-600 mx-1"></div>
              <button 
@@ -1433,6 +1443,8 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
         preserveSourcePixels={uploadTarget === 'background'}
         maxOutputDimension={uploadTarget === 'sign' ? 4096 : 1024}
         enableLeveling={uploadTarget === 'background'}
+        enableLocation={uploadTarget === 'background'}
+        onAddressReady={handlePhotoAddressReady}
       />
       
       <SignLibrary
