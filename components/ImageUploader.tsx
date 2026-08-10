@@ -1,9 +1,10 @@
 
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Camera, Upload, X, Check, RotateCcw, ZoomIn, ZoomOut, Move } from 'lucide-react';
+import { Camera, Upload, X, Check, RotateCcw, ZoomIn, ZoomOut, Move, Gauge, ScanLine } from 'lucide-react';
 import { notify } from '../services/toast';
 import { reportError } from '../services/monitoring';
 import { MAX_SOURCE_BYTES, MAX_SOURCE_PIXELS } from '../services/imageProcessing';
+import { levelCorrectionDegrees, levelImage } from '../services/imageLeveling';
 
 interface ImageUploaderProps {
   isOpen: boolean;
@@ -11,9 +12,10 @@ interface ImageUploaderProps {
   onImageReady: (dataUrl: string) => void;
   preserveSourcePixels?: boolean;
   maxOutputDimension?: number;
+  enableLeveling?: boolean;
 }
 
-type Step = 'select' | 'camera' | 'crop';
+type Step = 'select' | 'camera' | 'level' | 'crop';
 
 interface Rect { x: number; y: number; w: number; h: number; }
 interface Point { x: number; y: number; }
@@ -28,12 +30,17 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({
   onImageReady,
   preserveSourcePixels = false,
   maxOutputDimension = 1024,
+  enableLeveling = false,
 }) => {
   const [step, setStep] = useState<Step>('select');
   const [sourceImage, setSourceImage] = useState<string | null>(null);
   const [videoStream, setVideoStream] = useState<MediaStream | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isDecoding, setIsDecoding] = useState(false);
+  const [levelPhoto, setLevelPhoto] = useState(false);
+  const [deviceRoll, setDeviceRoll] = useState<number | null>(null);
+  const [levelLine, setLevelLine] = useState<{ start: Point; end: Point } | null>(null);
+  const [isDrawingLevel, setIsDrawingLevel] = useState(false);
   
   // Camera Refs
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -68,6 +75,10 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({
       setPan({ x: 0, y: 0 });
       setIsProcessing(false);
       setIsDecoding(false);
+      setLevelPhoto(false);
+      setDeviceRoll(null);
+      setLevelLine(null);
+      setIsDrawingLevel(false);
     }
   }, [isOpen]);
 
@@ -76,6 +87,21 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({
       videoStream.getTracks().forEach(track => track.stop());
       setVideoStream(null);
     }
+  };
+
+  const toggleLevelPhoto = async () => {
+    const next = !levelPhoto;
+    if (next) {
+      const orientation = DeviceOrientationEvent as typeof DeviceOrientationEvent & { requestPermission?: () => Promise<'granted' | 'denied'> };
+      if (orientation.requestPermission) {
+        try {
+          if (await orientation.requestPermission() !== 'granted') notify('Motion permission was not granted. You can still level the photo after capture.', 'info');
+        } catch {
+          notify('Live level is unavailable, but post-capture leveling will still work.', 'info');
+        }
+      }
+    }
+    setLevelPhoto(next);
   };
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -94,7 +120,7 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({
         if (processingGenerationRef.current !== selectionGeneration) return;
         if (typeof evt.target?.result === 'string') {
           setSourceImage(evt.target.result);
-          setStep('crop');
+          setStep(levelPhoto ? 'level' : 'crop');
         }
       };
       reader.onerror = () => {
@@ -142,7 +168,7 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({
         ctx.drawImage(vid, 0, 0);
         setSourceImage(canvas.toDataURL('image/jpeg', 0.98));
         stopCamera();
-        setStep('crop');
+        setStep(levelPhoto ? 'level' : 'crop');
       }
     }
   };
@@ -163,9 +189,14 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({
     };
   }, [pan, zoom]);
 
+  const screenToImage = useCallback((point: Point, canvasW: number, canvasH: number, imgW: number, imgH: number) => ({
+    x: Math.max(0, Math.min(imgW, (point.x - canvasW / 2 - pan.x) / zoom + imgW / 2)),
+    y: Math.max(0, Math.min(imgH, (point.y - canvasH / 2 - pan.y) / zoom + imgH / 2)),
+  }), [pan, zoom]);
+
   // Initialize Canvas & Image
   useEffect(() => {
-    if (step === 'crop' && sourceImage) {
+    if ((step === 'crop' || step === 'level') && sourceImage) {
       const decodeGeneration = processingGenerationRef.current;
       const img = new Image();
       img.onload = () => {
@@ -200,16 +231,13 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({
            setZoom(fitZoom);
            setPan({ x: 0, y: 0 });
 
-            // Start with the complete source selected. Cropping must be an
-            // explicit user choice; silently trimming the image discards pixels.
-            const cw = img.width;
-            const ch = img.height;
-            setCropRect({
-                x: 0,
-                y: 0,
-                w: cw,
-                h: ch
-            });
+            if (step === 'crop') {
+              // Start with the complete source selected. Cropping must be an
+              // explicit user choice; silently trimming the image discards pixels.
+              setCropRect({ x: 0, y: 0, w: img.width, h: img.height });
+            } else {
+              setLevelLine(null);
+            }
             setIsDecoding(false);
         }
       };
@@ -224,6 +252,20 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({
       img.src = sourceImage;
     }
   }, [step, sourceImage]);
+
+  useEffect(() => {
+    if (step !== 'camera' || !levelPhoto) { setDeviceRoll(null); return; }
+    const updateRoll = (event: DeviceOrientationEvent) => {
+      if (typeof event.gamma !== 'number') return;
+      const screenAngle = window.screen.orientation?.angle ?? 0;
+      const roll = Math.abs(screenAngle) === 90 && typeof event.beta === 'number'
+        ? (screenAngle === 90 ? event.beta : -event.beta)
+        : event.gamma;
+      setDeviceRoll(Math.max(-45, Math.min(45, roll)));
+    };
+    window.addEventListener('deviceorientation', updateRoll, true);
+    return () => window.removeEventListener('deviceorientation', updateRoll, true);
+  }, [levelPhoto, step]);
 
   // Render Loop
   useEffect(() => {
@@ -282,6 +324,51 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({
 
   }, [step, cropRect, zoom, pan]);
 
+  useEffect(() => {
+    if (step !== 'level' || !imageRef.current || !canvasRef.current) return;
+    const canvas = canvasRef.current;
+    const context = canvas.getContext('2d');
+    const image = imageRef.current;
+    if (!context) return;
+    context.clearRect(0, 0, canvas.width, canvas.height);
+    context.save();
+    context.translate(canvas.width / 2 + pan.x, canvas.height / 2 + pan.y);
+    context.scale(zoom, zoom);
+    context.drawImage(image, -image.width / 2, -image.height / 2);
+    context.restore();
+
+    context.save();
+    context.strokeStyle = 'rgba(255,255,255,.22)';
+    context.lineWidth = 1;
+    context.setLineDash([8, 8]);
+    context.beginPath();
+    context.moveTo(0, canvas.height / 2);
+    context.lineTo(canvas.width, canvas.height / 2);
+    context.stroke();
+    context.restore();
+
+    if (levelLine) {
+      const start = toScreen(levelLine.start.x, levelLine.start.y, canvas.width, canvas.height, image.width, image.height);
+      const end = toScreen(levelLine.end.x, levelLine.end.y, canvas.width, canvas.height, image.width, image.height);
+      context.strokeStyle = '#fbbf24';
+      context.fillStyle = '#fbbf24';
+      context.lineWidth = 3;
+      context.setLineDash([]);
+      context.beginPath();
+      context.moveTo(start.x, start.y);
+      context.lineTo(end.x, end.y);
+      context.stroke();
+      for (const point of [start, end]) {
+        context.beginPath();
+        context.arc(point.x, point.y, 9, 0, Math.PI * 2);
+        context.fill();
+        context.strokeStyle = '#111827';
+        context.lineWidth = 3;
+        context.stroke();
+      }
+    }
+  }, [levelLine, pan, step, toScreen, zoom]);
+
   // Handle Logic
   const getHandleCoords = (rect: Rect, cw: number, ch: number, iw: number, ih: number) => {
     const tl = toScreen(rect.x, rect.y, cw, ch, iw, ih);
@@ -309,6 +396,50 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({
           x: (e.clientX - rect.left) * scaleX,
           y: (e.clientY - rect.top) * scaleY
       };
+  };
+
+  const handleLevelPointerDown = (e: React.PointerEvent) => {
+    e.preventDefault();
+    if (!canvasRef.current || !imageRef.current) return;
+    e.currentTarget.setPointerCapture(e.pointerId);
+    const point = screenToImage(getMousePos(e), canvasRef.current.width, canvasRef.current.height, imageRef.current.width, imageRef.current.height);
+    setLevelLine({ start: point, end: point });
+    setIsDrawingLevel(true);
+  };
+
+  const handleLevelPointerMove = (e: React.PointerEvent) => {
+    if (!isDrawingLevel || !canvasRef.current || !imageRef.current) return;
+    e.preventDefault();
+    const point = screenToImage(getMousePos(e), canvasRef.current.width, canvasRef.current.height, imageRef.current.width, imageRef.current.height);
+    setLevelLine(line => line ? { ...line, end: point } : line);
+  };
+
+  const handleLevelPointerUp = (e: React.PointerEvent) => {
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) e.currentTarget.releasePointerCapture(e.pointerId);
+    setIsDrawingLevel(false);
+  };
+
+  const applyLevel = async () => {
+    if (!sourceImage || !imageRef.current || !levelLine) return;
+    const lineLength = Math.hypot(levelLine.end.x - levelLine.start.x, levelLine.end.y - levelLine.start.y);
+    if (lineLength < 20) { notify('Draw a longer line along a known horizontal edge.', 'error'); return; }
+    const correction = levelCorrectionDegrees(levelLine.start, levelLine.end);
+    const processingGeneration = ++processingGenerationRef.current;
+    setIsProcessing(true);
+    try {
+      const result = await levelImage(imageRef.current, sourceImage, correction);
+      if (processingGenerationRef.current !== processingGeneration) return;
+      imageRef.current = null;
+      setIsDecoding(true);
+      setSourceImage(result);
+      setStep('crop');
+      notify(`Photo levelled ${Math.abs(correction).toFixed(1)}° ${correction < 0 ? 'counter-clockwise' : 'clockwise'}.`, 'success');
+    } catch (error) {
+      reportError('image-level', error, { correction });
+      notify(error instanceof Error ? error.message : 'The photo could not be levelled.', 'error');
+    } finally {
+      if (processingGenerationRef.current === processingGeneration) setIsProcessing(false);
+    }
   };
 
   const handlePointerDown = (e: React.PointerEvent) => {
@@ -514,6 +645,7 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({
           <h3 className="text-lg font-semibold text-white flex items-center gap-2">
             {step === 'select' && 'Select Image Source'}
             {step === 'camera' && 'Take Photo'}
+            {step === 'level' && 'Level Photo'}
             {step === 'crop' && 'Crop & Convert'}
           </h3>
           <button onClick={onClose} disabled={isProcessing} className="text-gray-400 hover:text-white disabled:cursor-wait disabled:opacity-40 transition-colors">
@@ -525,7 +657,24 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({
         <div className="flex min-h-0 flex-1 flex-col items-center justify-center overflow-auto p-3 sm:min-h-[300px] sm:p-6">
           
           {step === 'select' && (
-            <div className="grid w-full max-w-md grid-cols-1 gap-3 sm:grid-cols-2 sm:gap-6">
+            <div className="flex w-full max-w-md flex-col gap-4">
+              {enableLeveling && (
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={levelPhoto}
+                  aria-label="Level photo"
+                  onClick={toggleLevelPhoto}
+                  className={`flex min-h-14 items-center justify-between rounded-xl border px-4 py-3 text-left transition-all ${levelPhoto ? 'border-amber-400 bg-amber-400/10 shadow-[0_0_24px_rgba(251,191,36,.12)]' : 'border-gray-600 bg-gray-900/60 hover:border-gray-500'}`}
+                >
+                  <span className="flex items-center gap-3">
+                    <span className={`grid h-9 w-9 place-items-center rounded-lg ${levelPhoto ? 'bg-amber-400 text-gray-950' : 'bg-gray-700 text-gray-300'}`}><Gauge className="h-5 w-5" /></span>
+                    <span><strong className="block text-sm text-white">Level photo</strong><span className="block text-xs text-gray-400">Live horizon + straighten after capture</span></span>
+                  </span>
+                  <span aria-hidden="true" className={`relative h-6 w-11 rounded-full transition-colors ${levelPhoto ? 'bg-amber-400' : 'bg-gray-600'}`}><span className={`absolute top-1 h-4 w-4 rounded-full bg-white shadow transition-transform ${levelPhoto ? 'translate-x-6' : 'translate-x-1'}`} /></span>
+                </button>
+              )}
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 sm:gap-6">
               <label className="group flex min-h-28 cursor-pointer flex-col items-center justify-center gap-3 rounded-xl border-2 border-dashed border-gray-600 bg-gray-700/50 p-4 transition-all hover:border-blue-500 hover:bg-gray-700 sm:gap-4 sm:p-8">
                 <div className="p-4 bg-gray-800 rounded-full group-hover:bg-blue-600 transition-colors">
                   <Upload className="w-8 h-8 text-gray-300 group-hover:text-white" />
@@ -543,12 +692,22 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({
                 </div>
                 <span className="text-gray-300 font-medium group-hover:text-white">Use Camera</span>
               </button>
+              </div>
             </div>
           )}
 
           {step === 'camera' && (
             <div className="relative w-full max-w-lg bg-black rounded-lg overflow-hidden">
                <video ref={videoRef} autoPlay playsInline className="w-full h-auto object-cover" />
+               {levelPhoto && (
+                 <div className="pointer-events-none absolute inset-0" data-testid="live-level-guide">
+                   <div className="absolute left-1/2 top-1/2 w-[82%] -translate-x-1/2 -translate-y-1/2" style={{ transform: `translate(-50%, -50%) rotate(${deviceRoll ?? 0}deg)` }}>
+                     <div className={`h-0.5 w-full shadow-[0_0_0_1px_rgba(0,0,0,.7)] transition-colors ${deviceRoll !== null && Math.abs(deviceRoll) <= 1.5 ? 'bg-emerald-400' : 'bg-amber-400'}`} />
+                     <div className={`absolute left-1/2 top-1/2 h-5 w-5 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 ${deviceRoll !== null && Math.abs(deviceRoll) <= 1.5 ? 'border-emerald-400 bg-emerald-400/30' : 'border-amber-400 bg-black/30'}`} />
+                   </div>
+                   <div className={`absolute left-1/2 top-4 -translate-x-1/2 rounded-full border px-3 py-1 font-mono text-xs font-bold ${deviceRoll !== null && Math.abs(deviceRoll) <= 1.5 ? 'border-emerald-400/70 bg-emerald-950/80 text-emerald-300' : 'border-amber-400/70 bg-gray-950/80 text-amber-300'}`}>{deviceRoll === null ? 'LEVEL SENSOR WAITING' : Math.abs(deviceRoll) <= 1.5 ? 'LEVEL' : `${deviceRoll > 0 ? '+' : ''}${deviceRoll.toFixed(1)}°`}</div>
+                 </div>
+               )}
                <div className="absolute bottom-4 left-0 right-0 flex justify-center">
                  <button 
                    onClick={capturePhoto}
@@ -557,6 +716,19 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({
                    <div className="w-12 h-12 rounded-full bg-white" />
                  </button>
                </div>
+            </div>
+          )}
+
+          {step === 'level' && (
+            <div className="flex h-full w-full flex-col items-center gap-3">
+              <div className="flex w-full items-start gap-3 rounded-lg border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-amber-100">
+                <ScanLine className="mt-0.5 h-5 w-5 shrink-0 text-amber-300" />
+                <div><p className="text-sm font-semibold">Draw along a known horizontal edge</p><p className="text-xs text-amber-100/65">Use a roofline, fascia, window head, or horizon. Longer lines produce better accuracy.</p></div>
+                {levelLine && <span data-testid="level-angle" className="ml-auto shrink-0 rounded bg-gray-950/70 px-2 py-1 font-mono text-xs text-amber-300">{Math.abs(levelCorrectionDegrees(levelLine.start, levelLine.end)).toFixed(1)}°</span>}
+              </div>
+              <div className="relative min-h-[300px] w-full flex-1 cursor-crosshair overflow-hidden border border-gray-600 bg-black/50 shadow-lg">
+                <canvas ref={canvasRef} data-testid="level-photo-canvas" onPointerDown={handleLevelPointerDown} onPointerMove={handleLevelPointerMove} onPointerUp={handleLevelPointerUp} onPointerCancel={handleLevelPointerUp} className="block h-full w-full touch-none" />
+              </div>
             </div>
           )}
 
@@ -631,6 +803,12 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({
                 <Check className="w-4 h-4" /> 
                  {isDecoding ? 'Preparing full resolution…' : isProcessing ? 'Processing full resolution…' : preserveSourcePixels ? 'Use full-resolution crop' : 'Crop & Save PNG'}
              </button>
+           )}
+           {step === 'level' && (
+             <div className="flex items-center gap-2">
+               <button onClick={() => setStep('crop')} disabled={isProcessing || isDecoding} className="rounded-lg px-4 py-2 text-sm text-gray-300 hover:bg-gray-800 hover:text-white">Skip</button>
+               <button onClick={applyLevel} disabled={isProcessing || isDecoding || !levelLine} data-testid="apply-photo-level" className="flex items-center gap-2 rounded-lg bg-amber-400 px-5 py-2 text-sm font-bold text-gray-950 shadow-lg shadow-amber-950/30 transition hover:bg-amber-300 disabled:cursor-not-allowed disabled:opacity-40"><Check className="h-4 w-4" />{isProcessing ? 'Leveling full resolution…' : 'Apply level'}</button>
+             </div>
            )}
         </div>
       </div>

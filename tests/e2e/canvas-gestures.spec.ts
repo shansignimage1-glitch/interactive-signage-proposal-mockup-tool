@@ -416,6 +416,21 @@ test('desktop Select & adjust handles show a precision magnifier', async ({ page
   await expect.poll(async () => (await dimensionHandle.boundingBox())!.x).toBeGreaterThan(movedStartBefore!.x + 14);
   await expect.poll(async () => (await dimensionEndHandle.boundingBox())!.x).toBeGreaterThan(movedEndBefore!.x + 14);
 
+  // A visible endpoint must remain directly editable even after the dimension
+  // has been deselected. Previously the handler silently targeted only the
+  // stale active dimension, so this drag did nothing.
+  await surface.click({ position: { x: surfaceBounds!.width * 0.08, y: surfaceBounds!.height * 0.08 } });
+  const deselectedHandleBefore = await dimensionEndHandle.boundingBox();
+  expect(deselectedHandleBefore).not.toBeNull();
+  await page.mouse.move(
+    deselectedHandleBefore!.x + deselectedHandleBefore!.width / 2,
+    deselectedHandleBefore!.y + deselectedHandleBefore!.height / 2,
+  );
+  await page.mouse.down();
+  await page.mouse.move(deselectedHandleBefore!.x + deselectedHandleBefore!.width / 2 + 28, deselectedHandleBefore!.y + deselectedHandleBefore!.height / 2);
+  await page.mouse.up();
+  await expect.poll(async () => (await dimensionEndHandle.boundingBox())!.x).toBeGreaterThan(deselectedHandleBefore!.x + 20);
+
   await page.getByRole('button', { name: 'Width × height' }).click();
   await surface.click({ position: { x: surfaceBounds!.width * 0.45, y: surfaceBounds!.height * 0.32 } });
   await surface.click({ position: { x: surfaceBounds!.width * 0.72, y: surfaceBounds!.height * 0.54 } });
@@ -430,6 +445,13 @@ test('desktop Select & adjust handles show a precision magnifier', async ({ page
   await page.mouse.up();
   await expect(loupe).toBeHidden();
   await expect.poll(async () => (await boxCorner.boundingBox())!.x).toBeLessThan(boxCornerBefore!.x - 10);
+
+  const dimensionLabel = page.locator('[data-testid^="dimension-label-"]').first();
+  const labelBeforeZoomOut = await dimensionLabel.boundingBox();
+  expect(labelBeforeZoomOut).not.toBeNull();
+  await page.getByRole('button', { name: 'Zoom out' }).click();
+  await page.getByRole('button', { name: 'Zoom out' }).click();
+  await expect.poll(async () => (await dimensionLabel.boundingBox())!.width).toBeLessThan(labelBeforeZoomOut!.width * 0.82);
 });
 
 test('background upload retains its full source dimensions for editing', async ({ page }, testInfo) => {
@@ -558,4 +580,54 @@ test('uploaded PNG signs retain enough source pixels for sharp canvas rendering'
     width: (image as HTMLImageElement).naturalWidth,
     height: (image as HTMLImageElement).naturalHeight,
   }))).toEqual({ width: sourceWidth, height: sourceHeight });
+});
+
+test('background upload can optionally level a drawn horizontal at full editing resolution', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-chromium', 'The leveling geometry is device-independent and covered once.');
+
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Continue as Guest' }).click();
+  const openAllControls = page.getByRole('button', { name: 'Open all controls' });
+  if (await openAllControls.isVisible()) await openAllControls.click();
+  await page.getByRole('button', { name: /New Image \/ Camera/ }).click();
+
+  const toggle = page.getByRole('switch', { name: 'Level photo' });
+  await expect(toggle).toHaveAttribute('aria-checked', 'false');
+  await toggle.click();
+  await expect(toggle).toHaveAttribute('aria-checked', 'true');
+
+  const pngDataUrl = await page.evaluate(() => {
+    const canvas = document.createElement('canvas');
+    canvas.width = 1200;
+    canvas.height = 800;
+    const context = canvas.getContext('2d')!;
+    context.fillStyle = '#dbeafe';
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    context.strokeStyle = '#0f172a';
+    context.lineWidth = 20;
+    context.beginPath();
+    context.moveTo(180, 300);
+    context.lineTo(1020, 390);
+    context.stroke();
+    return canvas.toDataURL('image/png');
+  });
+  await page.locator('input[type="file"][accept="image/*"]').setInputFiles({
+    name: 'tilted-facade.png',
+    mimeType: 'image/png',
+    buffer: Buffer.from(pngDataUrl.split(',')[1], 'base64'),
+  });
+
+  await expect(page.getByText('Level Photo')).toBeVisible();
+  const levelCanvas = page.getByTestId('level-photo-canvas');
+  const bounds = await levelCanvas.boundingBox();
+  expect(bounds).not.toBeNull();
+  await page.mouse.move(bounds!.x + bounds!.width * 0.22, bounds!.y + bounds!.height * 0.42);
+  await page.mouse.down();
+  await page.mouse.move(bounds!.x + bounds!.width * 0.78, bounds!.y + bounds!.height * 0.53);
+  await page.mouse.up();
+  await expect(page.getByTestId('level-angle')).not.toHaveText('0.0°');
+  await page.getByTestId('apply-photo-level').click();
+  await expect(page.getByText('Crop & Convert')).toBeVisible();
+  await page.getByTestId('confirm-image-crop').click();
+  await expect(page.getByText('Select Image Source')).toBeHidden();
 });

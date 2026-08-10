@@ -323,7 +323,9 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
              updateActiveCanvas({
                  backgroundImage: dataUrl,
                  backgroundSize: { width: img.width, height: img.height },
-                 calibration: null // new photo (uploader may also resize) — old scale invalid
+                 calibration: null, // new or levelled photo — old image coordinates are invalid
+                 dimensions: [],
+                 activeDimensionId: null,
              });
         };
         img.src = dataUrl;
@@ -1430,6 +1432,7 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
         onImageReady={handleImageReady}
         preserveSourcePixels={uploadTarget === 'background'}
         maxOutputDimension={uploadTarget === 'sign' ? 4096 : 1024}
+        enableLeveling={uploadTarget === 'background'}
       />
       
       <SignLibrary
