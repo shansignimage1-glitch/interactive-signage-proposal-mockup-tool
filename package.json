@@ -28,7 +28,8 @@
     "jspdf": "^4.2.1",
     "lucide-react": "^0.554.0",
     "react": "^19.2.0",
-    "react-dom": "^19.2.0"
+    "react-dom": "^19.2.0",
+    "three": "^0.180.0"
   },
   "devDependencies": {
     "@firebase/rules-unit-testing": "^5.0.1",

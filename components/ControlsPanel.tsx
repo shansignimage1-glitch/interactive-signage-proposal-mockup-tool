@@ -594,6 +594,7 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
   // --- Measurement / Calibration ---
   const calibration = activeCanvas.calibration ?? null;
   const planes = getCalibrationPlanes(calibration);
+  const selectedPlane = planes.find(plane => plane.id === calibration?.activePlaneId) ?? planes[0];
   const placement: PlacementSettings = activeCanvas.placement ?? {
       snapEnabled: true,
       showVanishingGuides: false,
@@ -983,6 +984,11 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
                         <label className="flex min-h-10 items-center justify-between rounded-lg bg-gray-800 px-2 text-[11px] text-gray-300">Vanishing guides<input aria-label="Vanishing-point guides" type="checkbox" checked={placement.showVanishingGuides} onChange={event => updatePlacement({ showVanishingGuides: event.target.checked })} className="accent-cyan-500" /></label>
                     </div>
                     {planes.length > 0 && <div className="grid grid-cols-[1fr_auto] gap-2"><select aria-label="Active calibrated plane" value={calibration?.activePlaneId ?? planes[0].id} onChange={event => selectPlane(event.target.value)} className="min-h-10 rounded-lg border border-gray-700 bg-gray-900 px-2 text-xs text-white">{planes.map(plane => <option key={plane.id} value={plane.id}>{plane.name}</option>)}</select><button type="button" onClick={() => onOpenCalibration({ addPlane: true })} className="rounded-lg border border-cyan-500/40 bg-cyan-500/10 px-3 text-xs text-cyan-200 hover:bg-cyan-500/20">+ Plane</button></div>}
+                    {selectedPlane?.calibrationKind === 'parallel-offset' && (
+                        <div className="rounded-lg border border-cyan-500/20 bg-cyan-500/10 px-2.5 py-2 text-[10px] text-cyan-100">
+                            Parallel offset · {Math.abs(selectedPlane.offsetMm ?? 0).toFixed(0)}mm {Number(selectedPlane.offsetMm) < 0 ? 'forward' : 'behind'} · {selectedPlane.cameraConfidence === 'verified' ? 'verified camera' : 'estimated camera'}
+                        </div>
+                    )}
                     <div className="border-t border-gray-700 pt-3 space-y-2">
                         <label className="flex min-h-10 items-center justify-between text-xs text-gray-300"><span>Lens correction <span className="block text-[9px] text-gray-500">Non-destructive radial model</span></span><input aria-label="Lens distortion correction" type="checkbox" checked={placement.lens.enabled} onChange={event => updatePlacement({ lens: { ...placement.lens, enabled: event.target.checked } })} className="accent-cyan-500" /></label>
                         {placement.lens.enabled && <><div><div className="flex justify-between text-[10px] text-gray-400"><span>Barrel / pincushion</span><span>{placement.lens.k1.toFixed(2)}</span></div><input aria-label="Primary lens correction" type="range" min="-0.5" max="0.5" step="0.01" value={placement.lens.k1} onChange={event => updatePlacement({ lens: { ...placement.lens, k1: Number(event.target.value) } })} className="w-full accent-cyan-500" /></div><div><div className="flex justify-between text-[10px] text-gray-400"><span>Edge refinement</span><span>{placement.lens.k2.toFixed(2)}</span></div><input aria-label="Secondary lens correction" type="range" min="-0.25" max="0.25" step="0.01" value={placement.lens.k2} onChange={event => updatePlacement({ lens: { ...placement.lens, k2: Number(event.target.value) } })} className="w-full accent-cyan-500" /></div><p className="text-[9px] text-amber-300">Changing correction changes photo geometry; refine calibration points afterward.</p></>}

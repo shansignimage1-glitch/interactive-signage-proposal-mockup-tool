@@ -30,6 +30,13 @@ const decode = async (blob: Blob): Promise<DecodedImage> => {
   return bitmap;
 };
 
+export const readImageDimensions = async (blob: Blob): Promise<{ width: number; height: number }> => {
+  const image = await decode(blob);
+  const dimensions = { width: image.width, height: image.height };
+  image.close();
+  return dimensions;
+};
+
 export const optimizeImageBlob = async (blob: Blob, maxDimension = DEFAULT_MAX_DIMENSION): Promise<Blob> => {
   const bitmap = await decode(blob);
   const scale = Math.min(1, maxDimension / Math.max(bitmap.width, bitmap.height));

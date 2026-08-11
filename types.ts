@@ -18,6 +18,14 @@ export interface CalibrationPlane {
   corners: [Point, Point, Point, Point];
   widthMm: number;
   heightMm: number;
+  /** Image points mapped to the reference plane's millimetre coordinate system. */
+  worldCornersMm?: [Point, Point, Point, Point];
+  /** Base plane used to estimate the shared camera pose. */
+  referencePlaneId?: string;
+  /** Signed normal offset: positive is farther from the camera, negative is forward. */
+  offsetMm?: number;
+  calibrationKind?: 'known-size' | 'parallel-offset';
+  cameraConfidence?: 'verified' | 'estimated';
 }
 
 export interface LensCorrection {
@@ -225,6 +233,61 @@ export interface Canvas {
   sheetNumber: string; 
 }
 
+export type BuildingFaceId = 'front' | 'right' | 'rear' | 'left';
+export type BuildingSurfaceCoverage = 'measured' | 'estimated' | 'unsurveyed';
+
+export interface BuildingFaceAssignment {
+  canvasId: string | null;
+  coverage: BuildingSurfaceCoverage;
+}
+
+/** Shared real-world shell used by the optional rotatable proposal viewer. */
+export interface BuildingModelSettings {
+  widthMm: number;
+  depthMm: number;
+  heightMm: number;
+  faceAssignments: Record<BuildingFaceId, BuildingFaceAssignment>;
+}
+
+export type FieldMeasurementMethod = 'laser' | 'tape' | 'drawing' | 'estimate';
+export type PlaneDepthDirection = 'behind' | 'forward';
+
+export interface ReferenceWallFieldMeasurement {
+  wallName: string;
+  widthMm?: number;
+  heightMm?: number;
+  planeDepthMm?: number;
+  planeDepthDirection: PlaneDepthDirection;
+  referencePlaneName: string;
+  method: FieldMeasurementMethod;
+  notes: string;
+}
+
+export interface SiteCapturePhoto {
+  id: string;
+  label: string;
+  originalRef: string;
+  workingRef: string;
+  thumbnailRef: string;
+  fileName: string;
+  mimeType: string;
+  byteSize: number;
+  pixelWidth: number;
+  pixelHeight: number;
+  workingPixelWidth: number;
+  workingPixelHeight: number;
+  capturedAt: number;
+  notes: string;
+  location?: {
+    latitude: number;
+    longitude: number;
+    accuracy?: number;
+    address?: string;
+  };
+  referenceWall: ReferenceWallFieldMeasurement;
+  promotedCanvasId?: string;
+}
+
 export interface UserProfile {
   uid: string;
   displayName: string | null;
@@ -253,6 +316,8 @@ export interface MockupState {
   savedTemplates: TitleBlockTemplate[]; 
   notes: string; // Project General Notes
   referenceImages: ReferenceImage[]; // Global references
+  siteCaptures?: SiteCapturePhoto[];
+  buildingModel?: BuildingModelSettings;
   
   // Sync & Connectivity
   lastSaved: number; // Timestamp

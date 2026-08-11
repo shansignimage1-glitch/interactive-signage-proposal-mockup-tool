@@ -37,7 +37,13 @@ export const imagePointToPlane = (point: Point, cal: Calibration): Point | null 
   const plane = getActiveCalibrationPlane(cal);
   if (!plane) return null;
   const { corners, widthMm, heightMm } = plane;
-  const h = computeHomography(corners, [{ x: 0, y: 0 }, { x: widthMm, y: 0 }, { x: widthMm, y: heightMm }, { x: 0, y: heightMm }]);
+  const planeCoordinates = plane.worldCornersMm ?? [
+    { x: 0, y: 0 },
+    { x: widthMm, y: 0 },
+    { x: widthMm, y: heightMm },
+    { x: 0, y: heightMm },
+  ];
+  const h = computeHomography(corners, planeCoordinates);
   return transformPoint(point, h);
 };
 
@@ -45,7 +51,13 @@ export const planePointToImage = (point: Point, cal: Calibration): Point | null 
   const plane = getActiveCalibrationPlane(cal);
   if (!plane) return null;
   const { corners, widthMm, heightMm } = plane;
-  const h = computeHomography([{ x: 0, y: 0 }, { x: widthMm, y: 0 }, { x: widthMm, y: heightMm }, { x: 0, y: heightMm }], corners);
+  const planeCoordinates = plane.worldCornersMm ?? [
+    { x: 0, y: 0 },
+    { x: widthMm, y: 0 },
+    { x: widthMm, y: heightMm },
+    { x: 0, y: heightMm },
+  ];
+  const h = computeHomography(planeCoordinates, corners);
   return transformPoint(point, h);
 };
 

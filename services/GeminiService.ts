@@ -28,3 +28,13 @@ export async function cleanupImage(image: string, mimeType: string, prompt: stri
   const result = await authenticatedPost<{ image: string; mimeType: string }>('/api/cleanup', { image, mimeType, prompt });
   return `data:${result.mimeType};base64,${result.image}`;
 }
+
+export async function transcribeAudio(blob: Blob): Promise<string> {
+  const audio = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error ?? new Error('Audio could not be read.'));
+    reader.onload = () => resolve(String(reader.result).split(',')[1] ?? '');
+    reader.readAsDataURL(blob);
+  });
+  return (await authenticatedPost<{ text: string }>('/api/transcribe', { audio, mimeType: blob.type.split(';')[0] })).text;
+}

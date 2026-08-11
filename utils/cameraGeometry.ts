@@ -90,14 +90,22 @@ const multiplyKInverse = (p: [number, number, number], fx: number, fy: number, c
 const norm = (v: number[]) => Math.hypot(...v);
 const cross = (a: number[], b: number[]): [number, number, number] => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
 
-/** Decomposes the active plane homography into a pinhole camera pose and projects depth in millimetres. */
-export const projectPlaneDepth = (
-  corners: [Point, Point, Point, Point],
+interface PlanePose {
+  r1: number[];
+  r2: number[];
+  r3: number[];
+  t: number[];
+  fx: number;
+  fy: number;
+  cx: number;
+  cy: number;
+}
+
+const estimatePlanePose = (
   plane: CalibrationPlane,
   camera: CameraModel,
   imageSize: { width: number; height: number },
-  depthMm: number,
-): [Point, Point, Point, Point] | null => {
+): PlanePose => {
   const h = computeHomography(
     [{x:0,y:0},{x:plane.widthMm,y:0},{x:plane.widthMm,y:plane.heightMm},{x:0,y:plane.heightMm}],
     plane.corners,
@@ -109,7 +117,7 @@ export const projectPlaneDepth = (
   const q1 = multiplyKInverse([h[0], h[3], h[6]], fx, fy, cx, cy);
   const q2 = multiplyKInverse([h[1], h[4], h[7]], fx, fy, cx, cy);
   const q3 = multiplyKInverse([h[2], h[5], h[8]], fx, fy, cx, cy);
-  const scale = 2 / Math.max(1e-9, norm(q1) + norm(q2));
+  const scale = 1 / Math.max(1e-9, norm(q1));
   const r1 = q1.map(v => v * scale);
   const r2raw = q2.map(v => v * scale);
   const dot = r1[0]*r2raw[0] + r1[1]*r2raw[1] + r1[2]*r2raw[2];
@@ -118,6 +126,18 @@ export const projectPlaneDepth = (
   const r2 = r2n.map(v => v / r2scale);
   const r3 = cross(r1, r2);
   const t = q3.map(v => v * scale);
+  return { r1, r2, r3, t, fx, fy, cx, cy };
+};
+
+/** Decomposes the active plane homography into a pinhole camera pose and projects depth in millimetres. */
+export const projectPlaneDepth = (
+  corners: [Point, Point, Point, Point],
+  plane: CalibrationPlane,
+  camera: CameraModel,
+  imageSize: { width: number; height: number },
+  depthMm: number,
+): [Point, Point, Point, Point] | null => {
+  const { r1, r2, r3, t, fx, fy, cx, cy } = estimatePlanePose(plane, camera, imageSize);
   const inverse = computeHomography(plane.corners, [{x:0,y:0},{x:plane.widthMm,y:0},{x:plane.widthMm,y:plane.heightMm},{x:0,y:plane.heightMm}]);
   const projected = corners.map(corner => {
     const world = transform(corner, inverse);
@@ -131,6 +151,98 @@ export const projectPlaneDepth = (
     return { x: fx * xc / zc + cx, y: fy * yc / zc + cy };
   });
   return projected.some(p => !p) ? null : projected as [Point, Point, Point, Point];
+};
+
+/** Intersects one image ray with a plane parallel to the reference at signed Z. */
+export const imagePointToParallelPlane = (
+  point: Point,
+  referencePlane: CalibrationPlane,
+  camera: CameraModel,
+  imageSize: { width: number; height: number },
+  offsetMm: number,
+): Point | null => {
+  if (Math.abs(offsetMm) < 1e-9) {
+    const inverse = computeHomography(referencePlane.corners, [
+      {x:0,y:0},
+      {x:referencePlane.widthMm,y:0},
+      {x:referencePlane.widthMm,y:referencePlane.heightMm},
+      {x:0,y:referencePlane.heightMm},
+    ]);
+    return transform(point, inverse);
+  }
+  const { r1, r2, r3, t, fx, fy, cx, cy } = estimatePlanePose(referencePlane, camera, imageSize);
+  const cameraRay = [(point.x - cx) / fx, (point.y - cy) / fy, 1];
+  const cameraCenter = [
+    -(r1[0]*t[0] + r1[1]*t[1] + r1[2]*t[2]),
+    -(r2[0]*t[0] + r2[1]*t[1] + r2[2]*t[2]),
+    -(r3[0]*t[0] + r3[1]*t[1] + r3[2]*t[2]),
+  ];
+  const worldRay = [
+    r1[0]*cameraRay[0] + r1[1]*cameraRay[1] + r1[2]*cameraRay[2],
+    r2[0]*cameraRay[0] + r2[1]*cameraRay[1] + r2[2]*cameraRay[2],
+    r3[0]*cameraRay[0] + r3[1]*cameraRay[1] + r3[2]*cameraRay[2],
+  ];
+  if (Math.abs(worldRay[2]) < 1e-9) return null;
+  const distanceAlongRay = (offsetMm - cameraCenter[2]) / worldRay[2];
+  if (!Number.isFinite(distanceAlongRay) || distanceAlongRay <= 0) return null;
+  const result = {
+    x: cameraCenter[0] + worldRay[0] * distanceAlongRay,
+    y: cameraCenter[1] + worldRay[1] * distanceAlongRay,
+  };
+  return Number.isFinite(result.x) && Number.isFinite(result.y) ? result : null;
+};
+
+export const buildParallelOffsetPlane = (
+  corners: [Point, Point, Point, Point],
+  referencePlane: CalibrationPlane,
+  camera: CameraModel,
+  imageSize: { width: number; height: number },
+  offsetMm: number,
+  metadata: { id: string; name: string },
+): CalibrationPlane | null => {
+  const projected = corners.map(point => imagePointToParallelPlane(point, referencePlane, camera, imageSize, offsetMm));
+  if (projected.some(point => point === null)) return null;
+  const worldCornersMm = projected as [Point, Point, Point, Point];
+  const edgeLength = (a: Point, b: Point) => Math.hypot(b.x - a.x, b.y - a.y);
+  const widthMm = (edgeLength(worldCornersMm[0], worldCornersMm[1]) + edgeLength(worldCornersMm[3], worldCornersMm[2])) / 2;
+  const heightMm = (edgeLength(worldCornersMm[0], worldCornersMm[3]) + edgeLength(worldCornersMm[1], worldCornersMm[2])) / 2;
+  if (!(widthMm > 0) || !(heightMm > 0)) return null;
+  return {
+    ...metadata,
+    corners,
+    widthMm,
+    heightMm,
+    worldCornersMm,
+    referencePlaneId: referencePlane.id,
+    offsetMm,
+    calibrationKind: 'parallel-offset',
+    cameraConfidence: camera.estimated || !camera.focalLengthPx ? 'estimated' : 'verified',
+  };
+};
+
+/**
+ * Projects an extruded face through the calibrated wall pose. When no plane
+ * pose is available, preserves the editable visual direction used by legacy
+ * and uncalibrated projects.
+ */
+export const projectExtrudedQuad = (
+  corners: [Point, Point, Point, Point],
+  plane: CalibrationPlane | null,
+  camera: CameraModel | null,
+  imageSize: { width: number; height: number },
+  depthMm: number,
+  visualDepthPx: number,
+  angleDeg: number,
+): [Point, Point, Point, Point] => {
+  const projected = plane && camera
+    ? projectPlaneDepth(corners, plane, camera, imageSize, depthMm)
+    : null;
+  if (projected) return projected;
+  const radians = angleDeg * Math.PI / 180;
+  return corners.map(point => ({
+    x: point.x - Math.cos(radians) * visualDepthPx,
+    y: point.y - Math.sin(radians) * visualDepthPx,
+  })) as [Point, Point, Point, Point];
 };
 
 export const distortedSourcePoint = (point: Point, size: {width:number;height:number}, k1: number, k2: number): Point => {

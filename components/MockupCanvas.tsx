@@ -1,8 +1,8 @@
 
-import React, { useEffect, useRef, useState, useCallback } from 'react';
+import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import { AppImages, MockupState, Point, Sign, Dimension, TitleBlock, Revision, PaperSize, Orientation, Calibration } from '../types';
 import { hexToRgb, isPointInPolygon, distance, computeHomography } from '../utils/math';
-import { measureLine, measureBox, measureSignSizeMm, moveSignOnPlane, scaleSignOnPlane } from '../utils/measure';
+import { formatLength, measureLine, measureBox, measureSignSizeMm, moveSignOnPlane, scaleSignOnPlane } from '../utils/measure';
 import { buildElementMask } from '../utils/elementDetection';
 import { reportError } from '../services/monitoring';
 import { notify } from '../services/toast';
@@ -11,7 +11,7 @@ import { ZoomIn, ZoomOut, Maximize, Check, X, Lock, Unlock, Undo2, Redo2 } from 
 import { ToolMode } from '../App';
 import { TITLE_BLOCK_TEMPLATES } from '../data/titleBlockTemplates';
 import { clampViewScale, viewForPinch, zoomViewAtPoint, type ViewTransform } from '../utils/viewport';
-import { calibrationForPlane, getActiveCalibrationPlane, getCalibrationPlanes, getVanishingPoints, projectPlaneDepth, snapSign } from '../utils/cameraGeometry';
+import { calibrationForPlane, getActiveCalibrationPlane, getCalibrationPlanes, getVanishingPoints, projectExtrudedQuad, projectPlaneDepth, snapSign } from '../utils/cameraGeometry';
 import LensCorrectedBackground from './LensCorrectedBackground';
 import { getBackingDepth, getSignExtrusionPlan } from '../utils/signExtrusion';
 
@@ -110,6 +110,16 @@ const pointToSegmentDistance = (point: Point, start: Point, end: Point) => {
     if (lengthSquared === 0) return distance(point, start);
     const t = Math.max(0, Math.min(1, ((point.x - start.x) * dx + (point.y - start.y) * dy) / lengthSquared));
     return distance(point, { x: start.x + t * dx, y: start.y + t * dy });
+};
+
+const getSignSizeMm = (sign: Sign, calibration: Calibration | null) => {
+    const signCalibration = calibrationForPlane(calibration, sign.calibrationPlaneId);
+    const measured = signCalibration ? measureSignSizeMm(sign.corners, signCalibration) : null;
+    if (measured) return measured;
+    if ((sign.realWidthMm ?? 0) > 0 && (sign.realHeightMm ?? 0) > 0) {
+        return { width: sign.realWidthMm!, height: sign.realHeightMm! };
+    }
+    return null;
 };
 
 // Paper Dimensions in Millimeters
@@ -229,9 +239,9 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
   // --- Per-element extrusion (homography program) ---
   const elemProgramRef = useRef<WebGLProgram | null>(null);
   const elemLocsRef = useRef<{
-    H: WebGLUniformLocation | null;
+    baseH: WebGLUniformLocation | null;
+    topH: WebGLUniformLocation | null;
     resolution: WebGLUniformLocation | null;
-    extrude: WebGLUniformLocation | null;
     signSize: WebGLUniformLocation | null;
     color: WebGLUniformLocation | null;
     mode: WebGLUniformLocation | null;
@@ -259,6 +269,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
 
   const startMousePos = useRef<Point>({ x: 0, y: 0 });
   const startCornersRef = useRef<[Point, Point, Point, Point] | null>(null);
+  const startSignSizeRef = useRef<{ width: number; height: number } | null>(null);
   const dragSignIdRef = useRef<string | null>(null);
   const signPlacementChangedRef = useRef(false);
   const dragDimensionIdRef = useRef<string | null>(null);
@@ -493,6 +504,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
     setActiveHandle(null);
     activeEditPointerRef.current = null;
     startCornersRef.current = null;
+    startSignSizeRef.current = null;
     dragSignIdRef.current = null;
     dragDimensionIdRef.current = null;
     startDimRef.current = null;
@@ -794,21 +806,24 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
 
     // --- Second program: per-element extrusion via homography ---
     // Geometry lives in sign-image px space in static buffers; the vertex
-    // shader maps it through u_H every frame, so corner drags only update
-    // uniforms — no CPU tessellation, no buffer re-uploads.
+    // shader maps base and raised faces through separate homographies every
+    // frame, so their connecting returns inherit the wall perspective.
     const elemVs = createShader(gl.VERTEX_SHADER, `
       attribute vec2 a_pos;      // sign-image px
       attribute float a_top;     // 0 = base plane, 1 = extruded top
       attribute float a_shade;
-      uniform mat3 u_H;          // sign-image px -> background-image px homography
+      uniform mat3 u_baseH;      // artwork on the wall/sign plane
+      uniform mat3 u_topH;       // same artwork projected at extrusion depth
       uniform vec2 u_resolution;
-      uniform vec2 u_extrude;    // direction * depth (background px), post-divide
       uniform vec2 u_signSize;
       varying vec2 v_uv;
       varying float v_shade;
       void main() {
-        vec3 p = u_H * vec3(a_pos, 1.0);
-        vec2 img = p.xy / p.z + a_top * u_extrude;
+        vec3 base = u_baseH * vec3(a_pos, 1.0);
+        vec3 top = u_topH * vec3(a_pos, 1.0);
+        vec2 baseImg = base.xy / base.z;
+        vec2 topImg = top.xy / top.z;
+        vec2 img = mix(baseImg, topImg, a_top);
         vec2 clip = (img / u_resolution) * 2.0 - 1.0;
         gl_Position = vec4(clip * vec2(1, -1), 0, 1);
         v_uv = a_pos / u_signSize;
@@ -841,9 +856,9 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
       if (gl.getProgramParameter(elemProgram, gl.LINK_STATUS)) {
         elemProgramRef.current = elemProgram;
         elemLocsRef.current = {
-          H: gl.getUniformLocation(elemProgram, 'u_H'),
+          baseH: gl.getUniformLocation(elemProgram, 'u_baseH'),
+          topH: gl.getUniformLocation(elemProgram, 'u_topH'),
           resolution: gl.getUniformLocation(elemProgram, 'u_resolution'),
-          extrude: gl.getUniformLocation(elemProgram, 'u_extrude'),
           signSize: gl.getUniformLocation(elemProgram, 'u_signSize'),
           color: gl.getUniformLocation(elemProgram, 'u_color'),
           mode: gl.getUniformLocation(elemProgram, 'u_mode'),
@@ -1026,18 +1041,24 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
 
     signs.forEach(sign => {
       const c = sign.corners;
+      const sourceQuad = sign.elementsSourceSize ? [
+        { x: 0, y: 0 },
+        { x: sign.elementsSourceSize.width, y: 0 },
+        { x: sign.elementsSourceSize.width, y: sign.elementsSourceSize.height },
+        { x: 0, y: sign.elementsSourceSize.height },
+      ] as [Point, Point, Point, Point] : null;
       const rgb = hexToRgb(sign.sideColor);
       const sideColor = [rgb[0], rgb[1], rgb[2], sign.opacity];
       const shadowColor = [rgb[0]*0.7, rgb[1]*0.7, rgb[2]*0.7, sign.opacity];
       const extrusionPlan = getSignExtrusionPlan(sign);
+      const placement = state.canvases.find(item => item.id === state.activeCanvasId)?.placement;
+      const plane = getActiveCalibrationPlane(calibration, sign.calibrationPlaneId);
 
       if (extrusionPlan.renderBacking) {
         const rad = (sign.extrusionAngle * Math.PI) / 180;
         const backingDepth = getBackingDepth(sign);
         const depthX = Math.cos(rad) * backingDepth;
         const depthY = Math.sin(rad) * backingDepth;
-        const placement = state.canvases.find(item => item.id === state.activeCanvasId)?.placement;
-        const plane = getActiveCalibrationPlane(calibration, sign.calibrationPlaneId);
         const cameraBack = sign.projectionMode === 'camera-3d' && placement?.camera.enabled && plane
           ? projectPlaneDepth(c, plane, placement.camera, images.backgroundSize, Math.min(sign.physicalDepthMm ?? 100, (sign.physicalDepthMm ?? 100) * (backingDepth / Math.max(1, sign.extrusionDepth))))
           : null;
@@ -1067,17 +1088,13 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
         // Homography: sign-image px -> background-image px (the quad's plane).
         // Recomputed per render (an 8x8 solve, microseconds) — the geometry
         // itself never leaves the GPU.
-        const Hm = computeHomography(
-          [{ x: 0, y: 0 }, { x: sw, y: 0 }, { x: sw, y: sh }, { x: 0, y: sh }],
-          c
-        );
-        gl.uniformMatrix3fv(eLocs.H, false, [Hm[0], Hm[3], Hm[6], Hm[1], Hm[4], Hm[7], Hm[2], Hm[5], Hm[8]]);
+        const Hm = computeHomography(sourceQuad!, c);
+        gl.uniformMatrix3fv(eLocs.baseH, false, [Hm[0], Hm[3], Hm[6], Hm[1], Hm[4], Hm[7], Hm[2], Hm[5], Hm[8]]);
         gl.uniform2f(eLocs.resolution, sourceWidth, sourceHeight);
         gl.uniform2f(eLocs.signSize, sw, sh);
         gl.uniform1i(eLocs.image, 0);
         gl.uniform1i(eLocs.mask, 1);
 
-        const rad2 = (sign.extrusionAngle * Math.PI) / 180;
         // Converts element depths (sign-image px) to background px on the quad
         const pxScale = ((distance(c[0], c[1]) + distance(c[3], c[2])) / 2) / sw;
 
@@ -1095,8 +1112,23 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
           const geo = elemCache.elements.get(elDef.id);
           if (!geo) return;
           const off = elDef.depth * pxScale;
-          // Elements rise TOWARD the viewer — opposite the slab's receding sides
-          gl.uniform2f(eLocs.extrude, -Math.cos(rad2) * off, -Math.sin(rad2) * off);
+          const depthMm = (sign.physicalDepthMm ?? 100) * (off / Math.max(1, sign.extrusionDepth));
+          // A calibrated wall supplies a camera-facing raised plane. Mapping
+          // the same artwork through base and top homographies makes every
+          // return converge with the face perspective instead of receiving a
+          // single post-projection screen offset. Uncalibrated signs retain
+          // the user-controlled visual direction as a safe fallback.
+          const topCorners = projectExtrudedQuad(
+            c,
+            plane,
+            placement?.camera ?? null,
+            images.backgroundSize,
+            depthMm,
+            off,
+            sign.extrusionAngle,
+          );
+          const topHm = computeHomography(sourceQuad!, topCorners);
+          gl.uniformMatrix3fv(eLocs.topH, false, [topHm[0], topHm[3], topHm[6], topHm[1], topHm[4], topHm[7], topHm[2], topHm[5], topHm[8]]);
 
           // Side walls
           gl.uniform1i(eLocs.mode, 0);
@@ -1171,6 +1203,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
             onSignPlacementStart();
             signPlacementChangedRef.current = false;
             startCornersRef.current = [...activeSign.corners];
+            startSignSizeRef.current = getSignSizeMm(activeSign, calibration);
             dragSignIdRef.current = activeSign.id;
             if (index >= 0 && index < 4) {
                 showPrecisionLoupe('sign', e, startMousePos.current);
@@ -1213,6 +1246,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
       signPlacementChangedRef.current = false;
       startMousePos.current = getMousePos(e);
       startCornersRef.current = [...sign.corners];
+      startSignSizeRef.current = getSignSizeMm(sign, calibration);
       dragSignIdRef.current = sign.id;
       setActiveHandle(4);
       setHoveredHandle(null);
@@ -1388,9 +1422,14 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
                 const keepRatio = activeSign.aspectLocked !== false;
                 const signCalibration = calibrationForPlane(calibration, activeSign.calibrationPlaneId);
                 const newCorners = scaleSignOnPlane(startCorners, scaleX, keepRatio ? scaleX : 1, signCalibration);
-                const realSize = signCalibration ? measureSignSizeMm(newCorners, signCalibration) : null;
+                const startSize = startSignSizeRef.current;
+                const realSize = signCalibration
+                    ? measureSignSizeMm(newCorners, signCalibration)
+                    : startSize ? { width: startSize.width * scaleX, height: startSize.height * (keepRatio ? scaleX : 1) } : null;
                 signPlacementChangedRef.current = true;
-                updateSignById(dragSignId, { corners: newCorners, realWidthMm: realSize?.width, realHeightMm: realSize?.height });
+                updateSignById(dragSignId, realSize
+                    ? { corners: newCorners, realWidthMm: realSize.width, realHeightMm: realSize.height }
+                    : { corners: newCorners });
             }
             else if (interactionHandle === 6) {
                 const center = {
@@ -1403,9 +1442,14 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
                 const keepRatio = activeSign.aspectLocked !== false;
                 const signCalibration = calibrationForPlane(calibration, activeSign.calibrationPlaneId);
                 const newCorners = scaleSignOnPlane(startCorners, keepRatio ? scaleY : 1, scaleY, signCalibration);
-                const realSize = signCalibration ? measureSignSizeMm(newCorners, signCalibration) : null;
+                const startSize = startSignSizeRef.current;
+                const realSize = signCalibration
+                    ? measureSignSizeMm(newCorners, signCalibration)
+                    : startSize ? { width: startSize.width * (keepRatio ? scaleY : 1), height: startSize.height * scaleY } : null;
                 signPlacementChangedRef.current = true;
-                updateSignById(dragSignId, { corners: newCorners, realWidthMm: realSize?.width, realHeightMm: realSize?.height });
+                updateSignById(dragSignId, realSize
+                    ? { corners: newCorners, realWidthMm: realSize.width, realHeightMm: realSize.height }
+                    : { corners: newCorners });
             }
         } else if (updateDraggedDimension(interactionHandle, pos)) {
             if (precisionPointerRef.current?.kind === 'dimension' && precisionPointerRef.current.pointerId === e.pointerId) {
@@ -1467,7 +1511,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
     setSnapGuides(null);
     clearPrecisionLoupe();
     activeEditPointerRef.current = null;
-    setActiveHandle(null); startCornersRef.current = null; dragSignIdRef.current = null; dragDimensionIdRef.current = null; startDimRef.current = null;
+    setActiveHandle(null); startCornersRef.current = null; startSignSizeRef.current = null; dragSignIdRef.current = null; dragDimensionIdRef.current = null; startDimRef.current = null;
   };
 
   const handleCanvasPointerCancel = (e: React.PointerEvent) => {
@@ -1484,6 +1528,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
     clearPrecisionLoupe();
     activeEditPointerRef.current = null;
     startCornersRef.current = null;
+    startSignSizeRef.current = null;
     dragSignIdRef.current = null;
     startDimRef.current = null;
     if (e.currentTarget.hasPointerCapture(e.pointerId)) e.currentTarget.releasePointerCapture(e.pointerId);
@@ -1582,6 +1627,21 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
       maxX: Math.max(...activeSign.corners.map(point => point.x)),
       maxY: Math.max(...activeSign.corners.map(point => point.y)),
   } : null;
+  const signSizeLabels = useMemo(() => signs.flatMap(sign => {
+      const size = getSignSizeMm(sign, calibration);
+      if (!size) return [];
+      return [{
+          id: sign.id,
+          name: sign.name,
+          center: {
+              x: sign.corners.reduce((sum, point) => sum + point.x, 0) / sign.corners.length,
+              y: sign.corners.reduce((sum, point) => sum + point.y, 0) / sign.corners.length,
+          },
+          widthMm: size.width,
+          heightMm: size.height,
+          text: `${formatLength(size.width, state.unitSystem)} × ${formatLength(size.height, state.unitSystem)}`,
+      }];
+  }), [calibration, signs, state.unitSystem]);
   const totalScale = baseScale * view.scale;
 
   // Render Title Block Layout Overlay
@@ -2301,6 +2361,26 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
                     )}
                 </svg>
                 <div className="absolute inset-0 z-30 w-full h-full pointer-events-none">
+                    {state.showDimensions && signSizeLabels.map(label => (
+                        <div
+                            key={`sign-size-${label.id}`}
+                            data-testid={`sign-size-label-${label.id}`}
+                            data-width-mm={label.widthMm}
+                            data-height-mm={label.heightMm}
+                            aria-label={`${label.name} dimensions ${label.text}`}
+                            className="absolute rounded-md border border-blue-400/80 bg-slate-950/88 px-2 py-1 font-mono text-[11px] font-semibold leading-none text-white shadow-lg backdrop-blur-sm"
+                            style={{
+                                left: label.center.x,
+                                top: label.center.y,
+                                transform: `translate(-50%, -50%) scale(${dimensionLabelScale})`,
+                                transformOrigin: 'center center',
+                                whiteSpace: 'nowrap',
+                                zIndex: label.id === activeSignId ? 48 : 44,
+                            }}
+                        >
+                            {label.text}
+                        </div>
+                    ))}
                     {state.showDimensions && dimensions.map(dim => {
                         const mx = (dim.start.x + dim.end.x) / 2;
                         const my = (dim.start.y + dim.end.y) / 2;

@@ -1,5 +1,6 @@
 import { MockupState } from '../types';
 import { defaultExtrusionModeForType } from './signExtrusion';
+import { normalizeBuildingModel } from './buildingModel';
 
 /** Normalizes projects saved by older app versions before they enter React state. */
 export const normalizeProjectState = (input: MockupState): MockupState => {
@@ -38,16 +39,34 @@ export const normalizeProjectState = (input: MockupState): MockupState => {
     },
   });
   }) : [];
+  const siteCaptures = Array.isArray(input.siteCaptures) ? input.siteCaptures.map(capture => ({
+    ...capture,
+    notes: capture.notes ?? '',
+    workingPixelWidth: capture.workingPixelWidth ?? capture.pixelWidth,
+    workingPixelHeight: capture.workingPixelHeight ?? capture.pixelHeight,
+    referenceWall: {
+      wallName: capture.referenceWall?.wallName ?? capture.label ?? 'Reference wall',
+      widthMm: capture.referenceWall?.widthMm,
+      heightMm: capture.referenceWall?.heightMm,
+      planeDepthMm: capture.referenceWall?.planeDepthMm,
+      planeDepthDirection: capture.referenceWall?.planeDepthDirection ?? 'behind',
+      referencePlaneName: capture.referenceWall?.referencePlaneName ?? 'Main façade',
+      method: capture.referenceWall?.method ?? 'laser',
+      notes: capture.referenceWall?.notes ?? '',
+    },
+  })) : [];
 
   return {
     ...input,
     canvases,
+    buildingModel: normalizeBuildingModel(input.buildingModel, canvases),
     activeCanvasId: canvases.some(canvas => canvas.id === input.activeCanvasId)
       ? input.activeCanvasId
       : (canvases[0]?.id ?? ''),
     unitSystem: input.unitSystem ?? 'metric',
     savedTemplates: Array.isArray(input.savedTemplates) ? input.savedTemplates : [],
     referenceImages: Array.isArray(input.referenceImages) ? input.referenceImages : [],
+    siteCaptures,
     notes: input.notes ?? '',
     showDimensions: input.showDimensions ?? true,
     cloudRevision: input.cloudRevision ?? 0,

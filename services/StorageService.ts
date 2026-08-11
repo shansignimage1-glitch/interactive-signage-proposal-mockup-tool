@@ -15,7 +15,7 @@ const STORE_PROJECTS = 'projects';
 const STORE_METADATA = 'metadata';
 const STORE_ASSETS = 'assets'; // cached cloud-drive image blobs, keyed by ref
 const STORE_SYNC_QUEUE = 'syncQueue';
-const DB_VERSION = 4; // v4 adds durable offline cloud-sync jobs
+const DB_VERSION = 4; // Site-capture blobs reuse the existing durable assets store.
 const knownCloudRevisions = new Map<string, number>();
 const revisionKey = (userId: string, projectId: string) => `${userId}_${projectId}`;
 
@@ -93,6 +93,55 @@ export const getCachedAsset = async (ref: string): Promise<CachedAsset | null> =
 export const putCachedAsset = async (ref: string, blob: Blob): Promise<void> => {
     await idbOperation(STORE_ASSETS, 'readwrite', (store) =>
         store.put({ ref, blob, mime: blob.type, cachedAt: Date.now() } as CachedAsset));
+};
+
+export type SiteCaptureAssetKind = 'original' | 'working' | 'thumbnail' | 'dictation';
+const SITE_CAPTURE_SCHEME = 'site-capture://';
+
+export const makeSiteCaptureAssetRef = (projectId: string, captureId: string, kind: SiteCaptureAssetKind): string =>
+    `${SITE_CAPTURE_SCHEME}${projectId}/${captureId}/${kind}`;
+
+export const putSiteCaptureAsset = async (ref: string, blob: Blob): Promise<void> => {
+    if (!ref.startsWith(SITE_CAPTURE_SCHEME)) throw new Error('Invalid site-capture asset reference.');
+    await assertStorageCapacity(blob.size);
+    await putCachedAsset(ref, blob);
+};
+
+export const getSiteCaptureAsset = async (ref: string): Promise<Blob | null> => {
+    if (!ref.startsWith(SITE_CAPTURE_SCHEME)) return null;
+    return (await getCachedAsset(ref))?.blob ?? null;
+};
+
+export const deleteSiteCaptureAssets = async (projectId: string, captureId?: string): Promise<void> => {
+    const prefix = `${SITE_CAPTURE_SCHEME}${projectId}/${captureId ? `${captureId}/` : ''}`;
+    const assets = await idbOperation<CachedAsset[]>(STORE_ASSETS, 'readonly', store => store.getAll());
+    const refs = assets.filter(asset => asset.ref.startsWith(prefix)).map(asset => asset.ref);
+    if (!refs.length) return;
+    const db = await initDB();
+    await new Promise<void>((resolve, reject) => {
+        const tx = db.transaction(STORE_ASSETS, 'readwrite');
+        refs.forEach(ref => tx.objectStore(STORE_ASSETS).delete(ref));
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+    });
+};
+
+const uploadSiteCaptureAsset = async (userId: string, projectId: string, captureId: string, kind: SiteCaptureAssetKind, ref: string): Promise<string> => {
+    if (!ref.startsWith(SITE_CAPTURE_SCHEME)) return ref;
+    const asset = await getSiteCaptureAsset(ref);
+    if (!asset) throw new Error(`Site-capture ${kind} is missing from this device.`);
+    const destination = storageRef(storage, `users/${userId}/captures/${projectId}/${captureId}/${kind}`);
+    try { return await getDownloadURL(destination); }
+    catch {
+        await uploadBytes(destination, asset, { contentType: asset.type || undefined });
+        return getDownloadURL(destination);
+    }
+};
+
+const deleteStorageTree = async (root: StorageReference): Promise<void> => {
+    const listing = await listAll(root);
+    await Promise.all(listing.items.map(deleteObject));
+    await Promise.all(listing.prefixes.map(deleteStorageTree));
 };
 
 // --- Cloud Image Upload Helpers ---
@@ -207,6 +256,16 @@ export const StorageService = {
   deleteProjectLocal: async (projectId: string): Promise<void> => {
       await idbOperation(STORE_PROJECTS, 'readwrite', (store) => store.delete(projectId));
       await idbOperation(STORE_METADATA, 'readwrite', (store) => store.delete(projectId));
+      await deleteSiteCaptureAssets(projectId);
+  },
+
+  deleteSiteCapture: async (userId: string, projectId: string, captureId: string): Promise<void> => {
+      await deleteSiteCaptureAssets(projectId, captureId);
+      if (!userId.startsWith('guest_')) {
+          await deleteStorageTree(storageRef(storage, `users/${userId}/captures/${projectId}/${captureId}`)).catch(error => {
+              reportWarning('capture-delete', 'Cloud capture cleanup failed', { projectId, captureId, error: String(error) });
+          });
+      }
   },
 
   queueProjectSync: async (userId: string, projectId: string): Promise<void> => {
@@ -303,6 +362,7 @@ export const StorageService = {
           console.warn("Could not delete cloud project:", e);
       }
       await pruneOrphanedImages(userId).catch(e => console.warn("Orphaned image prune failed:", e));
+      await deleteStorageTree(storageRef(storage, `users/${userId}/captures/${projectId}`)).catch(e => console.warn('Site-capture cleanup failed:', e));
 
       // Trash drive files no other project still references (best-effort)
       if (deletedRefs.length > 0) {
@@ -396,11 +456,19 @@ export const StorageService = {
               image: await resolveImage(r.image),
           })));
 
+          const siteCaptures = await Promise.all((state.siteCaptures ?? []).map(async capture => ({
+              ...capture,
+              originalRef: await uploadSiteCaptureAsset(userId, state.projectId, capture.id, 'original', capture.originalRef),
+              workingRef: await uploadSiteCaptureAsset(userId, state.projectId, capture.id, 'working', capture.workingRef),
+              thumbnailRef: await uploadSiteCaptureAsset(userId, state.projectId, capture.id, 'thumbnail', capture.thumbnailRef),
+          })));
+
           const cloudState = {
               ...state,
               canvases,
               titleBlock: { ...state.titleBlock, logoImage },
               referenceImages,
+              siteCaptures,
           };
 
           const projectRef = doc(db, FIRESTORE_COLLECTION, `${userId}_${state.projectId}`);

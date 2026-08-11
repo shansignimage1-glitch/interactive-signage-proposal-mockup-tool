@@ -53,7 +53,7 @@ vi.mock('../../services/AssetResolver', () => ({
   resolveProjectImages: async (state: unknown) => ({ state, failedRefs: [], needsReconnect: false }),
 }));
 
-import { StorageService } from '../../services/StorageService';
+import { makeSiteCaptureAssetRef, putSiteCaptureAsset, StorageService } from '../../services/StorageService';
 
 describe('StorageService save/load', () => {
   beforeEach(() => {
@@ -116,6 +116,35 @@ describe('StorageService save/load', () => {
     await expect(StorageService.saveProject('guest_test', project)).resolves.toBe('local');
     expect(mocks.transactionSet).not.toHaveBeenCalled();
     expect(mocks.uploadImage).not.toHaveBeenCalled();
+    await StorageService.deleteProjectLocal(project.projectId);
+  });
+
+  it('uploads site-capture originals separately and stores only cloud references in Firestore', async () => {
+    const project = makeProject({ projectId: `capture-${Date.now()}` });
+    const captureId = 'capture-1';
+    const originalRef = makeSiteCaptureAssetRef(project.projectId, captureId, 'original');
+    const workingRef = makeSiteCaptureAssetRef(project.projectId, captureId, 'working');
+    const thumbnailRef = makeSiteCaptureAssetRef(project.projectId, captureId, 'thumbnail');
+    await putSiteCaptureAsset(originalRef, new Blob(['untouched-original'], { type: 'image/jpeg' }));
+    await putSiteCaptureAsset(workingRef, new Blob(['working'], { type: 'image/jpeg' }));
+    await putSiteCaptureAsset(thumbnailRef, new Blob(['thumb'], { type: 'image/jpeg' }));
+    project.siteCaptures = [{
+      id: captureId, label: 'Front', originalRef, workingRef, thumbnailRef,
+      fileName: 'front.jpg', mimeType: 'image/jpeg', byteSize: 18,
+      pixelWidth: 6000, pixelHeight: 4000, workingPixelWidth: 4096, workingPixelHeight: 2731,
+      capturedAt: Date.now(), notes: '',
+      referenceWall: { wallName: 'Front wall', widthMm: 12000, heightMm: 6000, planeDepthMm: 0, planeDepthDirection: 'behind', referencePlaneName: 'Front wall', method: 'laser', notes: '' },
+    }];
+    mocks.getDownloadURL.mockImplementation(async (ref: any) => `https://storage.example/${ref.path}`);
+
+    await expect(StorageService.saveProject('user-1', project)).resolves.toBe('cloud');
+    expect(mocks.transactionSet).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      siteCaptures: [expect.objectContaining({
+        originalRef: expect.stringContaining('/captures/'),
+        workingRef: expect.stringContaining('/captures/'),
+        thumbnailRef: expect.stringContaining('/captures/'),
+      })],
+    }));
     await StorageService.deleteProjectLocal(project.projectId);
   });
 });

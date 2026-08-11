@@ -1,8 +1,9 @@
 import React from 'react';
 import { AlertTriangle, ArrowLeft, Check, Grid3X3, LocateFixed, RotateCcw, Ruler, Undo2, X } from 'lucide-react';
-import { Calibration, MeasureUnit, Point, Size } from '../types';
+import { Calibration, CameraModel, MeasureUnit, Point, Size } from '../types';
 import { CALIBRATION_PRESETS, toMm } from '../utils/measure';
 import { assessCalibrationQuality, CalibrationMethod } from '../utils/calibrationQuality';
+import { buildParallelOffsetPlane, getCalibrationPlanes } from '../utils/cameraGeometry';
 
 export type CalibrationStage = 'choose' | 'place' | 'details' | 'review';
 
@@ -19,11 +20,17 @@ export interface CalibrationDraft {
   planeName: string;
   addPlane: boolean;
   editingPlaneId: string | null;
+  planeMode: 'known-size' | 'parallel-offset';
+  referencePlaneId: string;
+  offset: string;
+  offsetDirection: 'behind' | 'forward';
 }
 
 interface CalibrationWizardProps {
   draft: CalibrationDraft;
   imageSize: Size;
+  existingCalibration: Calibration | null;
+  camera: CameraModel;
   existingDimensionCount: number;
   onChange: (next: CalibrationDraft) => void;
   onApply: (calibration: Calibration, reapply: boolean) => void;
@@ -46,11 +53,15 @@ const qualityStyles = {
 const CalibrationWizard: React.FC<CalibrationWizardProps> = ({
   draft,
   imageSize,
+  existingCalibration,
+  camera,
   existingDimensionCount,
   onChange,
   onApply,
   onCancel,
 }) => {
+  const existingPlanes = getCalibrationPlanes(existingCalibration);
+  const confirmedPlanes = existingPlanes.filter(plane => plane.calibrationKind !== 'parallel-offset');
   const requiredPoints = draft.method === 'plane' ? 4 : 2;
   const quality = draft.method
     ? assessCalibrationQuality(draft.method, draft.points, imageSize)
@@ -65,6 +76,17 @@ const CalibrationWizard: React.FC<CalibrationWizardProps> = ({
     } else {
       patch({ method, stage: 'place', points: keepPoints, presetId: draft.method === 'line' ? draft.presetId : 'door_height', value: draft.method === 'line' ? draft.value : '', unit: draft.method === 'line' ? draft.unit : 'm' });
     }
+  };
+
+  const selectPlaneMode = (planeMode: CalibrationDraft['planeMode']) => {
+    patch({
+      method: 'plane',
+      planeMode,
+      stage: 'place',
+      points: draft.planeMode === planeMode ? draft.points : [],
+      referencePlaneId: draft.referencePlaneId || confirmedPlanes[0]?.id || '',
+      presetId: planeMode === 'known-size' ? 'door' : 'parallel_offset',
+    });
   };
 
   const selectPreset = (presetId: string) => {
@@ -90,19 +112,46 @@ const CalibrationWizard: React.FC<CalibrationWizardProps> = ({
       };
     }
 
+    const corners = draft.points as [Point, Point, Point, Point];
+    if (draft.planeMode === 'parallel-offset') {
+      const referencePlane = confirmedPlanes.find(plane => plane.id === draft.referencePlaneId);
+      const offsetValue = Number(draft.offset);
+      if (!referencePlane || !Number.isFinite(offsetValue) || offsetValue <= 0) return null;
+      const signedOffsetMm = toMm(offsetValue, draft.unit) * (draft.offsetDirection === 'behind' ? 1 : -1);
+      const derived = buildParallelOffsetPlane(
+        corners,
+        referencePlane,
+        camera,
+        imageSize,
+        signedOffsetMm,
+        { id: `plane-${Date.now()}`, name: draft.planeName.trim() || 'Offset wall' },
+      );
+      if (!derived) return null;
+      return {
+        start: corners[0],
+        end: corners[1],
+        realValue: derived.widthMm,
+        unit: 'mm',
+        plane: { corners, widthMm: derived.widthMm, heightMm: derived.heightMm },
+        planes: [derived],
+        activePlaneId: derived.id,
+      };
+    }
+
     const width = Number(draft.width);
     const height = Number(draft.height);
     if (!Number.isFinite(width) || width <= 0 || !Number.isFinite(height) || height <= 0) return null;
     const widthMm = toMm(width, draft.unit);
     const heightMm = toMm(height, draft.unit);
-    const corners = draft.points as [Point, Point, Point, Point];
+    const id = `plane-${Date.now()}`;
     return {
       start: corners[0],
       end: corners[1],
       realValue: widthMm,
       unit: 'mm',
       plane: { corners, widthMm, heightMm },
-      planes: [{ id: `plane-${Date.now()}`, name: draft.planeName.trim() || 'Wall plane', corners, widthMm, heightMm }],
+      planes: [{ id, name: draft.planeName.trim() || 'Wall plane', corners, widthMm, heightMm, calibrationKind: 'known-size' }],
+      activePlaneId: id,
     };
   };
 
@@ -164,28 +213,46 @@ const CalibrationWizard: React.FC<CalibrationWizardProps> = ({
           <div>
             <p className="text-xs font-bold uppercase tracking-[0.18em] text-amber-400">Set real-world scale</p>
             <h2 className="mt-1 text-xl font-bold text-white">
-              {draft.stage === 'choose' ? 'How was this photo taken?' : draft.stage === 'details' ? 'Enter the known size' : 'Review calibration'}
+              {draft.stage === 'choose' ? (draft.addPlane ? 'Add measurement plane' : 'How was this photo taken?') : draft.stage === 'details' ? (draft.planeMode === 'parallel-offset' ? 'Define the plane relationship' : 'Enter the known size') : 'Review calibration'}
             </h2>
           </div>
           <button onClick={onCancel} className="grid h-11 w-11 place-items-center rounded-xl text-gray-400 hover:bg-gray-800 hover:text-white" aria-label="Close calibration"><X className="h-5 w-5" /></button>
         </div>
 
         {draft.stage === 'choose' && (
-          <>
-            <p className="mt-2 text-sm text-gray-400">Choose the method that matches the building photo. This decision controls the measurement math.</p>
-            <div className="mt-5 grid gap-3 sm:grid-cols-2">
-              <button onClick={() => selectMethod('plane')} className="min-h-40 rounded-2xl border border-amber-500/50 bg-amber-500/10 p-4 text-left transition hover:border-amber-300 hover:bg-amber-500/15">
-                <div className="flex items-center justify-between"><Grid3X3 className="h-6 w-6 text-amber-300" /><span className="rounded-full bg-amber-400 px-2 py-1 text-[10px] font-bold text-gray-950">RECOMMENDED</span></div>
-                <h3 className="mt-4 font-semibold text-white">Angled facade</h3>
-                <p className="mt-1 text-sm text-gray-300">Mark four corners of a known rectangle on the wall. Corrects measurements for perspective.</p>
-              </button>
-              <button onClick={() => selectMethod('line')} className="min-h-40 rounded-2xl border border-gray-700 bg-gray-900 p-4 text-left transition hover:border-blue-400 hover:bg-gray-800">
-                <Ruler className="h-6 w-6 text-blue-300" />
-                <h3 className="mt-4 font-semibold text-white">Straight-on photo</h3>
-                <p className="mt-1 text-sm text-gray-300">Mark one known edge with two points. Use only when the camera is square to the wall.</p>
-              </button>
-            </div>
-          </>
+          (draft.addPlane || draft.planeMode === 'parallel-offset') && confirmedPlanes.length ? (
+            <>
+              <p className="mt-2 text-sm text-gray-400">Choose how this wall relates to the confirmed reference.</p>
+              <div className="mt-5 grid gap-3 sm:grid-cols-2">
+                <button onClick={() => selectPlaneMode('parallel-offset')} className="min-h-40 rounded-2xl border border-cyan-500/50 bg-cyan-500/10 p-4 text-left transition hover:border-cyan-300 hover:bg-cyan-500/15">
+                  <div className="flex items-center justify-between"><Grid3X3 className="h-6 w-6 text-cyan-300" /><span className="rounded-full bg-cyan-400 px-2 py-1 text-[10px] font-bold text-gray-950">NEW</span></div>
+                  <h3 className="mt-4 font-semibold text-white">Parallel offset plane</h3>
+                  <p className="mt-1 text-sm text-gray-300">Use a confirmed wall and enter how far this parallel wall sits behind or in front.</p>
+                </button>
+                <button onClick={() => selectPlaneMode('known-size')} className="min-h-40 rounded-2xl border border-gray-700 bg-gray-900 p-4 text-left transition hover:border-amber-400 hover:bg-gray-800">
+                  <Ruler className="h-6 w-6 text-amber-300" />
+                  <h3 className="mt-4 font-semibold text-white">Independent known size</h3>
+                  <p className="mt-1 text-sm text-gray-300">Calibrate this wall from another rectangle whose width and height are known.</p>
+                </button>
+              </div>
+            </>
+          ) : (
+            <>
+              <p className="mt-2 text-sm text-gray-400">Choose the method that matches the building photo. This decision controls the measurement math.</p>
+              <div className="mt-5 grid gap-3 sm:grid-cols-2">
+                <button onClick={() => selectMethod('plane')} className="min-h-40 rounded-2xl border border-amber-500/50 bg-amber-500/10 p-4 text-left transition hover:border-amber-300 hover:bg-amber-500/15">
+                  <div className="flex items-center justify-between"><Grid3X3 className="h-6 w-6 text-amber-300" /><span className="rounded-full bg-amber-400 px-2 py-1 text-[10px] font-bold text-gray-950">RECOMMENDED</span></div>
+                  <h3 className="mt-4 font-semibold text-white">Angled facade</h3>
+                  <p className="mt-1 text-sm text-gray-300">Mark four corners of a known rectangle on the wall. Corrects measurements for perspective.</p>
+                </button>
+                <button onClick={() => selectMethod('line')} className="min-h-40 rounded-2xl border border-gray-700 bg-gray-900 p-4 text-left transition hover:border-blue-400 hover:bg-gray-800">
+                  <Ruler className="h-6 w-6 text-blue-300" />
+                  <h3 className="mt-4 font-semibold text-white">Straight-on photo</h3>
+                  <p className="mt-1 text-sm text-gray-300">Mark one known edge with two points. Use only when the camera is square to the wall.</p>
+                </button>
+              </div>
+            </>
+          )
         )}
 
         {draft.stage === 'details' && draft.method && (
@@ -194,15 +261,19 @@ const CalibrationWizard: React.FC<CalibrationWizardProps> = ({
               The photo remains live: drag empty space to pan, pinch or scroll to zoom, and use the controls on the right.
             </div>
             <button onClick={() => patch({ stage: 'place' })} className="mt-3 flex min-h-11 items-center gap-1 text-sm text-gray-300 hover:text-white"><ArrowLeft className="h-4 w-4" /> Adjust points</button>
-            <label className="mt-2 block text-xs font-bold uppercase tracking-wider text-gray-500">Reference object</label>
-            <select value={draft.presetId} onChange={event => selectPreset(event.target.value)} className="mt-1 min-h-12 w-full rounded-xl border border-gray-700 bg-gray-900 px-3 text-sm text-white focus:border-blue-500 focus:outline-none">
-              {draft.method === 'line' ? (
-                <>
-                  {CALIBRATION_PRESETS.map(preset => <option key={preset.id} value={preset.id}>{preset.label}</option>)}
-                  <option value="custom">Custom known length</option>
-                </>
-              ) : PLANE_PRESETS.map(preset => <option key={preset.id} value={preset.id}>{preset.label}</option>)}
-            </select>
+            {draft.planeMode !== 'parallel-offset' && (
+              <>
+                <label className="mt-2 block text-xs font-bold uppercase tracking-wider text-gray-500">Reference object</label>
+                <select value={draft.presetId} onChange={event => selectPreset(event.target.value)} className="mt-1 min-h-12 w-full rounded-xl border border-gray-700 bg-gray-900 px-3 text-sm text-white focus:border-blue-500 focus:outline-none">
+                  {draft.method === 'line' ? (
+                    <>
+                      {CALIBRATION_PRESETS.map(preset => <option key={preset.id} value={preset.id}>{preset.label}</option>)}
+                      <option value="custom">Custom known length</option>
+                    </>
+                  ) : PLANE_PRESETS.map(preset => <option key={preset.id} value={preset.id}>{preset.label}</option>)}
+                </select>
+              </>
+            )}
 
             {draft.method === 'line' && draft.presetId === 'custom' && (
               <div className="mt-3 grid grid-cols-[1fr_100px] gap-2">
@@ -211,7 +282,7 @@ const CalibrationWizard: React.FC<CalibrationWizardProps> = ({
               </div>
             )}
 
-            {draft.method === 'plane' && (
+            {draft.method === 'plane' && draft.planeMode === 'known-size' && (
               <div className="mt-3 grid grid-cols-2 gap-2">
                 <label className="col-span-2 text-xs text-gray-400">Plane name<input aria-label="Plane name" type="text" value={draft.planeName} onChange={event => patch({ planeName: event.target.value })} placeholder="e.g. Left facade" className="mt-1 min-h-12 w-full rounded-xl border border-gray-700 bg-gray-900 px-3 text-base text-white focus:border-blue-500 focus:outline-none" /></label>
                 <label className="text-xs text-gray-400">Known width<input aria-label="Known width" inputMode="decimal" type="number" min="0" step="any" value={draft.width} onChange={event => patch({ width: event.target.value, presetId: 'custom_plane' })} className="mt-1 min-h-12 w-full rounded-xl border border-gray-700 bg-gray-900 px-3 text-base text-white focus:border-blue-500 focus:outline-none" /></label>
@@ -220,8 +291,23 @@ const CalibrationWizard: React.FC<CalibrationWizardProps> = ({
               </div>
             )}
 
+            {draft.method === 'plane' && draft.planeMode === 'parallel-offset' && (
+              <div className="mt-3 grid grid-cols-2 gap-2">
+                <label className="col-span-2 text-xs text-gray-400">Plane name<input aria-label="Plane name" type="text" value={draft.planeName} onChange={event => patch({ planeName: event.target.value })} placeholder="e.g. Recessed facade" className="mt-1 min-h-12 w-full rounded-xl border border-gray-700 bg-gray-900 px-3 text-base text-white focus:border-blue-500 focus:outline-none" /></label>
+                <label className="col-span-2 text-xs text-gray-400">Confirmed reference plane<select aria-label="Reference plane" value={draft.referencePlaneId} onChange={event => patch({ referencePlaneId: event.target.value })} className="mt-1 min-h-12 w-full rounded-xl border border-gray-700 bg-gray-900 px-3 text-sm text-white focus:border-blue-500 focus:outline-none">{confirmedPlanes.map(plane => <option key={plane.id} value={plane.id}>{plane.name}</option>)}</select></label>
+                <label className="text-xs text-gray-400">Relationship<select aria-label="Plane offset direction" value={draft.offsetDirection} onChange={event => patch({ offsetDirection: event.target.value as CalibrationDraft['offsetDirection'] })} className="mt-1 min-h-12 w-full rounded-xl border border-gray-700 bg-gray-900 px-3 text-sm text-white focus:border-blue-500 focus:outline-none"><option value="behind">Further back</option><option value="forward">Closer to camera</option></select></label>
+                <label className="text-xs text-gray-400">Offset distance<input aria-label="Plane offset distance" inputMode="decimal" type="number" min="0" step="any" value={draft.offset} onChange={event => patch({ offset: event.target.value })} className="mt-1 min-h-12 w-full rounded-xl border border-gray-700 bg-gray-900 px-3 text-base text-white focus:border-blue-500 focus:outline-none" /></label>
+                <div className="col-span-2"><UnitSelect value={draft.unit} onChange={unit => patch({ unit })} /></div>
+                <div className={`col-span-2 rounded-xl border p-3 text-xs ${camera.estimated || !camera.focalLengthPx ? 'border-amber-500/30 bg-amber-500/10 text-amber-100' : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-100'}`}>
+                  {camera.estimated || !camera.focalLengthPx
+                    ? `Estimated camera model (${camera.fieldOfViewDeg}° field of view). Measurements are model-derived; verify one check dimension on Plane 2.`
+                    : 'Verified camera intrinsics available. Plane 2 will use camera-ray intersection in the Plane 1 coordinate system.'}
+                </div>
+              </div>
+            )}
+
             <div className="mt-4 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-100">
-              {draft.method === 'plane' ? 'Measurements are valid on this wall plane. Objects projecting toward or away from the wall need a separate reference.' : 'A two-point scale is accurate only on a straight-on photo and on the same flat wall as the reference.'}
+              {draft.method === 'plane' ? (draft.planeMode === 'parallel-offset' ? 'The selected pixels are intersected with a parallel 3D plane at the entered offset. Do not use this mode for a wall with a different angle.' : 'Measurements are valid on this wall plane. Objects projecting toward or away from the wall need a separate reference.') : 'A two-point scale is accurate only on a straight-on photo and on the same flat wall as the reference.'}
             </div>
             <button onClick={() => patch({ stage: 'review' })} disabled={!calibration} className="mt-4 min-h-12 w-full rounded-xl bg-blue-600 font-semibold text-white hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-40">Review calibration</button>
           </>
@@ -229,14 +315,14 @@ const CalibrationWizard: React.FC<CalibrationWizardProps> = ({
 
         {draft.stage === 'review' && draft.method && quality && (
           <>
-            <button onClick={() => patch({ stage: 'details' })} className="mt-3 flex min-h-11 items-center gap-1 text-sm text-gray-300 hover:text-white"><ArrowLeft className="h-4 w-4" /> Change reference size</button>
+            <button onClick={() => patch({ stage: 'details' })} className="mt-3 flex min-h-11 items-center gap-1 text-sm text-gray-300 hover:text-white"><ArrowLeft className="h-4 w-4" /> {draft.planeMode === 'parallel-offset' ? 'Change plane relationship' : 'Change reference size'}</button>
             <div className={`mt-2 rounded-xl border p-4 ${qualityStyles[quality.level]}`}>
               <div className="flex items-start gap-3"><Check className="mt-0.5 h-5 w-5 shrink-0" /><div><p className="font-semibold">{quality.title}</p><p className="mt-1 text-sm opacity-85">{quality.message}</p></div></div>
             </div>
             <dl className="mt-4 grid grid-cols-2 gap-3 rounded-xl bg-gray-900 p-4 text-sm">
               <div><dt className="text-gray-500">Method</dt><dd className="mt-1 font-medium text-white">{draft.method === 'plane' ? 'Perspective wall · 4 points' : 'Known length · 2 points'}</dd></div>
               <div><dt className="text-gray-500">Reference coverage</dt><dd className="mt-1 font-medium text-white">{Math.round(quality.coverage * 100)}% of photo {draft.method === 'plane' ? 'area' : 'width'}</dd></div>
-              <div className="col-span-2"><dt className="text-gray-500">Known size</dt><dd className="mt-1 font-medium text-white">{draft.method === 'plane' ? `${draft.width} × ${draft.height} ${draft.unit}` : CALIBRATION_PRESETS.find(item => item.id === draft.presetId)?.label ?? `${draft.value} ${draft.unit}`}</dd></div>
+              <div className="col-span-2"><dt className="text-gray-500">{draft.planeMode === 'parallel-offset' ? 'Derived plane' : 'Known size'}</dt><dd className="mt-1 font-medium text-white">{draft.method === 'plane' ? (draft.planeMode === 'parallel-offset' && calibration?.plane ? `${(calibration.plane.widthMm / 1000).toFixed(3)} × ${(calibration.plane.heightMm / 1000).toFixed(3)} m · ${draft.offsetDirection === 'behind' ? 'back' : 'forward'} ${draft.offset}${draft.unit}` : `${draft.width} × ${draft.height} ${draft.unit}`) : CALIBRATION_PRESETS.find(item => item.id === draft.presetId)?.label ?? `${draft.value} ${draft.unit}`}</dd></div>
             </dl>
             {existingDimensionCount > 0 && (
               <label className="mt-4 flex min-h-11 cursor-pointer items-start gap-3 rounded-xl border border-gray-700 p-3 text-sm text-gray-300">

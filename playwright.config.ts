@@ -14,7 +14,8 @@ export default defineConfig({
   projects: [
     { name: 'desktop-chromium', use: { ...devices['Desktop Chrome'] } },
     { name: 'ipad', use: { ...devices['iPad Pro 11'], browserName: 'chromium' } },
-    { name: 'iphone', use: { ...devices['iPhone 13'], browserName: 'chromium' } },
+    { name: 'iphone', testMatch: /mobile-site-capture\.spec\.ts/, use: { ...devices['iPhone 13'], browserName: 'chromium' } },
+    { name: 'android-phone', testMatch: /mobile-site-capture\.spec\.ts/, use: { ...devices['Pixel 7'], browserName: 'chromium' } },
   ],
   webServer: {
     command: 'npm run dev -- --host 127.0.0.1 --port 4173',

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { formatLength, getMmPerPx, measureBox, measureLine, measureSignSizeMm, moveSignOnPlane, resizeSignToRealSize, scaleSignOnPlane, toMm } from '../../utils/measure';
+import { formatLength, getMmPerPx, imagePointToPlane, measureBox, measureLine, measureSignSizeMm, moveSignOnPlane, resizeSignToRealSize, scaleSignOnPlane, toMm } from '../../utils/measure';
 import type { Calibration } from '../../types';
 
 describe('measurement conversion and calibration', () => {
@@ -55,5 +55,27 @@ describe('measurement conversion and calibration', () => {
     const movedSize = measureSignSizeMm(moved, calibration);
     expect(movedSize?.width).toBeCloseTo(2000, 5);
     expect(movedSize?.height).toBeCloseTo(500, 5);
+  });
+
+  it('measures an offset plane in its derived world coordinates', () => {
+    const corners = [{x:200,y:180},{x:760,y:220},{x:720,y:650},{x:230,y:620}] as [
+      {x:number;y:number}, {x:number;y:number}, {x:number;y:number}, {x:number;y:number}
+    ];
+    const worldCornersMm = [{x:400,y:250},{x:3400,y:250},{x:3400,y:2250},{x:400,y:2250}] as typeof corners;
+    const plane = {
+      id: 'wall-2', name: 'Wall 2', corners, widthMm: 3000, heightMm: 2000,
+      worldCornersMm, referencePlaneId: 'wall-1', offsetMm: 500,
+      calibrationKind: 'parallel-offset' as const, cameraConfidence: 'estimated' as const,
+    };
+    const calibration: Calibration = {
+      start: corners[0], end: corners[1], realValue: 3000, unit: 'mm',
+      plane: { corners, widthMm: 3000, heightMm: 2000 },
+      planes: [plane], activePlaneId: plane.id,
+    };
+    const mapped = imagePointToPlane(corners[0], calibration);
+    expect(mapped?.x).toBeCloseTo(worldCornersMm[0].x, 6);
+    expect(mapped?.y).toBeCloseTo(worldCornersMm[0].y, 6);
+    expect(measureLine(corners[0], corners[1], calibration, 'metric')).toBe('3.00m');
+    expect(measureBox(corners[0], corners[2], calibration, 'metric')).toBe('3.00m × 2.00m');
   });
 });

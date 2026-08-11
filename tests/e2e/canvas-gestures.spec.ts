@@ -327,6 +327,47 @@ test('canvas undo and redo restore a completed sign placement gesture', async ({
   await expect(redoButton).toBeDisabled();
 });
 
+test('placed sign dimensions stay on the sign and update while it is scaled', async ({ page }) => {
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Continue as Guest' }).click();
+  await addPlaceholderSign(page);
+  await calibrateCanvas(page);
+  await page.getByRole('button', { name: 'Select & adjust' }).click();
+  await page.evaluate(() => {
+    Element.prototype.setPointerCapture = () => undefined;
+    Element.prototype.releasePointerCapture = () => undefined;
+    Element.prototype.hasPointerCapture = () => false;
+  });
+
+  const sign = page.locator('[data-testid^="sign-hit-area-"]').first();
+  const label = page.locator('[data-testid^="sign-size-label-"]').first();
+  await expect(label).toBeVisible();
+  await expect(label).toContainText('×');
+
+  const signBounds = await sign.boundingBox();
+  const labelBounds = await label.boundingBox();
+  expect(signBounds).not.toBeNull();
+  expect(labelBounds).not.toBeNull();
+  const signCenter = { x: signBounds!.x + signBounds!.width / 2, y: signBounds!.y + signBounds!.height / 2 };
+  const labelCenter = { x: labelBounds!.x + labelBounds!.width / 2, y: labelBounds!.y + labelBounds!.height / 2 };
+  expect(labelCenter.x).toBeCloseTo(signCenter.x, 1);
+  expect(labelCenter.y).toBeCloseTo(signCenter.y, 1);
+
+  const beforeWidth = Number(await label.getAttribute('data-width-mm'));
+  const beforeHeight = Number(await label.getAttribute('data-height-mm'));
+  await sign.click({ force: true });
+  const scaleHandle = page.getByTestId('sign-scale-x-handle');
+  await expect(scaleHandle).toBeVisible();
+  const handleBounds = await scaleHandle.boundingBox();
+  expect(handleBounds).not.toBeNull();
+  const handleCenter = { x: handleBounds!.x + handleBounds!.width / 2, y: handleBounds!.y + handleBounds!.height / 2 };
+  await dispatchTouch(page, 'pointerdown', 1, handleCenter.x, handleCenter.y, '[data-testid="sign-scale-x-handle"]');
+  await dispatchTouch(page, 'pointermove', 1, handleCenter.x + 90, handleCenter.y, '[data-testid="sign-scale-x-handle"]');
+  await expect.poll(async () => Number(await label.getAttribute('data-width-mm'))).toBeGreaterThan(beforeWidth * 1.05);
+  await expect.poll(async () => Number(await label.getAttribute('data-height-mm'))).toBeGreaterThan(beforeHeight * 1.05);
+  await dispatchTouch(page, 'pointerup', 1, handleCenter.x + 90, handleCenter.y, '[data-testid="sign-scale-x-handle"]');
+});
+
 test('3D extrusion automatically isolates artwork and separates board depth', async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== 'desktop-chromium', 'WebGL construction-mode coverage runs once on desktop Chromium.');
 

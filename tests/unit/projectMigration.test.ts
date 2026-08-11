@@ -20,6 +20,8 @@ describe('project migration and normalization', () => {
     expect(normalized.referenceImages).toEqual([]);
     expect(normalized.canvases[0].calibration).toBeNull();
     expect(normalized.canvases[0].dimensions).toEqual([]);
+    expect(normalized.buildingModel?.faceAssignments.front.canvasId).toBe('canvas-1');
+    expect(normalized.buildingModel?.faceAssignments.right.coverage).toBe('unsurveyed');
     expect(normalized.isSyncing).toBe(false);
   });
 

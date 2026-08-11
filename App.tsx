@@ -12,19 +12,22 @@ const ProjectManager = React.lazy(() => import('./components/ProjectManager'));
 const ElementStudio = React.lazy(() => import('./components/ElementStudio'));
 const DriveSettings = React.lazy(() => import('./components/DriveSettings'));
 const AccountSettings = React.lazy(() => import('./components/AccountSettings'));
-import { MockupState, AppImages, Point, Sign, Dimension, TitleBlock, TitleBlockField, Canvas, Calibration, SignElement, Size, ConnectorStatus, CloudProvider, UserProfile } from './types';
+const Proposal3DViewer = React.lazy(() => import('./components/Proposal3DViewer'));
+const MobileSiteCapture = React.lazy(() => import('./components/MobileSiteCapture'));
+import { MockupState, AppImages, Point, Sign, Dimension, TitleBlock, TitleBlockField, Canvas, Calibration, SignElement, Size, ConnectorStatus, CloudProvider, UserProfile, SiteCapturePhoto } from './types';
 import { getActiveConnector, getPreferredProvider, setConnectorUid, connectors, getConnectorForRef } from './services/driveConnectors';
 import { distance } from './utils/math';
 import { measureLine, measureBox, getMmPerPx } from './utils/measure';
 import { normalizeProjectState } from './utils/projectMigration';
 import CalibrationWizard, { CalibrationDraft } from './components/CalibrationWizard';
 import { TITLE_BLOCK_TEMPLATES } from './data/titleBlockTemplates';
-import { StorageService } from './services/StorageService';
-import { Wifi, WifiOff, RefreshCw, LogIn, LogOut, Loader2, AlertTriangle, User as UserIcon, HardDrive, Database, Settings } from 'lucide-react';
+import { getSiteCaptureAsset, StorageService } from './services/StorageService';
+import { Wifi, WifiOff, RefreshCw, LogIn, LogOut, Loader2, AlertTriangle, User as UserIcon, HardDrive, Database, Settings, Building2 } from 'lucide-react';
 import { notify } from './services/toast';
 import { reportError, reportWarning } from './services/monitoring';
 import { captureElement } from './utils/exportCapture';
 import { optimizeImageFile } from './services/imageProcessing';
+import { blobToDataUri } from './services/imageHash';
 
 const GUEST_PROJECT_ID_KEY = 'signagepro_guest_project_id';
 const AUTH_BOOT_TIMEOUT_MS = 20_000;
@@ -123,6 +126,7 @@ const getInitialState = (): MockupState => {
         savedTemplates: [],
         notes: '',
         referenceImages: [],
+        siteCaptures: [],
         lastSaved: Date.now(),
         isOnline: navigator.onLine,
         isSyncing: false
@@ -157,6 +161,7 @@ const createCleanProjectState = (user: UserProfile | null, isOnline: boolean): M
         savedTemplates: [],
         notes: '',
         referenceImages: [],
+        siteCaptures: [],
         lastSaved: Date.now(),
         isOnline,
         isSyncing: false,
@@ -192,6 +197,12 @@ const App: React.FC = () => {
   const [showProjectManager, setShowProjectManager] = useState(false);
   const [showDriveSettings, setShowDriveSettings] = useState(false);
   const [showAccountSettings, setShowAccountSettings] = useState(false);
+  const [showProposal3D, setShowProposal3D] = useState(false);
+  const [isPhoneCapture, setIsPhoneCapture] = useState(() => {
+      const params = new URLSearchParams(window.location.search);
+      if (params.get('editor') === '1') return false;
+      return params.get('mobileCapture') === '1' || window.matchMedia('(max-width: 699px), (max-height: 699px) and (pointer: coarse)').matches;
+  });
   const [driveStatus, setDriveStatus] = useState<ConnectorStatus>('disconnected');
   const [driveNeedsReconnect, setDriveNeedsReconnect] = useState(false);
   const [driveReconnectProvider, setDriveReconnectProvider] = useState<CloudProvider | null>(null);
@@ -203,6 +214,15 @@ const App: React.FC = () => {
       document.documentElement.classList.toggle('signagepro-authenticated', !!state.user);
       return () => document.documentElement.classList.remove('signagepro-authenticated');
   }, [state.user]);
+  useEffect(() => {
+      const media = window.matchMedia('(max-width: 699px), (max-height: 699px) and (pointer: coarse)');
+      const updateMode = () => {
+          const params = new URLSearchParams(window.location.search);
+          setIsPhoneCapture(params.get('editor') !== '1' && (params.get('mobileCapture') === '1' || media.matches));
+      };
+      media.addEventListener('change', updateMode);
+      return () => media.removeEventListener('change', updateMode);
+  }, []);
 
   const handleViewLockedChange = useCallback((locked: boolean) => {
       setViewLocked(locked);
@@ -529,7 +549,7 @@ const App: React.FC = () => {
       return () => {
           if (syncTimeoutRef.current) clearTimeout(syncTimeoutRef.current);
       };
-  }, [state.canvases, state.titleBlock, state.notes, state.referenceImages, triggerBackendSync, state.user, state.projectName]);
+  }, [state.canvases, state.titleBlock, state.notes, state.referenceImages, state.siteCaptures, triggerBackendSync, state.user, state.projectName]);
 
 
   const activeCanvas = state.canvases.find(c => c.id === state.activeCanvasId) || state.canvases[0];
@@ -747,20 +767,28 @@ const App: React.FC = () => {
   // --- Guided calibration workflow ---
   const openCalibration = (options?: { addPlane?: boolean }) => {
       const existing = activeCanvas?.calibration ?? null;
+      const existingPlanes = existing?.planes?.length
+          ? existing.planes
+          : existing?.plane ? [{ id: 'legacy-plane', name: 'Wall 1', ...existing.plane }] : [];
+      const activeExistingPlane = existingPlanes.find(plane => plane.id === existing?.activePlaneId) ?? existingPlanes[0];
       const isPlane = !!existing?.plane && !options?.addPlane;
       setCalibrationDraft({
-          stage: options?.addPlane ? 'place' : 'choose',
+          stage: 'choose',
           method: options?.addPlane ? 'plane' : isPlane ? 'plane' : existing ? 'line' : null,
-          points: existing?.plane ? [...existing.plane.corners] : existing ? [existing.start, existing.end] : [],
+          points: options?.addPlane ? [] : activeExistingPlane ? [...activeExistingPlane.corners] : existing ? [existing.start, existing.end] : [],
           presetId: isPlane ? 'custom_plane' : existing ? 'custom' : 'door_height',
           value: existing && !isPlane ? String(existing.realValue) : '',
-          width: options?.addPlane ? '0.813' : existing?.plane ? String(existing.plane.widthMm / 1000) : '0.813',
-          height: options?.addPlane ? '2.032' : existing?.plane ? String(existing.plane.heightMm / 1000) : '2.032',
-          unit: isPlane ? 'm' : existing?.unit ?? 'm',
+          width: options?.addPlane ? '0.813' : activeExistingPlane ? String(activeExistingPlane.widthMm / 1000) : '0.813',
+          height: options?.addPlane ? '2.032' : activeExistingPlane ? String(activeExistingPlane.heightMm / 1000) : '2.032',
+          unit: options?.addPlane ? 'mm' : isPlane ? 'm' : existing?.unit ?? 'm',
           reapply: false,
-          planeName: options?.addPlane ? `Wall ${(existing?.planes?.length ?? (existing?.plane ? 1 : 0)) + 1}` : (existing?.planes?.find(plane => plane.id === existing.activePlaneId)?.name ?? 'Wall 1'),
+          planeName: options?.addPlane ? `Wall ${existingPlanes.length + 1}` : (activeExistingPlane?.name ?? 'Wall 1'),
           addPlane: !!options?.addPlane,
-          editingPlaneId: options?.addPlane ? null : existing?.activePlaneId ?? (existing?.plane ? 'legacy-plane' : null),
+          editingPlaneId: options?.addPlane ? null : activeExistingPlane?.id ?? null,
+          planeMode: activeExistingPlane?.calibrationKind === 'parallel-offset' ? 'parallel-offset' : 'known-size',
+          referencePlaneId: activeExistingPlane?.referencePlaneId ?? existingPlanes.find(plane => plane.calibrationKind !== 'parallel-offset')?.id ?? '',
+          offset: activeExistingPlane?.offsetMm !== undefined ? String(Math.abs(activeExistingPlane.offsetMm)) : '500',
+          offsetDirection: (activeExistingPlane?.offsetMm ?? 0) < 0 ? 'forward' : 'behind',
       });
   };
 
@@ -1086,6 +1114,35 @@ const App: React.FC = () => {
       notify('New clean project started.', 'success');
   };
 
+  const handlePromoteSiteCapture = async (capture: SiteCapturePhoto) => {
+      if (capture.promotedCanvasId) return;
+      let backgroundImage = capture.workingRef;
+      if (capture.workingRef.startsWith('site-capture://')) {
+          const blob = await getSiteCaptureAsset(capture.workingRef);
+          if (!blob) throw new Error('The working photograph is missing from this device.');
+          backgroundImage = await blobToDataUri(blob);
+      }
+      const current = stateRef.current;
+      const newCanvas = createDefaultCanvas(current.canvases.length);
+      const replaceableCanvas = current.canvases.length === 1 && !current.canvases[0].backgroundImage && current.canvases[0].signs.length === 0 && current.canvases[0].dimensions.length === 0 && !current.canvases[0].calibration;
+      if (replaceableCanvas) newCanvas.id = current.canvases[0].id;
+      newCanvas.name = capture.label;
+      newCanvas.sheetTitle = capture.label.toUpperCase();
+      newCanvas.backgroundImage = backgroundImage;
+      newCanvas.backgroundSize = { width: capture.workingPixelWidth, height: capture.workingPixelHeight };
+      const nextCaptures = (current.siteCaptures ?? []).map(item => item.id === capture.id ? { ...item, promotedCanvasId: newCanvas.id } : item);
+      let titleBlock = current.titleBlock;
+      if (capture.location?.address) {
+          titleBlock = { ...titleBlock, fields: titleBlock.fields.map(field => field.label === 'ADDRESS' && !field.value ? { ...field, value: capture.location!.address! } : field) };
+      }
+      const nextCanvases = replaceableCanvas ? [newCanvas] : [...current.canvases, newCanvas];
+      const next = { ...current, canvases: nextCanvases, activeCanvasId: newCanvas.id, siteCaptures: nextCaptures, titleBlock, lastSaved: Date.now() };
+      stateRef.current = next;
+      setState(next);
+      addToHistory(next);
+      notify(`${capture.label} is ready in the iPad and desktop editor.`, 'success');
+  };
+
   // --- Render ---
   if (isAuthLoading) {
       return (
@@ -1139,6 +1196,22 @@ const App: React.FC = () => {
                   </p>
               </div>
           </div>
+      );
+  }
+
+  if (isPhoneCapture) {
+      return (
+        <Suspense fallback={<div className="fixed inset-0 grid place-items-center bg-[#080c11] text-slate-400"><Loader2 className="h-7 w-7 animate-spin" /></div>}>
+          <MobileSiteCapture
+            state={state}
+            syncStatus={syncStatus}
+            onUpdate={updateState}
+            onLoadProject={handleProjectLoad}
+            onNewProject={handleNewProject}
+            onPromoteCapture={handlePromoteSiteCapture}
+            onLogout={handleLogout}
+          />
+        </Suspense>
       );
   }
 
@@ -1208,6 +1281,8 @@ const App: React.FC = () => {
           <CalibrationWizard
               draft={calibrationDraft}
               imageSize={activeCanvas.backgroundSize}
+              existingCalibration={activeCanvas.calibration ?? null}
+              camera={activeCanvas.placement?.camera ?? { enabled: false, fieldOfViewDeg: 60, estimated: true }}
               existingDimensionCount={activeCanvas.dimensions.length}
               onChange={setCalibrationDraft}
               onApply={applyCalibration}
@@ -1310,7 +1385,28 @@ const App: React.FC = () => {
            onCropConfirm={handleCrop}
            onCancelCrop={() => setIsCropping(false)}
          />
+         <button
+           type="button"
+           onClick={() => setShowProposal3D(true)}
+           className="absolute left-3 top-[max(4.5rem,calc(env(safe-area-inset-top)+4.5rem))] z-40 flex h-10 items-center gap-2 rounded-xl border border-cyan-400/25 bg-gray-950/85 px-3 text-[11px] font-bold uppercase tracking-[0.12em] text-cyan-200 shadow-xl backdrop-blur transition hover:border-cyan-300/50 hover:bg-cyan-400/10 lg:left-4 lg:top-4"
+           aria-label="Open 3D proposal viewer"
+           title="Open rotatable 3D proposal"
+         >
+           <Building2 className="h-4 w-4" /> 3D proposal
+         </button>
       </div>
+
+      {showProposal3D && (
+        <Suspense fallback={<div className="fixed inset-0 z-[90] grid place-items-center bg-gray-950 text-sm text-gray-400"><Loader2 className="mr-2 inline h-5 w-5 animate-spin" /> Preparing 3D proposal…</div>}>
+          <Proposal3DViewer
+            canvases={state.canvases}
+            settings={state.buildingModel}
+            isNightMode={state.isNightMode}
+            onChange={buildingModel => updateStateWithHistory({ buildingModel })}
+            onClose={() => setShowProposal3D(false)}
+          />
+        </Suspense>
+      )}
 
       {showProjectManager && (
           <Suspense fallback={null}>
