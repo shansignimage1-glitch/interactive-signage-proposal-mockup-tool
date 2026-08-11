@@ -12,7 +12,7 @@ import { optimizeDataUri } from '../services/imageProcessing';
 import { materializeTemplateDataUri } from '../services/LibraryService';
 import { calibrationForPlane, getCalibrationPlanes } from '../utils/cameraGeometry';
 import { detectSignArtwork } from '../utils/elementDetection';
-import { defaultExtrusionModeForType, getBackingDepth, getSignExtrusionMode } from '../utils/signExtrusion';
+import { defaultExtrusionModeForType, getBackingDepth, getSignExtrusionMode, VISUAL_EXTRUSION_REFERENCE_WIDTH_PX } from '../utils/signExtrusion';
 
 interface ControlsPanelProps {
   state: MockupState;
@@ -554,10 +554,10 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
             notify('No letters or logo could be isolated. Open 3D Elements to refine detection.', 'warning');
             return;
           }
-          const quadWidth = (Math.hypot(sign.corners[1].x - sign.corners[0].x, sign.corners[1].y - sign.corners[0].y)
-            + Math.hypot(sign.corners[2].x - sign.corners[3].x, sign.corners[2].y - sign.corners[3].y)) / 2;
-          const imageToCanvasScale = quadWidth / Math.max(1, sourceSize.width);
-          const elementDepth = Math.max(2, sign.extrusionDepth / Math.max(0.01, imageToCanvasScale));
+          const elementDepth = Math.max(
+            2,
+            sourceSize.width * sign.extrusionDepth / VISUAL_EXTRUSION_REFERENCE_WIDTH_PX,
+          );
           updateSignById(sign.id, {
             elements: elements.map((element, index) => ({
               id: `auto-${index}-${Math.round(element.bbox.x)}-${Math.round(element.bbox.y)}`,
@@ -567,6 +567,7 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
               enabled: true,
             })),
             elementsSourceSize: sourceSize,
+            elementDepthModel: 'relative-width-v1',
           });
         })
         .catch(error => {
@@ -602,12 +603,34 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
       camera: { enabled: false, fieldOfViewDeg: 60, estimated: true },
   };
   const updatePlacement = (updates: Partial<PlacementSettings>) => updateActiveCanvas({ placement: { ...placement, ...updates } });
+  const updateCameraEnabled = (enabled: boolean) => {
+      updateActiveCanvasWithHistory({
+          placement: { ...placement, camera: { ...placement.camera, enabled } },
+          signs: enabled
+              ? activeCanvas.signs
+              : activeCanvas.signs.map(sign => sign.projectionMode === 'camera-3d' ? { ...sign, projectionMode: 'planar' as const } : sign),
+      });
+  };
+  const updateProjectionMode = (projectionMode: 'planar' | 'camera-3d') => {
+      if (!activeSign) return;
+      const camera = projectionMode === 'camera-3d'
+          ? { ...placement.camera, enabled: true }
+          : placement.camera;
+      updateActiveCanvasWithHistory({
+          signs: activeCanvas.signs.map(sign => sign.id === activeSign.id ? { ...sign, projectionMode } : sign),
+          placement: { ...placement, camera },
+      });
+  };
   const selectPlane = (planeId: string) => {
       if (!calibration) return;
       const plane = planes.find(item => item.id === planeId);
       if (!plane) return;
-      updateActiveCanvas({ calibration: { ...calibration, activePlaneId: plane.id, plane: { corners: plane.corners, widthMm: plane.widthMm, heightMm: plane.heightMm } } });
-      if (activeSign) updateActiveSign({ calibrationPlaneId: plane.id });
+      updateActiveCanvasWithHistory({
+          calibration: { ...calibration, activePlaneId: plane.id, plane: { corners: plane.corners, widthMm: plane.widthMm, heightMm: plane.heightMm } },
+          signs: activeSign
+              ? activeCanvas.signs.map(sign => sign.id === activeSign.id ? { ...sign, calibrationPlaneId: plane.id } : sign)
+              : activeCanvas.signs,
+      });
   };
   const mmPerPx = calibration ? getMmPerPx(calibration) : null;
 
@@ -994,7 +1017,7 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
                         {placement.lens.enabled && <><div><div className="flex justify-between text-[10px] text-gray-400"><span>Barrel / pincushion</span><span>{placement.lens.k1.toFixed(2)}</span></div><input aria-label="Primary lens correction" type="range" min="-0.5" max="0.5" step="0.01" value={placement.lens.k1} onChange={event => updatePlacement({ lens: { ...placement.lens, k1: Number(event.target.value) } })} className="w-full accent-cyan-500" /></div><div><div className="flex justify-between text-[10px] text-gray-400"><span>Edge refinement</span><span>{placement.lens.k2.toFixed(2)}</span></div><input aria-label="Secondary lens correction" type="range" min="-0.25" max="0.25" step="0.01" value={placement.lens.k2} onChange={event => updatePlacement({ lens: { ...placement.lens, k2: Number(event.target.value) } })} className="w-full accent-cyan-500" /></div><p className="text-[9px] text-amber-300">Changing correction changes photo geometry; refine calibration points afterward.</p></>}
                     </div>
                     <div className="border-t border-gray-700 pt-3 space-y-2">
-                        <label className="flex min-h-10 items-center justify-between text-xs text-gray-300"><span>Camera pose <span className="block text-[9px] text-gray-500">For projecting and freestanding signs</span></span><input aria-label="Camera pose estimation" type="checkbox" checked={placement.camera.enabled} onChange={event => updatePlacement({ camera: { ...placement.camera, enabled: event.target.checked } })} className="accent-cyan-500" /></label>
+                        <label className="flex min-h-10 items-center justify-between text-xs text-gray-300"><span>Camera pose <span className="block text-[9px] text-gray-500">For projecting and freestanding signs</span></span><input aria-label="Camera pose estimation" type="checkbox" checked={placement.camera.enabled} onChange={event => updateCameraEnabled(event.target.checked)} className="accent-cyan-500" /></label>
                         {placement.camera.enabled && <label className="block text-[10px] text-gray-400">Horizontal field of view · {placement.camera.fieldOfViewDeg}°<input aria-label="Camera field of view" type="range" min="25" max="100" step="1" value={placement.camera.fieldOfViewDeg} onChange={event => updatePlacement({ camera: { ...placement.camera, fieldOfViewDeg: Number(event.target.value), estimated: true, focalLengthPx: undefined } })} className="mt-1 w-full accent-cyan-500" /><span className="mt-1 block text-[9px] text-amber-300">Estimated pose · enter verified camera data in a future EXIF workflow for survey-grade output.</span></label>}
                     </div>
                 </div>
@@ -1135,10 +1158,10 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
                                           <div className="mt-3 space-y-3">
                                               <label className="block text-xs text-gray-400">Sign construction<select aria-label="Sign extrusion construction" value={getSignExtrusionMode(activeSign)} onChange={event => updateActiveSign({ extrusionMode: event.target.value as 'backed' | 'individual' })} className="mt-1 min-h-10 w-full rounded-lg border border-gray-700 bg-gray-900 px-2 text-xs text-white"><option value="backed">Backing board + raised letters/logo</option><option value="individual">Individual letters/logo (no board)</option></select></label>
                                               {preparingExtrusionId === activeSign.id && <div data-testid="extrusion-detection-status" className="flex items-center gap-2 rounded-lg border border-cyan-500/20 bg-cyan-500/10 px-3 py-2 text-[10px] text-cyan-200"><Loader2 className="h-3.5 w-3.5 animate-spin" /> Isolating letters and logo…</div>}
-                                              {planes.length > 0 && <label className="block text-xs text-gray-400">Projection model<select aria-label="Sign projection model" value={activeSign.projectionMode ?? 'planar'} onChange={event => updateActiveSign({ projectionMode: event.target.value as 'planar' | 'camera-3d' })} className="mt-1 min-h-10 w-full rounded-lg border border-gray-700 bg-gray-900 px-2 text-xs text-white"><option value="planar">Visual 2D extrusion</option><option value="camera-3d">Camera-pose 3D</option></select></label>}
+                                              {planes.length > 0 && <label className="block text-xs text-gray-400">Projection model<select aria-label="Sign projection model" value={activeSign.projectionMode ?? 'planar'} onChange={event => updateProjectionMode(event.target.value as 'planar' | 'camera-3d')} className="mt-1 min-h-10 w-full rounded-lg border border-gray-700 bg-gray-900 px-2 text-xs text-white"><option value="planar">Visual 2D extrusion</option><option value="camera-3d">Camera-pose 3D</option></select></label>}
                                               {activeSign.projectionMode === 'camera-3d' && <div><div className="mb-1 flex justify-between"><label className="text-xs text-gray-400">Physical depth</label><span className="font-mono text-xs text-cyan-300">{activeSign.physicalDepthMm ?? 100}mm</span></div><input aria-label="Physical sign depth" type="range" min="10" max="2000" step="10" value={activeSign.physicalDepthMm ?? 100} onChange={event => updateActiveSign({ physicalDepthMm: Number(event.target.value) })} className="h-2 w-full accent-cyan-500" /><p className="mt-1 text-[9px] text-gray-500">Projected with the selected plane and camera field of view.</p></div>}
-                                              <div><div className="mb-1 flex justify-between"><label className="text-xs text-gray-400">Letter / logo depth</label><span className="font-mono text-xs text-cyan-300">{activeSign.extrusionDepth}px</span></div><input aria-label="Letter and logo extrusion depth" type="range" min="1" max="100" value={activeSign.extrusionDepth} onChange={(e) => updateLetterDepth(parseInt(e.target.value))} className="h-2 w-full accent-cyan-500" /></div>
-                                              {getSignExtrusionMode(activeSign) === 'backed' && <div><div className="mb-1 flex justify-between"><label className="text-xs text-gray-400">Backing board depth</label><span className="font-mono text-xs text-cyan-300">{getBackingDepth(activeSign).toFixed(0)}px</span></div><input aria-label="Backing board extrusion depth" type="range" min="0" max={Math.max(1, Math.floor(activeSign.extrusionDepth * 0.8))} value={getBackingDepth(activeSign)} onChange={event => updateActiveSign({ backingDepth: Number(event.target.value) })} className="h-2 w-full accent-cyan-500" /><p className="mt-1 text-[9px] text-gray-500">The board remains shallower than the raised copy.</p></div>}
+                                              <div><div className="mb-1 flex justify-between"><label className="text-xs text-gray-400">Visual letter / logo depth</label><span className="font-mono text-xs text-cyan-300">{(activeSign.extrusionDepth / VISUAL_EXTRUSION_REFERENCE_WIDTH_PX * 100).toFixed(1)}%</span></div><input aria-label="Letter and logo extrusion depth" type="range" min="1" max="100" value={activeSign.extrusionDepth} onChange={(e) => updateLetterDepth(parseInt(e.target.value))} className="h-2 w-full accent-cyan-500" /><p className="mt-1 text-[9px] text-gray-500">Relative to the placed sign width, so depth stays consistent on desktop and iPad.</p></div>
+                                              {getSignExtrusionMode(activeSign) === 'backed' && <div><div className="mb-1 flex justify-between"><label className="text-xs text-gray-400">Backing board depth</label><span className="font-mono text-xs text-cyan-300">{(getBackingDepth(activeSign) / VISUAL_EXTRUSION_REFERENCE_WIDTH_PX * 100).toFixed(1)}%</span></div><input aria-label="Backing board extrusion depth" type="range" min="0" max={Math.max(1, Math.floor(activeSign.extrusionDepth * 0.8))} value={getBackingDepth(activeSign)} onChange={event => updateActiveSign({ backingDepth: Number(event.target.value) })} className="h-2 w-full accent-cyan-500" /><p className="mt-1 text-[9px] text-gray-500">The board remains shallower than the raised copy.</p></div>}
                                               <div><div className="mb-1 flex justify-between"><label className="text-xs text-gray-400">Direction</label><span className="font-mono text-xs text-cyan-300">{activeSign.extrusionAngle}°</span></div><input type="range" min="0" max="360" value={activeSign.extrusionAngle} onChange={(e) => updateActiveSign({ extrusionAngle: parseInt(e.target.value) })} className="h-2 w-full accent-cyan-500" /></div>
                                               <label className="flex items-center justify-between text-xs text-gray-400"><span>Side colour</span><input type="color" value={activeSign.sideColor} onChange={(e) => updateActiveSign({ sideColor: e.target.value })} className="h-8 w-12 cursor-pointer rounded border border-gray-600 bg-transparent p-0.5" /></label>
                                           </div>

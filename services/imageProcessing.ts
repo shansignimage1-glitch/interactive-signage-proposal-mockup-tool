@@ -3,25 +3,43 @@ import { blobToDataUri, dataUriToBlob } from './imageHash';
 export const MAX_SOURCE_BYTES = 40 * 1024 * 1024;
 export const MAX_SOURCE_PIXELS = 80_000_000;
 export const DEFAULT_MAX_DIMENSION = 4096;
+const WEB_SAFE_IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp']);
 
 export class ImageTooLargeError extends Error { name = 'ImageTooLargeError'; }
 export class StorageQuotaError extends Error { name = 'StorageQuotaError'; }
 
 type DecodedImage = CanvasImageSource & { width: number; height: number; close: () => void };
 
+const decodeWithImageElement = async (blob: Blob): Promise<DecodedImage> => {
+  const url = URL.createObjectURL(blob);
+  const image = new Image();
+  image.src = url;
+  try {
+    await image.decode();
+    return Object.assign(image, { close: () => URL.revokeObjectURL(url) }) as DecodedImage;
+  } catch {
+    URL.revokeObjectURL(url);
+    throw new Error('This photo format could not be decoded on this device. Open it in the device photo editor, save a JPEG copy, and try again.');
+  }
+};
+
 const decode = async (blob: Blob): Promise<DecodedImage> => {
   if (blob.size > MAX_SOURCE_BYTES) throw new ImageTooLargeError('This photo is larger than 40 MB. Use the device photo editor to reduce it first.');
   let bitmap: DecodedImage;
   if ('createImageBitmap' in globalThis) {
-    bitmap = await createImageBitmap(blob, { imageOrientation: 'from-image' }) as DecodedImage;
+    try {
+      bitmap = await createImageBitmap(blob, { imageOrientation: 'from-image' }) as DecodedImage;
+    } catch {
+      // Safari can expose createImageBitmap but reject a camera blob (notably
+      // HEIC/HEIF files) or the orientation option. Its image element decoder
+      // still understands photos captured by the device, so use it as the
+      // compatibility path instead of surfacing the browser's raw Blob error.
+      bitmap = await decodeWithImageElement(blob);
+    }
   } else {
     // Older iPadOS/Safari builds may not expose createImageBitmap. Keep a
     // normal image-element path so field uploads still work on those devices.
-    const url = URL.createObjectURL(blob);
-    const image = new Image();
-    image.src = url;
-    await image.decode();
-    bitmap = Object.assign(image, { close: () => URL.revokeObjectURL(url) }) as DecodedImage;
+    bitmap = await decodeWithImageElement(blob);
   }
   if (bitmap.width * bitmap.height > MAX_SOURCE_PIXELS) {
     bitmap.close();
@@ -40,13 +58,17 @@ export const readImageDimensions = async (blob: Blob): Promise<{ width: number; 
 export const optimizeImageBlob = async (blob: Blob, maxDimension = DEFAULT_MAX_DIMENSION): Promise<Blob> => {
   const bitmap = await decode(blob);
   const scale = Math.min(1, maxDimension / Math.max(bitmap.width, bitmap.height));
-  if (scale === 1 && blob.size <= 8 * 1024 * 1024) { bitmap.close(); return blob; }
+  const sourceType = blob.type.toLowerCase();
+  if (scale === 1 && blob.size <= 8 * 1024 * 1024 && WEB_SAFE_IMAGE_TYPES.has(sourceType)) {
+    bitmap.close();
+    return blob;
+  }
   const canvas = document.createElement('canvas');
   canvas.width = Math.max(1, Math.round(bitmap.width * scale));
   canvas.height = Math.max(1, Math.round(bitmap.height * scale));
   const ctx = canvas.getContext('2d', { alpha: true })!;
   ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height); bitmap.close();
-  const preserveTransparency = blob.type === 'image/png' || blob.type === 'image/webp';
+  const preserveTransparency = sourceType === 'image/png' || sourceType === 'image/webp';
   const type = preserveTransparency ? 'image/webp' : 'image/jpeg';
   return new Promise((resolve, reject) => canvas.toBlob(result => result ? resolve(result) : reject(new Error('Image compression failed')), type, 0.86));
 };

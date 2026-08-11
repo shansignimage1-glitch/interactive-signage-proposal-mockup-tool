@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
   ArrowUpRight, Camera, Check, ChevronDown, Cloud, CloudOff, FolderOpen, Images,
-  Loader2, LogOut, MapPin, Mic, NotebookPen, Plus, Ruler, Square, Trash2, WifiOff,
+  Loader2, LogOut, MapPin, Mic, NotebookPen, Plus, Ruler, Save, Square, Trash2, WifiOff,
 } from 'lucide-react';
 import { MeasureUnit, MockupState, ProjectMetadata, ReferenceWallFieldMeasurement, SiteCapturePhoto } from '../types';
 import { currentCoordinates, reverseGeocode } from '../services/PhotoLocationService';
@@ -23,6 +23,7 @@ interface MobileSiteCaptureProps {
   onUpdate: (updates: Partial<MockupState>) => void;
   onLoadProject: (state: MockupState) => void;
   onNewProject: () => Promise<void>;
+  onSaveProject: (name: string) => Promise<void>;
   onPromoteCapture: (capture: SiteCapturePhoto) => Promise<void>;
   onLogout: () => Promise<void>;
 }
@@ -134,13 +135,16 @@ const DictationButton: React.FC<{
   );
 };
 
-const MobileSiteCapture: React.FC<MobileSiteCaptureProps> = ({ state, syncStatus, onUpdate, onLoadProject, onNewProject, onPromoteCapture, onLogout }) => {
+const MobileSiteCapture: React.FC<MobileSiteCaptureProps> = ({ state, syncStatus, onUpdate, onLoadProject, onNewProject, onSaveProject, onPromoteCapture, onLogout }) => {
   const captures = state.siteCaptures ?? [];
   const [tab, setTab] = useState<MobileTab>('capture');
   const [activeCaptureId, setActiveCaptureId] = useState<string | null>(captures[0]?.id ?? null);
   const [isProcessing, setIsProcessing] = useState(false);
   const [projectPickerOpen, setProjectPickerOpen] = useState(false);
   const [projects, setProjects] = useState<ProjectMetadata[]>([]);
+  const [projectNameDraft, setProjectNameDraft] = useState(state.projectName);
+  const [isSavingProject, setIsSavingProject] = useState(false);
+  const [selectedProjectId, setSelectedProjectId] = useState(state.projectId);
   const [measurementUnit, setMeasurementUnit] = useState<MeasureUnit>('m');
   const fileInputRef = useRef<HTMLInputElement>(null);
   const activeCapture = captures.find(capture => capture.id === activeCaptureId) ?? captures[0] ?? null;
@@ -225,8 +229,30 @@ const MobileSiteCapture: React.FC<MobileSiteCaptureProps> = ({ state, syncStatus
   };
 
   const openProjectPicker = async () => {
+    setProjectNameDraft(state.projectName);
+    setSelectedProjectId(state.projectId);
     setProjects((await StorageService.listProjectsLocal()).sort((a, b) => b.lastModified - a.lastModified));
     setProjectPickerOpen(true);
+  };
+
+  const saveCurrentProject = async () => {
+    const name = projectNameDraft.trim();
+    if (!name) {
+      notify('Enter a project name before saving.', 'warning');
+      return;
+    }
+    setIsSavingProject(true);
+    try {
+      await onSaveProject(name);
+      (document.activeElement as HTMLElement | null)?.blur();
+      setSelectedProjectId(state.projectId);
+      setProjects((await StorageService.listProjectsLocal()).sort((a, b) => b.lastModified - a.lastModified));
+      notify(`${name} saved.`, 'success');
+    } catch (error) {
+      notify(error instanceof Error ? error.message : 'The project could not be saved.', 'error');
+    } finally {
+      setIsSavingProject(false);
+    }
   };
 
   const loadProject = async (projectId: string) => {
@@ -350,7 +376,35 @@ const MobileSiteCapture: React.FC<MobileSiteCaptureProps> = ({ state, syncStatus
         ] as const).map(([id, Icon, label]) => <button key={id} onClick={() => setTab(id)} className={`flex min-h-14 flex-col items-center justify-center gap-1 rounded-xl text-[9px] font-bold uppercase tracking-wider ${tab === id ? 'bg-orange-400/12 text-orange-300' : 'text-slate-500'}`} aria-current={tab === id ? 'page' : undefined}><Icon className="h-5 w-5" />{label}</button>)}
       </nav>
 
-      {projectPickerOpen && <div className="absolute inset-0 z-40 flex items-end bg-black/70 backdrop-blur-sm" onClick={() => setProjectPickerOpen(false)}><section onClick={event => event.stopPropagation()} className="max-h-[78vh] w-full overflow-y-auto rounded-t-[28px] border-t border-white/10 bg-[#111821] p-4 pb-[max(1.5rem,env(safe-area-inset-bottom))]"><div className="mx-auto mb-4 h-1 w-12 rounded-full bg-slate-700" /><div className="mb-4 flex items-center justify-between"><h2 className="text-lg font-semibold">Choose project</h2><button onClick={() => void onNewProject().then(() => setProjectPickerOpen(false))} className="flex min-h-11 items-center gap-2 rounded-xl bg-orange-500 px-3 text-xs font-bold text-black"><Plus className="h-4 w-4" />New project</button></div><label className="mb-4 block text-[10px] font-bold uppercase tracking-[0.14em] text-slate-500">Current project name<input value={state.projectName} onChange={event => onUpdate({ projectName: event.target.value, lastSaved: Date.now() })} className="mt-1.5 h-12 w-full rounded-xl border border-slate-700 bg-[#090d12] px-3 text-base normal-case tracking-normal text-white outline-none focus:border-orange-400" /></label><div className="space-y-2">{projects.map(project => <button key={project.id} onClick={() => void loadProject(project.id)} className={`flex min-h-16 w-full items-center justify-between rounded-2xl border p-3 text-left ${project.id === state.projectId ? 'border-orange-400/60 bg-orange-400/10' : 'border-slate-800 bg-[#0b1016]'}`}><span><span className="block text-sm font-semibold">{project.name}</span><span className="mt-1 block text-[10px] text-slate-500">{project.canvasCount} editor view{project.canvasCount === 1 ? '' : 's'} · {new Date(project.lastModified).toLocaleDateString()}</span></span>{project.id === state.projectId && <Check className="h-5 w-5 text-orange-300" />}</button>)}</div></section></div>}
+      {projectPickerOpen && (
+        <div className="absolute inset-0 z-40 flex items-end bg-black/70 backdrop-blur-sm" onClick={() => setProjectPickerOpen(false)}>
+          <section onClick={event => event.stopPropagation()} className="max-h-[78vh] w-full overflow-y-auto rounded-t-[28px] border-t border-white/10 bg-[#111821] p-4 pb-[max(1.5rem,env(safe-area-inset-bottom))]" aria-label="Saved projects">
+            <div className="mx-auto mb-4 h-1 w-12 rounded-full bg-slate-700" />
+            <div className="mb-4 flex items-center justify-between gap-3">
+              <div><p className="text-[9px] font-bold uppercase tracking-[0.2em] text-orange-300">Project storage</p><h2 className="mt-1 text-lg font-semibold">Saved projects</h2></div>
+              <button onClick={() => void onNewProject().then(() => setProjectPickerOpen(false))} className="flex min-h-11 items-center gap-2 rounded-xl bg-orange-500 px-3 text-xs font-bold text-black"><Plus className="h-4 w-4" />New project</button>
+            </div>
+            <div className="mb-5 rounded-2xl border border-orange-400/25 bg-orange-400/[0.06] p-3">
+              <label className="block text-[10px] font-bold uppercase tracking-[0.14em] text-slate-400">
+                Current project name
+                <input value={projectNameDraft} onChange={event => setProjectNameDraft(event.target.value)} className="mt-1.5 h-12 w-full rounded-xl border border-slate-700 bg-[#090d12] px-3 text-base normal-case tracking-normal text-white outline-none focus:border-orange-400" />
+              </label>
+              <button onClick={() => void saveCurrentProject()} disabled={isSavingProject || !projectNameDraft.trim()} className="mt-3 flex min-h-12 w-full items-center justify-center gap-2 rounded-xl bg-orange-500 px-4 text-sm font-black uppercase tracking-[0.1em] text-black shadow-[0_12px_30px_rgba(249,115,22,0.22)] active:scale-[0.99] disabled:opacity-40" aria-label="Save current project">
+                {isSavingProject ? <><Loader2 className="h-5 w-5 animate-spin" />Saving project…</> : <><Save className="h-5 w-5" />Save project</>}
+              </button>
+            </div>
+            <div className="mb-2 flex items-center justify-between"><h3 className="text-[10px] font-bold uppercase tracking-[0.16em] text-slate-500">Projects on this device</h3><span className="font-mono text-[10px] text-slate-600">{projects.length}</span></div>
+            <div className="space-y-2">
+              {projects.map(project => (
+                <button key={project.id} onClick={() => void loadProject(project.id)} aria-current={project.id === selectedProjectId ? 'true' : undefined} data-testid={project.id === selectedProjectId ? 'current-saved-project' : undefined} className={`flex min-h-16 w-full items-center justify-between rounded-2xl border p-3 text-left ${project.id === selectedProjectId ? 'border-orange-400/60 bg-orange-400/10' : 'border-slate-800 bg-[#0b1016]'}`}>
+                  <span><span className="block text-sm font-semibold">{project.name}</span><span className="mt-1 block text-[10px] text-slate-500">{project.canvasCount} editor view{project.canvasCount === 1 ? '' : 's'} · {new Date(project.lastModified).toLocaleDateString()}</span></span>
+                  {project.id === selectedProjectId && <Check className="h-5 w-5 text-orange-300" />}
+                </button>
+              ))}
+            </div>
+          </section>
+        </div>
+      )}
     </div>
   );
 };

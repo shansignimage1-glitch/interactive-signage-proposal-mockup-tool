@@ -53,7 +53,7 @@ vi.mock('../../services/AssetResolver', () => ({
   resolveProjectImages: async (state: unknown) => ({ state, failedRefs: [], needsReconnect: false }),
 }));
 
-import { makeSiteCaptureAssetRef, putSiteCaptureAsset, StorageService } from '../../services/StorageService';
+import { getSiteCaptureAsset, makeSiteCaptureAssetRef, putSiteCaptureAsset, StorageService } from '../../services/StorageService';
 
 describe('StorageService save/load', () => {
   beforeEach(() => {
@@ -146,5 +146,19 @@ describe('StorageService save/load', () => {
       })],
     }));
     await StorageService.deleteProjectLocal(project.projectId);
+  });
+
+  it('round-trips site-capture files through clone-safe bytes', async () => {
+    const projectId = `asset-${Date.now()}`;
+    const ref = makeSiteCaptureAssetRef(projectId, 'capture-1', 'original');
+    const original = new File(['camera-original'], 'camera.heic', { type: 'image/heic' });
+
+    await putSiteCaptureAsset(ref, original);
+    const restored = await getSiteCaptureAsset(ref);
+
+    expect(restored).toBeInstanceOf(Blob);
+    expect(restored?.type).toBe('image/heic');
+    expect(await restored?.text()).toBe('camera-original');
+    await StorageService.deleteProjectLocal(projectId);
   });
 });

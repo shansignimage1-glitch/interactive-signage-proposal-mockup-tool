@@ -13,7 +13,7 @@
     "test:rules": "firebase emulators:exec --only firestore,storage \"vitest run --config vitest.rules.config.ts\"",
     "test:e2e": "playwright test",
     "test:e2e:ipad": "playwright test --project=ipad",
-    "test:e2e:install": "playwright install chromium",
+    "test:e2e:install": "playwright install chromium webkit",
     "test:all": "npm run test:unit && npm run test:rules && npm run test:e2e",
     "admin:claim": "node scripts/set-admin-claim.mjs"
   },

@@ -14,7 +14,9 @@ export default defineConfig({
   projects: [
     { name: 'desktop-chromium', use: { ...devices['Desktop Chrome'] } },
     { name: 'ipad', use: { ...devices['iPad Pro 11'], browserName: 'chromium' } },
+    { name: 'ipad-webkit', use: { ...devices['iPad Pro 11'], browserName: 'webkit' } },
     { name: 'iphone', testMatch: /mobile-site-capture\.spec\.ts/, use: { ...devices['iPhone 13'], browserName: 'chromium' } },
+    { name: 'iphone-webkit', testMatch: /mobile-site-capture\.spec\.ts/, use: { ...devices['iPhone 13'], browserName: 'webkit' } },
     { name: 'android-phone', testMatch: /mobile-site-capture\.spec\.ts/, use: { ...devices['Pixel 7'], browserName: 'chromium' } },
   ],
   webServer: {

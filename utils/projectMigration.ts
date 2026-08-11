@@ -1,5 +1,5 @@
 import { MockupState } from '../types';
-import { defaultExtrusionModeForType } from './signExtrusion';
+import { defaultExtrusionModeForType, VISUAL_EXTRUSION_REFERENCE_WIDTH_PX } from './signExtrusion';
 import { normalizeBuildingModel } from './buildingModel';
 
 /** Normalizes projects saved by older app versions before they enter React state. */
@@ -13,15 +13,39 @@ export const normalizeProjectState = (input: MockupState): MockupState => {
     const activePlane = planes.find(plane => plane.id === activePlaneId) ?? planes[0];
     return ({
     ...canvas,
-    signs: Array.isArray(canvas.signs) ? canvas.signs.map(sign => ({
-      ...sign,
-      placementAnchor: sign.placementAnchor ?? 'center',
-      projectionMode: sign.projectionMode ?? 'planar',
-      physicalDepthMm: sign.physicalDepthMm ?? 100,
-      extrusionMode: sign.extrusionMode ?? defaultExtrusionModeForType(sign.signType ?? 'fascia_non_ill'),
-      backingDepth: sign.backingDepth ?? Math.max(2, Math.round((sign.extrusionDepth ?? 15) / 3)),
-      calibrationPlaneId: sign.calibrationPlaneId ?? activePlaneId,
-    })) : [],
+    signs: Array.isArray(canvas.signs) ? canvas.signs.map(sign => {
+      const elements = Array.isArray(sign.elements) ? sign.elements : undefined;
+      const isLegacyAutoDetection = !sign.elementDepthModel
+        && Boolean(elements?.length)
+        && Boolean(sign.elementsSourceSize)
+        && elements!.every(element => element.id.startsWith('auto-'));
+      let migratedElements = elements;
+
+      if (isLegacyAutoDetection && elements && sign.elementsSourceSize) {
+        const previousReference = Math.max(1, ...elements.map(element => element.depth));
+        const relativeReference = Math.max(
+          1,
+          sign.elementsSourceSize.width * (sign.extrusionDepth ?? 15) / VISUAL_EXTRUSION_REFERENCE_WIDTH_PX,
+        );
+        const scale = relativeReference / previousReference;
+        migratedElements = elements.map(element => ({
+          ...element,
+          depth: Math.max(1, element.depth * scale),
+        }));
+      }
+
+      return {
+        ...sign,
+        elements: migratedElements,
+        elementDepthModel: 'relative-width-v1' as const,
+        placementAnchor: sign.placementAnchor ?? 'center',
+        projectionMode: sign.projectionMode ?? 'planar',
+        physicalDepthMm: sign.physicalDepthMm ?? 100,
+        extrusionMode: sign.extrusionMode ?? defaultExtrusionModeForType(sign.signType ?? 'fascia_non_ill'),
+        backingDepth: sign.backingDepth ?? Math.max(2, Math.round((sign.extrusionDepth ?? 15) / 3)),
+        calibrationPlaneId: sign.calibrationPlaneId ?? activePlaneId,
+      };
+    }) : [],
     dimensions: Array.isArray(canvas.dimensions) ? canvas.dimensions : [],
     activeSignId: canvas.activeSignId ?? null,
     activeDimensionId: canvas.activeDimensionId ?? null,
