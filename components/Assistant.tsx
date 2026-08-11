@@ -18,7 +18,7 @@ const Assistant: React.FC<AssistantProps> = ({ isOpen: propIsOpen, setIsOpen: pr
   const [internalIsOpen, setInternalIsOpen] = useState(false);
   const [isMinimized, setIsMinimized] = useState(false);
   const [messages, setMessages] = useState<Message[]>([
-    { id: 'init', role: 'model', text: 'Hi! I\'m your SignagePro guide. Need help creating a mockup? Just ask or say "Teach me how to start"!' }
+    { id: 'init', role: 'model', text: 'Hi! I\'m your SignagePro guide. I can help with mobile site capture, calibration, sign placement, 3D extrusion and project workflows. What would you like to do?' }
   ]);
   const [inputText, setInputText] = useState('');
   const [isLoading, setIsLoading] = useState(false);
