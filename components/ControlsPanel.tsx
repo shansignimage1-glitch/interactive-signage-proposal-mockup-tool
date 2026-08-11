@@ -1,8 +1,7 @@
 
 import React, { useRef, useState, useEffect } from 'react';
-import { BLEND_MODES, MockupState, Sign, Point, Dimension, SignTemplate, ReferenceImage, TitleBlockField, Canvas, PaperSize, Orientation, SIGN_TYPES, SignType, UnitSystem } from '../types';
-import { distance } from '../utils/math';
-import { getMmPerPx, formatLength, toMm, measureLine, measureBox } from '../utils/measure';
+import { BLEND_MODES, MockupState, Sign, Point, Dimension, SignTemplate, ReferenceImage, TitleBlockField, Canvas, PaperSize, Orientation, SIGN_TYPES, SignType, UnitSystem, PlacementAnchor, PlacementSettings } from '../types';
+import { getMmPerPx, formatLength, toMm, measureLine, measureBox, measureSignSizeMm, resizeSignToRealSize } from '../utils/measure';
 import { Upload, Download, Sun, Moon, Move3d, Palette, Image as ImageIcon, Plus, Trash2, Layers, Eye, Copy, Box, Minus, Maximize, Ruler, ArrowRight, ArrowDown, ArrowLeft, ArrowUp, Scissors, Check, X, Eraser, Loader2, Square, PenTool, MousePointer2, Hand, Mic, EyeOff, Undo2, Redo2, Layout, FileText, Settings, Briefcase, User, Calendar, MapPin, Notebook, Camera, Library, Sparkles, PencilLine, Grid, Save, ChevronDown, ChevronRight, Monitor, Printer, FolderOpen, HardDrive, Lock, Unlock } from 'lucide-react';
 import ImageUploader from './ImageUploader';
 import SignLibrary from './SignLibrary';
@@ -11,6 +10,7 @@ import { TITLE_BLOCK_TEMPLATES } from '../data/titleBlockTemplates';
 import { notify } from '../services/toast';
 import { optimizeDataUri } from '../services/imageProcessing';
 import { materializeTemplateDataUri } from '../services/LibraryService';
+import { calibrationForPlane, getCalibrationPlanes } from '../utils/cameraGeometry';
 
 interface ControlsPanelProps {
   state: MockupState;
@@ -34,7 +34,7 @@ interface ControlsPanelProps {
   setToolMode: (mode: ToolMode) => void;
   viewLocked: boolean;
   onViewLockedChange: (locked: boolean) => void;
-  onOpenCalibration: () => void;
+  onOpenCalibration: (options?: { addPlane?: boolean }) => void;
   showCalibrationReference: boolean;
   setShowCalibrationReference: (show: boolean) => void;
   updateDimension: (id: string, updates: Partial<Dimension>) => void;
@@ -148,8 +148,9 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
   const [activeTab, setActiveTab] = useState<'editor' | 'page' | 'notes'>('editor');
   const [mobilePanelExpanded, setMobilePanelExpanded] = useState(false);
 
-  // Target real-world width input for the "Set width" sign-sizing control
+  // Target real-world dimensions for calibrated sign placement.
   const [targetWidth, setTargetWidth] = useState('');
+  const [targetHeight, setTargetHeight] = useState('');
   const [nudgeStep, setNudgeStep] = useState<1 | 5>(1);
 
   const applyPerspectivePreset = (preset: 'flat' | 'left' | 'right') => {
@@ -274,7 +275,8 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
                       extrusionAngle: 45,
                       opacity: 1,
                       blendMode: 'normal',
-                      sideColor: '#111111'
+                      sideColor: '#111111',
+                      aspectLocked: true,
                  };
                  
                  updateActiveCanvas({
@@ -324,6 +326,7 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
                  backgroundImage: dataUrl,
                  backgroundSize: { width: img.width, height: img.height },
                  calibration: null, // new or levelled photo — old image coordinates are invalid
+                 placement: { ...placement, lens: { enabled: false, k1: 0, k2: 0 }, camera: { enabled: false, fieldOfViewDeg: 60, estimated: true } },
                  dimensions: [],
                  activeDimensionId: null,
              });
@@ -387,8 +390,20 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
               extrusionAngle: 45,
               opacity: 1,
               blendMode: 'normal',
-              sideColor: '#111111'
+              sideColor: '#111111',
+              realWidthMm: template.width,
+              realHeightMm: template.height,
+              aspectLocked: true,
+              placementAnchor: 'center',
+              calibrationPlaneId: calibration?.activePlaneId,
+              projectionMode: 'planar',
+              physicalDepthMm: 100,
           };
+          const measuredBox = calibration ? measureSignSizeMm(newSign.corners, calibration) : null;
+          if (measuredBox) {
+              newSign.realWidthMm = measuredBox.width;
+              newSign.realHeightMm = measuredBox.height;
+          }
           
           // Add to active canvas
           updateActiveCanvas({
@@ -397,13 +412,35 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
              activeDimensionId: null
           });
       } 
-      else if (activeCanvas.activeSignId) {
-          updateActiveSign({ image, name: template.name, signType: template.signType ?? mapCategoryToType(template.category), extrusionEnabled: false, elements: undefined, elementsSourceSize: undefined });
+      else if (activeSign) {
+          const resizedCorners = calibration && activeSign && template.width > 0 && template.height > 0
+              ? resizeSignToRealSize(activeSign.corners, template.width, template.height, calibration)
+              : null;
+          updateActiveSign({
+              image,
+              name: template.name,
+              signType: template.signType ?? mapCategoryToType(template.category),
+              extrusionEnabled: false,
+              elements: undefined,
+              elementsSourceSize: undefined,
+              corners: resizedCorners ?? activeSign.corners,
+              realWidthMm: template.width,
+              realHeightMm: template.height,
+              aspectLocked: true,
+              placementAnchor: 'center',
+              calibrationPlaneId: calibration?.activePlaneId,
+              projectionMode: 'planar',
+              physicalDepthMm: 100,
+          });
       }
       else {
           const id = Date.now().toString();
-          const cx = activeCanvas.backgroundSize.width / 2;
-          const cy = activeCanvas.backgroundSize.height / 2;
+          const cx = calibration?.plane
+              ? calibration.plane.corners.reduce((sum, point) => sum + point.x, 0) / calibration.plane.corners.length
+              : activeCanvas.backgroundSize.width / 2;
+          const cy = calibration?.plane
+              ? calibration.plane.corners.reduce((sum, point) => sum + point.y, 0) / calibration.plane.corners.length
+              : activeCanvas.backgroundSize.height / 2;
           const storedAspect = template.width / template.height;
           const recoveredAspect = template.recovered ? await readImageAspectRatio(image) : null;
           const aspect = recoveredAspect && Number.isFinite(recoveredAspect) && recoveredAspect > 0
@@ -428,8 +465,14 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
               extrusionAngle: 45,
               opacity: 1,
               blendMode: 'normal',
-              sideColor: '#111111'
+              sideColor: '#111111',
+              realWidthMm: template.width,
+              realHeightMm: template.height,
+              aspectLocked: true,
           };
+          if (calibration && template.width > 0 && template.height > 0) {
+              newSign.corners = resizeSignToRealSize(newSign.corners, template.width, template.height, calibration) ?? newSign.corners;
+          }
           
           updateActiveCanvas({
               signs: [...activeCanvas.signs, newSign],
@@ -494,6 +537,21 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
 
   // --- Measurement / Calibration ---
   const calibration = activeCanvas.calibration ?? null;
+  const planes = getCalibrationPlanes(calibration);
+  const placement: PlacementSettings = activeCanvas.placement ?? {
+      snapEnabled: true,
+      showVanishingGuides: false,
+      lens: { enabled: false, k1: 0, k2: 0 },
+      camera: { enabled: false, fieldOfViewDeg: 60, estimated: true },
+  };
+  const updatePlacement = (updates: Partial<PlacementSettings>) => updateActiveCanvas({ placement: { ...placement, ...updates } });
+  const selectPlane = (planeId: string) => {
+      if (!calibration) return;
+      const plane = planes.find(item => item.id === planeId);
+      if (!plane) return;
+      updateActiveCanvas({ calibration: { ...calibration, activePlaneId: plane.id, plane: { corners: plane.corners, widthMm: plane.widthMm, heightMm: plane.heightMm } } });
+      if (activeSign) updateActiveSign({ calibrationPlaneId: plane.id });
+  };
   const mmPerPx = calibration ? getMmPerPx(calibration) : null;
 
   const activateTool = (mode: ToolMode) => {
@@ -533,24 +591,50 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
       updateState({ unitSystem: system, canvases: newCanvases });
   };
 
-  // Average opposite edges: corners can be perspective-warped, so no single
-  // "width" exists — the average is the honest approximation for a flat sign
-  const signSizePx = activeSign ? {
-      w: (distance(activeSign.corners[0], activeSign.corners[1]) + distance(activeSign.corners[3], activeSign.corners[2])) / 2,
-      h: (distance(activeSign.corners[0], activeSign.corners[3]) + distance(activeSign.corners[1], activeSign.corners[2])) / 2
-  } : null;
+  const signCalibration = calibrationForPlane(calibration, activeSign?.calibrationPlaneId);
+  const signSizeMm = activeSign && signCalibration ? measureSignSizeMm(activeSign.corners, signCalibration) : null;
+  const sizeInputUnit = state.unitSystem === 'metric' ? 'm' : 'ft';
+  const sizeInputFactor = toMm(1, sizeInputUnit);
+  const aspectLocked = activeSign?.aspectLocked !== false;
+  const currentAspect = activeSign?.realWidthMm && activeSign?.realHeightMm
+      ? activeSign.realWidthMm / activeSign.realHeightMm
+      : signSizeMm && signSizeMm.height > 0 ? signSizeMm.width / signSizeMm.height : null;
 
-  const applySignWidth = () => {
-      if (!activeSign || !signSizePx || !mmPerPx) return;
-      const v = parseFloat(targetWidth);
-      if (!isFinite(v) || v <= 0) return;
-      const targetMm = toMm(v, state.unitSystem === 'metric' ? 'm' : 'ft');
-      const scale = targetMm / (signSizePx.w * mmPerPx);
-      const c = activeSign.corners;
-      const center = { x: (c[0].x + c[1].x + c[2].x + c[3].x) / 4, y: (c[0].y + c[1].y + c[2].y + c[3].y) / 4 };
-      const newCorners = c.map(p => ({ x: center.x + (p.x - center.x) * scale, y: center.y + (p.y - center.y) * scale })) as [Point, Point, Point, Point];
-      updateActiveSign({ corners: newCorners });
-      setTargetWidth('');
+  useEffect(() => {
+      if (!signSizeMm) {
+          setTargetWidth('');
+          setTargetHeight('');
+          return;
+      }
+      const decimals = state.unitSystem === 'metric' ? 3 : 2;
+      setTargetWidth(Number((signSizeMm.width / sizeInputFactor).toFixed(decimals)).toString());
+      setTargetHeight(Number((signSizeMm.height / sizeInputFactor).toFixed(decimals)).toString());
+  }, [activeSign?.id, signSizeMm?.width, signSizeMm?.height, sizeInputFactor, state.unitSystem]);
+
+  const updateTargetWidth = (value: string) => {
+      setTargetWidth(value);
+      const numeric = Number(value);
+      if (aspectLocked && currentAspect && numeric > 0) setTargetHeight(Number((numeric / currentAspect).toFixed(3)).toString());
+  };
+
+  const updateTargetHeight = (value: string) => {
+      setTargetHeight(value);
+      const numeric = Number(value);
+      if (aspectLocked && currentAspect && numeric > 0) setTargetWidth(Number((numeric * currentAspect).toFixed(3)).toString());
+  };
+
+  const applySignSize = () => {
+      if (!activeSign || !signCalibration) return;
+      const widthMm = toMm(Number(targetWidth), sizeInputUnit);
+      const heightMm = toMm(Number(targetHeight), sizeInputUnit);
+      if (!(widthMm > 0) || !(heightMm > 0)) return;
+      const corners = resizeSignToRealSize(activeSign.corners, widthMm, heightMm, signCalibration);
+      if (!corners) {
+          notify('Could not project that size onto the calibrated wall.', 'error');
+          return;
+      }
+      updateActiveSign({ corners, realWidthMm: widthMm, realHeightMm: heightMm });
+      activateTool('select');
   };
 
   const nudgeActiveSign = (dx: number, dy: number) => {
@@ -836,6 +920,23 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
                     </button>
                 )}
 
+                <div className="rounded-xl border border-cyan-500/25 bg-cyan-500/5 p-3 space-y-3">
+                    <div className="flex items-center justify-between"><div><p className="text-xs font-semibold text-cyan-100">Professional placement</p><p className="text-[10px] text-gray-500">Planes, guides and camera correction</p></div><Move3d className="h-5 w-5 text-cyan-300" /></div>
+                    <div className="grid grid-cols-2 gap-2">
+                        <label className="flex min-h-10 items-center justify-between rounded-lg bg-gray-800 px-2 text-[11px] text-gray-300">Centre snapping<input aria-label="Centre snapping" type="checkbox" checked={placement.snapEnabled} onChange={event => updatePlacement({ snapEnabled: event.target.checked })} className="accent-cyan-500" /></label>
+                        <label className="flex min-h-10 items-center justify-between rounded-lg bg-gray-800 px-2 text-[11px] text-gray-300">Vanishing guides<input aria-label="Vanishing-point guides" type="checkbox" checked={placement.showVanishingGuides} onChange={event => updatePlacement({ showVanishingGuides: event.target.checked })} className="accent-cyan-500" /></label>
+                    </div>
+                    {planes.length > 0 && <div className="grid grid-cols-[1fr_auto] gap-2"><select aria-label="Active calibrated plane" value={calibration?.activePlaneId ?? planes[0].id} onChange={event => selectPlane(event.target.value)} className="min-h-10 rounded-lg border border-gray-700 bg-gray-900 px-2 text-xs text-white">{planes.map(plane => <option key={plane.id} value={plane.id}>{plane.name}</option>)}</select><button type="button" onClick={() => onOpenCalibration({ addPlane: true })} className="rounded-lg border border-cyan-500/40 bg-cyan-500/10 px-3 text-xs text-cyan-200 hover:bg-cyan-500/20">+ Plane</button></div>}
+                    <div className="border-t border-gray-700 pt-3 space-y-2">
+                        <label className="flex min-h-10 items-center justify-between text-xs text-gray-300"><span>Lens correction <span className="block text-[9px] text-gray-500">Non-destructive radial model</span></span><input aria-label="Lens distortion correction" type="checkbox" checked={placement.lens.enabled} onChange={event => updatePlacement({ lens: { ...placement.lens, enabled: event.target.checked } })} className="accent-cyan-500" /></label>
+                        {placement.lens.enabled && <><div><div className="flex justify-between text-[10px] text-gray-400"><span>Barrel / pincushion</span><span>{placement.lens.k1.toFixed(2)}</span></div><input aria-label="Primary lens correction" type="range" min="-0.5" max="0.5" step="0.01" value={placement.lens.k1} onChange={event => updatePlacement({ lens: { ...placement.lens, k1: Number(event.target.value) } })} className="w-full accent-cyan-500" /></div><div><div className="flex justify-between text-[10px] text-gray-400"><span>Edge refinement</span><span>{placement.lens.k2.toFixed(2)}</span></div><input aria-label="Secondary lens correction" type="range" min="-0.25" max="0.25" step="0.01" value={placement.lens.k2} onChange={event => updatePlacement({ lens: { ...placement.lens, k2: Number(event.target.value) } })} className="w-full accent-cyan-500" /></div><p className="text-[9px] text-amber-300">Changing correction changes photo geometry; refine calibration points afterward.</p></>}
+                    </div>
+                    <div className="border-t border-gray-700 pt-3 space-y-2">
+                        <label className="flex min-h-10 items-center justify-between text-xs text-gray-300"><span>Camera pose <span className="block text-[9px] text-gray-500">For projecting and freestanding signs</span></span><input aria-label="Camera pose estimation" type="checkbox" checked={placement.camera.enabled} onChange={event => updatePlacement({ camera: { ...placement.camera, enabled: event.target.checked } })} className="accent-cyan-500" /></label>
+                        {placement.camera.enabled && <label className="block text-[10px] text-gray-400">Horizontal field of view · {placement.camera.fieldOfViewDeg}°<input aria-label="Camera field of view" type="range" min="25" max="100" step="1" value={placement.camera.fieldOfViewDeg} onChange={event => updatePlacement({ camera: { ...placement.camera, fieldOfViewDeg: Number(event.target.value), estimated: true, focalLengthPx: undefined } })} className="mt-1 w-full accent-cyan-500" /><span className="mt-1 block text-[9px] text-amber-300">Estimated pose · enter verified camera data in a future EXIF workflow for survey-grade output.</span></label>}
+                    </div>
+                </div>
+
                 <div>
                     <div className="mb-1.5 flex items-center justify-between"><p className="text-[10px] font-bold uppercase tracking-wider text-gray-500">Measure</p>{!calibration && <span className="text-[10px] text-amber-400">Set scale first</span>}</div>
                     <div className="grid grid-cols-2 gap-2">
@@ -948,6 +1049,10 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
                                   <span className="rounded-full bg-cyan-400/10 px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider text-cyan-300">Selected sign</span>
                               </div>
                               <div className="space-y-4 p-3">
+                                  <div className="grid grid-cols-2 gap-2">
+                                      <label className="text-[10px] uppercase tracking-wider text-gray-500">Placement anchor<select aria-label="Sign placement anchor" value={activeSign.placementAnchor ?? 'center'} onChange={event => updateActiveSign({ placementAnchor: event.target.value as PlacementAnchor })} className="mt-1 min-h-10 w-full rounded-lg border border-gray-700 bg-gray-800 px-2 text-xs normal-case text-white"><option value="center">Centre</option><option value="top-left">Top left</option><option value="top-center">Top centre</option><option value="top-right">Top right</option><option value="bottom-left">Bottom left</option><option value="bottom-center">Bottom centre</option><option value="bottom-right">Bottom right</option></select></label>
+                                      {planes.length > 0 && <label className="text-[10px] uppercase tracking-wider text-gray-500">Surface<select aria-label="Sign calibrated plane" value={activeSign.calibrationPlaneId ?? calibration?.activePlaneId ?? planes[0].id} onChange={event => updateActiveSign({ calibrationPlaneId: event.target.value })} className="mt-1 min-h-10 w-full rounded-lg border border-gray-700 bg-gray-800 px-2 text-xs normal-case text-white">{planes.map(plane => <option key={plane.id} value={plane.id}>{plane.name}</option>)}</select></label>}
+                                  </div>
                                   <div>
                                       <div className="mb-2 flex items-center justify-between">
                                           <span className="text-[10px] font-bold uppercase tracking-wider text-gray-400">Perspective</span>
@@ -966,6 +1071,8 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
                                       </label>
                                       {activeSign.extrusionEnabled && (
                                           <div className="mt-3 space-y-3">
+                                              {planes.length > 0 && <label className="block text-xs text-gray-400">Projection model<select aria-label="Sign projection model" value={activeSign.projectionMode ?? 'planar'} onChange={event => updateActiveSign({ projectionMode: event.target.value as 'planar' | 'camera-3d' })} className="mt-1 min-h-10 w-full rounded-lg border border-gray-700 bg-gray-900 px-2 text-xs text-white"><option value="planar">Visual 2D extrusion</option><option value="camera-3d">Camera-pose 3D</option></select></label>}
+                                              {activeSign.projectionMode === 'camera-3d' && <div><div className="mb-1 flex justify-between"><label className="text-xs text-gray-400">Physical depth</label><span className="font-mono text-xs text-cyan-300">{activeSign.physicalDepthMm ?? 100}mm</span></div><input aria-label="Physical sign depth" type="range" min="10" max="2000" step="10" value={activeSign.physicalDepthMm ?? 100} onChange={event => updateActiveSign({ physicalDepthMm: Number(event.target.value) })} className="h-2 w-full accent-cyan-500" /><p className="mt-1 text-[9px] text-gray-500">Projected with the selected plane and camera field of view.</p></div>}
                                               <div><div className="mb-1 flex justify-between"><label className="text-xs text-gray-400">Depth</label><span className="font-mono text-xs text-cyan-300">{activeSign.extrusionDepth}px</span></div><input type="range" min="0" max="100" value={activeSign.extrusionDepth} onChange={(e) => updateActiveSign({ extrusionDepth: parseInt(e.target.value) })} className="h-2 w-full accent-cyan-500" /></div>
                                               <div><div className="mb-1 flex justify-between"><label className="text-xs text-gray-400">Direction</label><span className="font-mono text-xs text-cyan-300">{activeSign.extrusionAngle}°</span></div><input type="range" min="0" max="360" value={activeSign.extrusionAngle} onChange={(e) => updateActiveSign({ extrusionAngle: parseInt(e.target.value) })} className="h-2 w-full accent-cyan-500" /></div>
                                               <label className="flex items-center justify-between text-xs text-gray-400"><span>Side colour</span><input type="color" value={activeSign.sideColor} onChange={(e) => updateActiveSign({ sideColor: e.target.value })} className="h-8 w-12 cursor-pointer rounded border border-gray-600 bg-transparent p-0.5" /></label>
@@ -991,28 +1098,21 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
                           </button>
 
                           {/* Real-world size (requires calibration) */}
-                          {mmPerPx && signSizePx && (
+                          {calibration && signSizeMm && (
                               <div className="bg-amber-500/5 border border-amber-500/20 rounded-lg p-3 space-y-2">
                                   <div className="flex justify-between items-center text-xs">
-                                      <span className="text-gray-400">Actual size</span>
+                                      <span className="text-gray-400">{calibration.plane ? 'Wall-plane size' : 'Estimated size'}</span>
                                       <span className="text-amber-300 font-mono">
-                                          {formatLength(signSizePx.w * mmPerPx, state.unitSystem)} × {formatLength(signSizePx.h * mmPerPx, state.unitSystem)}
+                                          {formatLength(signSizeMm.width, state.unitSystem)} × {formatLength(signSizeMm.height, state.unitSystem)}
                                       </span>
                                   </div>
-                                  <div className="flex gap-2 items-center">
-                                      <label className="text-[10px] text-gray-500 uppercase flex-shrink-0">Set width ({state.unitSystem === 'metric' ? 'm' : 'ft'})</label>
-                                      <input
-                                          type="number"
-                                          min="0"
-                                          step="any"
-                                          value={targetWidth}
-                                          onChange={(e) => setTargetWidth(e.target.value)}
-                                          onKeyDown={(e) => e.key === 'Enter' && applySignWidth()}
-                                          placeholder="e.g. 3"
-                                          className="flex-1 min-w-0 bg-gray-900 border border-gray-600 rounded px-2 py-1 text-xs text-white focus:border-amber-500 outline-none"
-                                      />
-                                      <button onClick={applySignWidth} className="text-xs bg-amber-600/80 hover:bg-amber-500 text-white px-2 py-1 rounded transition-colors">Apply</button>
+                                  <div className="grid grid-cols-[1fr_auto_1fr] items-end gap-2">
+                                      <label className="text-[10px] text-gray-500 uppercase">Width ({sizeInputUnit})<input aria-label={`Sign width in ${sizeInputUnit}`} type="number" min="0" step="any" value={targetWidth} onChange={(e) => updateTargetWidth(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && applySignSize()} className="mt-1 w-full bg-gray-900 border border-gray-600 rounded px-2 py-1.5 text-xs text-white focus:border-amber-500 outline-none" /></label>
+                                      <button type="button" aria-label={aspectLocked ? 'Unlock sign proportions' : 'Lock sign proportions'} aria-pressed={aspectLocked} onClick={() => updateActiveSign({ aspectLocked: !aspectLocked })} title={aspectLocked ? 'Width and height stay proportional' : 'Width and height can change independently'} className={`mb-0.5 grid h-8 w-8 place-items-center rounded border ${aspectLocked ? 'border-amber-500/60 bg-amber-500/15 text-amber-300' : 'border-gray-600 bg-gray-800 text-gray-400'}`}>{aspectLocked ? <Lock className="h-3.5 w-3.5" /> : <Unlock className="h-3.5 w-3.5" />}</button>
+                                      <label className="text-[10px] text-gray-500 uppercase">Height ({sizeInputUnit})<input aria-label={`Sign height in ${sizeInputUnit}`} type="number" min="0" step="any" value={targetHeight} onChange={(e) => updateTargetHeight(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && applySignSize()} className="mt-1 w-full bg-gray-900 border border-gray-600 rounded px-2 py-1.5 text-xs text-white focus:border-amber-500 outline-none" /></label>
                                   </div>
+                                  <button onClick={applySignSize} className="w-full rounded bg-amber-600/80 px-2 py-1.5 text-xs font-medium text-white transition-colors hover:bg-amber-500">Place at exact size</button>
+                                  <p className="text-[10px] leading-relaxed text-gray-500">{calibration.plane ? 'Projected through the calibrated wall perspective.' : 'Uses one reference scale; use Perspective wall for depth-correct placement.'}</p>
                               </div>
                           )}
 

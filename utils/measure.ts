@@ -1,6 +1,7 @@
 import { Point, Calibration, MeasureUnit, UnitSystem } from '../types';
 import { distance } from './math';
 import { computeHomography } from './math';
+import { getActiveCalibrationPlane } from './cameraGeometry';
 
 // --- Unit conversion ---
 
@@ -22,18 +23,143 @@ export const getMmPerPx = (cal: Calibration): number | null => {
   return toMm(cal.realValue, cal.unit) / px;
 };
 
-const planePoint = (point: Point, cal: Calibration): Point | null => {
-  if (!cal.plane) return null;
-  const { corners, widthMm, heightMm } = cal.plane;
-  const h = computeHomography(corners, [{ x: 0, y: 0 }, { x: widthMm, y: 0 }, { x: widthMm, y: heightMm }, { x: 0, y: heightMm }]);
-  const w = h[6] * point.x + h[7] * point.y + h[8];
+const transformPoint = (point: Point, homography: number[]): Point | null => {
+  const w = homography[6] * point.x + homography[7] * point.y + homography[8];
   if (Math.abs(w) < 1e-9) return null;
-  return { x: (h[0] * point.x + h[1] * point.y + h[2]) / w, y: (h[3] * point.x + h[4] * point.y + h[5]) / w };
+  const transformed = {
+    x: (homography[0] * point.x + homography[1] * point.y + homography[2]) / w,
+    y: (homography[3] * point.x + homography[4] * point.y + homography[5]) / w,
+  };
+  return Number.isFinite(transformed.x) && Number.isFinite(transformed.y) ? transformed : null;
+};
+
+export const imagePointToPlane = (point: Point, cal: Calibration): Point | null => {
+  const plane = getActiveCalibrationPlane(cal);
+  if (!plane) return null;
+  const { corners, widthMm, heightMm } = plane;
+  const h = computeHomography(corners, [{ x: 0, y: 0 }, { x: widthMm, y: 0 }, { x: widthMm, y: heightMm }, { x: 0, y: heightMm }]);
+  return transformPoint(point, h);
+};
+
+export const planePointToImage = (point: Point, cal: Calibration): Point | null => {
+  const plane = getActiveCalibrationPlane(cal);
+  if (!plane) return null;
+  const { corners, widthMm, heightMm } = plane;
+  const h = computeHomography([{ x: 0, y: 0 }, { x: widthMm, y: 0 }, { x: widthMm, y: heightMm }, { x: 0, y: heightMm }], corners);
+  return transformPoint(point, h);
+};
+
+export const measureSignSizeMm = (corners: [Point, Point, Point, Point], cal: Calibration): { width: number; height: number } | null => {
+  const measuredCorners = getActiveCalibrationPlane(cal)
+    ? corners.map(point => imagePointToPlane(point, cal))
+    : corners.map(point => {
+        const scale = getMmPerPx(cal);
+        return scale === null ? null : { x: point.x * scale, y: point.y * scale };
+      });
+  if (measuredCorners.some(point => point === null)) return null;
+  const [tl, tr, br, bl] = measuredCorners as [Point, Point, Point, Point];
+  return {
+    width: (distance(tl, tr) + distance(bl, br)) / 2,
+    height: (distance(tl, bl) + distance(tr, br)) / 2,
+  };
+};
+
+const resizeRectangle = (
+  corners: [Point, Point, Point, Point],
+  width: number,
+  height: number,
+): [Point, Point, Point, Point] | null => {
+  if (!(width > 0) || !(height > 0)) return null;
+  const [tl, tr, br, bl] = corners;
+  const center = {
+    x: corners.reduce((sum, point) => sum + point.x, 0) / corners.length,
+    y: corners.reduce((sum, point) => sum + point.y, 0) / corners.length,
+  };
+  const horizontal = { x: (tr.x - tl.x) + (br.x - bl.x), y: (tr.y - tl.y) + (br.y - bl.y) };
+  const horizontalLength = Math.hypot(horizontal.x, horizontal.y);
+  if (horizontalLength < 1e-9) return null;
+  const xAxis = { x: horizontal.x / horizontalLength, y: horizontal.y / horizontalLength };
+  const vertical = { x: (bl.x - tl.x) + (br.x - tr.x), y: (bl.y - tl.y) + (br.y - tr.y) };
+  let yAxis = { x: -xAxis.y, y: xAxis.x };
+  if (yAxis.x * vertical.x + yAxis.y * vertical.y < 0) yAxis = { x: -yAxis.x, y: -yAxis.y };
+  const halfW = width / 2;
+  const halfH = height / 2;
+  return [
+    { x: center.x - xAxis.x * halfW - yAxis.x * halfH, y: center.y - xAxis.y * halfW - yAxis.y * halfH },
+    { x: center.x + xAxis.x * halfW - yAxis.x * halfH, y: center.y + xAxis.y * halfW - yAxis.y * halfH },
+    { x: center.x + xAxis.x * halfW + yAxis.x * halfH, y: center.y + xAxis.y * halfW + yAxis.y * halfH },
+    { x: center.x - xAxis.x * halfW + yAxis.x * halfH, y: center.y - xAxis.y * halfW + yAxis.y * halfH },
+  ];
+};
+
+export const resizeSignToRealSize = (
+  corners: [Point, Point, Point, Point],
+  widthMm: number,
+  heightMm: number,
+  cal: Calibration,
+): [Point, Point, Point, Point] | null => {
+  if (getActiveCalibrationPlane(cal)) {
+    const planeCorners = corners.map(point => imagePointToPlane(point, cal));
+    if (planeCorners.some(point => point === null)) return null;
+    const resized = resizeRectangle(planeCorners as [Point, Point, Point, Point], widthMm, heightMm);
+    if (!resized) return null;
+    const projected = resized.map(point => planePointToImage(point, cal));
+    return projected.some(point => point === null) ? null : projected as [Point, Point, Point, Point];
+  }
+  const scale = getMmPerPx(cal);
+  return scale === null ? null : resizeRectangle(corners, widthMm / scale, heightMm / scale);
+};
+
+export const scaleSignOnPlane = (
+  corners: [Point, Point, Point, Point],
+  scaleX: number,
+  scaleY: number,
+  cal: Calibration | null,
+): [Point, Point, Point, Point] => {
+  if (!getActiveCalibrationPlane(cal)) {
+    const center = {
+      x: corners.reduce((sum, point) => sum + point.x, 0) / corners.length,
+      y: corners.reduce((sum, point) => sum + point.y, 0) / corners.length,
+    };
+    return corners.map(point => ({ x: center.x + (point.x - center.x) * scaleX, y: center.y + (point.y - center.y) * scaleY })) as [Point, Point, Point, Point];
+  }
+  const planeCorners = corners.map(point => imagePointToPlane(point, cal));
+  if (planeCorners.some(point => point === null)) return corners;
+  const points = planeCorners as [Point, Point, Point, Point];
+  const center = {
+    x: points.reduce((sum, point) => sum + point.x, 0) / points.length,
+    y: points.reduce((sum, point) => sum + point.y, 0) / points.length,
+  };
+  const scaled = points.map(point => ({ x: center.x + (point.x - center.x) * scaleX, y: center.y + (point.y - center.y) * scaleY }));
+  const projected = scaled.map(point => planePointToImage(point, cal));
+  return projected.some(point => point === null) ? corners : projected as [Point, Point, Point, Point];
+};
+
+export const moveSignOnPlane = (
+  corners: [Point, Point, Point, Point],
+  from: Point,
+  to: Point,
+  cal: Calibration | null,
+): [Point, Point, Point, Point] => {
+  if (!getActiveCalibrationPlane(cal)) {
+    const dx = to.x - from.x;
+    const dy = to.y - from.y;
+    return corners.map(point => ({ x: point.x + dx, y: point.y + dy })) as [Point, Point, Point, Point];
+  }
+  const planeCorners = corners.map(point => imagePointToPlane(point, cal));
+  const planeFrom = imagePointToPlane(from, cal);
+  const planeTo = imagePointToPlane(to, cal);
+  if (planeCorners.some(point => point === null) || !planeFrom || !planeTo) return corners;
+  const dx = planeTo.x - planeFrom.x;
+  const dy = planeTo.y - planeFrom.y;
+  const moved = (planeCorners as Point[]).map(point => ({ x: point.x + dx, y: point.y + dy }));
+  const projected = moved.map(point => planePointToImage(point, cal));
+  return projected.some(point => point === null) ? corners : projected as [Point, Point, Point, Point];
 };
 
 export const measureDistanceMm = (start: Point, end: Point, cal: Calibration): number | null => {
-  if (cal.plane) {
-    const a = planePoint(start, cal), b = planePoint(end, cal);
+  if (getActiveCalibrationPlane(cal)) {
+    const a = imagePointToPlane(start, cal), b = imagePointToPlane(end, cal);
     return a && b ? distance(a, b) : null;
   }
   const scale = getMmPerPx(cal);
@@ -71,8 +197,8 @@ export const measureLine = (start: Point, end: Point, cal: Calibration, system: 
 
 // Box dimensions read as "width × height"
 export const measureBox = (start: Point, end: Point, cal: Calibration, system: UnitSystem): string => {
-  if (cal.plane) {
-    const a = planePoint(start, cal), b = planePoint(end, cal);
+  if (getActiveCalibrationPlane(cal)) {
+    const a = imagePointToPlane(start, cal), b = imagePointToPlane(end, cal);
     if (!a || !b) return '?';
     return `${formatLength(Math.abs(b.x - a.x), system)} × ${formatLength(Math.abs(b.y - a.y), system)}`;
   }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { formatLength, getMmPerPx, measureBox, measureLine, toMm } from '../../utils/measure';
+import { formatLength, getMmPerPx, measureBox, measureLine, measureSignSizeMm, moveSignOnPlane, resizeSignToRealSize, scaleSignOnPlane, toMm } from '../../utils/measure';
 import type { Calibration } from '../../types';
 
 describe('measurement conversion and calibration', () => {
@@ -36,5 +36,24 @@ describe('measurement conversion and calibration', () => {
     };
     expect(measureLine(calibration.plane.corners[0], calibration.plane.corners[1], calibration, 'metric')).toBe('4.00m');
     expect(measureBox(calibration.plane.corners[0], calibration.plane.corners[2], calibration, 'metric')).toBe('4.00m × 3.00m');
+
+    const initial = [
+      { x: 220, y: 160 }, { x: 340, y: 166 }, { x: 334, y: 220 }, { x: 225, y: 216 },
+    ] as const;
+    const resized = resizeSignToRealSize([...initial], 2000, 500, calibration);
+    expect(resized).not.toBeNull();
+    const measured = measureSignSizeMm(resized!, calibration);
+    expect(measured?.width).toBeCloseTo(2000, 5);
+    expect(measured?.height).toBeCloseTo(500, 5);
+
+    const scaled = scaleSignOnPlane(resized!, 1.5, 1.5, calibration);
+    const scaledSize = measureSignSizeMm(scaled, calibration);
+    expect(scaledSize?.width).toBeCloseTo(3000, 5);
+    expect(scaledSize?.height).toBeCloseTo(750, 5);
+
+    const moved = moveSignOnPlane(resized!, { x: 280, y: 190 }, { x: 360, y: 250 }, calibration);
+    const movedSize = measureSignSizeMm(moved, calibration);
+    expect(movedSize?.width).toBeCloseTo(2000, 5);
+    expect(movedSize?.height).toBeCloseTo(500, 5);
   });
 });

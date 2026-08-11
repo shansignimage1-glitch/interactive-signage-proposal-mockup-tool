@@ -16,6 +16,9 @@ export interface CalibrationDraft {
   height: string;
   unit: MeasureUnit;
   reapply: boolean;
+  planeName: string;
+  addPlane: boolean;
+  editingPlaneId: string | null;
 }
 
 interface CalibrationWizardProps {
@@ -99,6 +102,7 @@ const CalibrationWizard: React.FC<CalibrationWizardProps> = ({
       realValue: widthMm,
       unit: 'mm',
       plane: { corners, widthMm, heightMm },
+      planes: [{ id: `plane-${Date.now()}`, name: draft.planeName.trim() || 'Wall plane', corners, widthMm, heightMm }],
     };
   };
 
@@ -209,6 +213,7 @@ const CalibrationWizard: React.FC<CalibrationWizardProps> = ({
 
             {draft.method === 'plane' && (
               <div className="mt-3 grid grid-cols-2 gap-2">
+                <label className="col-span-2 text-xs text-gray-400">Plane name<input aria-label="Plane name" type="text" value={draft.planeName} onChange={event => patch({ planeName: event.target.value })} placeholder="e.g. Left facade" className="mt-1 min-h-12 w-full rounded-xl border border-gray-700 bg-gray-900 px-3 text-base text-white focus:border-blue-500 focus:outline-none" /></label>
                 <label className="text-xs text-gray-400">Known width<input aria-label="Known width" inputMode="decimal" type="number" min="0" step="any" value={draft.width} onChange={event => patch({ width: event.target.value, presetId: 'custom_plane' })} className="mt-1 min-h-12 w-full rounded-xl border border-gray-700 bg-gray-900 px-3 text-base text-white focus:border-blue-500 focus:outline-none" /></label>
                 <label className="text-xs text-gray-400">Known height<input aria-label="Known height" inputMode="decimal" type="number" min="0" step="any" value={draft.height} onChange={event => patch({ height: event.target.value, presetId: 'custom_plane' })} className="mt-1 min-h-12 w-full rounded-xl border border-gray-700 bg-gray-900 px-3 text-base text-white focus:border-blue-500 focus:outline-none" /></label>
                 <div className="col-span-2"><UnitSelect value={draft.unit} onChange={unit => patch({ unit, presetId: 'custom_plane' })} /></div>
@@ -240,7 +245,7 @@ const CalibrationWizard: React.FC<CalibrationWizardProps> = ({
               </label>
             )}
             {!quality.valid && <p className="mt-3 flex gap-2 text-sm text-red-300"><AlertTriangle className="h-5 w-5 shrink-0" />Return to the canvas and correct the reference before applying.</p>}
-            <button onClick={() => calibration && onApply(calibration, draft.reapply)} disabled={!calibration || !quality.valid} className="mt-4 min-h-12 w-full rounded-xl bg-emerald-600 font-semibold text-white hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-40">Apply calibration</button>
+            <button onClick={() => calibration && onApply(calibration, draft.reapply)} disabled={!calibration || !quality.valid} className="mt-4 min-h-12 w-full rounded-xl bg-emerald-600 font-semibold text-white hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-40">{draft.addPlane ? 'Add calibrated plane' : 'Apply calibration'}</button>
           </>
         )}
       </div>
