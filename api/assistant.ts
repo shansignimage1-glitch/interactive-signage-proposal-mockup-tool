@@ -1,7 +1,7 @@
 import { GoogleGenAI } from '@google/genai';
 import { allowPost, enforceRateLimit, requireApiKey, requireFirebaseUser, sendApiError, type VercelRequest, type VercelResponse } from './_lib/security.js';
+import { buildAssistantSystemInstruction } from './_lib/assistantKnowledge.js';
 
-const SYSTEM_INSTRUCTION = `You are the expert AI tutor for SignagePro, a professional signage mockup tool. Be concise, friendly, and teach users step-by-step. Explain uploading a facade, adding signs, 3D extrusion, four-corner perspective, reference-object calibration and dimensions, title blocks, export, Magic Cleanup, cloud-drive storage, and canvas navigation. If asked about unrelated topics, steer the user back to SignagePro.`;
 type Message = { role: 'user' | 'model'; text: string };
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -21,7 +21,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const response = await ai.models.generateContent({
       model: 'gemini-3.6-flash',
       contents: messages.map(message => ({ role: message.role, parts: [{ text: message.text }] })),
-      config: { systemInstruction: SYSTEM_INSTRUCTION, maxOutputTokens: 800 },
+      config: { systemInstruction: buildAssistantSystemInstruction(messages), maxOutputTokens: 800 },
     });
     const text = response.text?.trim();
     if (!text) throw new Error('EMPTY_RESPONSE');
