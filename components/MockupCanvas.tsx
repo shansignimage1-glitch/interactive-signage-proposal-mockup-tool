@@ -11,9 +11,9 @@ import { ZoomIn, ZoomOut, Maximize, Check, X, Lock, Unlock, Undo2, Redo2 } from 
 import { ToolMode } from '../App';
 import { TITLE_BLOCK_TEMPLATES } from '../data/titleBlockTemplates';
 import { clampViewScale, viewForPinch, zoomViewAtPoint, type ViewTransform } from '../utils/viewport';
-import { calibrationForPlane, getActiveCalibrationPlane, getCalibrationPlanes, getVanishingPoints, projectExtrudedQuad, projectPlaneDepth, snapSign } from '../utils/cameraGeometry';
+import { calibrationForPlane, getActiveCalibrationPlane, getCalibrationPlanes, getVanishingPoints, projectExtrudedQuad, snapSign } from '../utils/cameraGeometry';
 import LensCorrectedBackground from './LensCorrectedBackground';
-import { getBackingDepth, getSignExtrusionPlan } from '../utils/signExtrusion';
+import { getBackingDepth, getElementExtrusionDepthPx, getElementPhysicalDepthMultiplier, getSignExtrusionPlan, getVisualExtrusionDepthPx } from '../utils/signExtrusion';
 
 interface MockupCanvasProps {
   images: AppImages;
@@ -818,6 +818,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
       uniform vec2 u_signSize;
       varying vec2 v_uv;
       varying float v_shade;
+      varying float v_depth;
       void main() {
         vec3 base = u_baseH * vec3(a_pos, 1.0);
         vec3 top = u_topH * vec3(a_pos, 1.0);
@@ -828,6 +829,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
         gl_Position = vec4(clip * vec2(1, -1), 0, 1);
         v_uv = a_pos / u_signSize;
         v_shade = a_shade;
+        v_depth = a_top;
       }
     `);
     const elemFs = createShader(gl.FRAGMENT_SHADER, `
@@ -838,13 +840,18 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
       uniform int u_mode;        // 0 = flat side wall, 1 = masked texture face
       varying vec2 v_uv;
       varying float v_shade;
+      varying float v_depth;
       void main() {
         if (u_mode == 1) {
           vec4 tex = texture2D(u_image, v_uv);
           float m = texture2D(u_mask, v_uv).a;
           gl_FragColor = vec4(tex.rgb, tex.a * m * u_color.a);
         } else {
-          gl_FragColor = vec4(u_color.rgb * v_shade, u_color.a);
+          // Darker at the wall and brighter at the raised face. The depth
+          // gradient gives the return readable volume on both retina iPads
+          // and desktop screens instead of rendering as a flat outline.
+          float depthLight = mix(0.58, 1.0, smoothstep(0.0, 1.0, v_depth));
+          gl_FragColor = vec4(u_color.rgb * v_shade * depthLight, u_color.a);
         }
       }
     `);
@@ -1055,14 +1062,22 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
       const plane = getActiveCalibrationPlane(calibration, sign.calibrationPlaneId);
 
       if (extrusionPlan.renderBacking) {
-        const rad = (sign.extrusionAngle * Math.PI) / 180;
         const backingDepth = getBackingDepth(sign);
-        const depthX = Math.cos(rad) * backingDepth;
-        const depthY = Math.sin(rad) * backingDepth;
-        const cameraBack = sign.projectionMode === 'camera-3d' && placement?.camera.enabled && plane
-          ? projectPlaneDepth(c, plane, placement.camera, images.backgroundSize, Math.min(sign.physicalDepthMm ?? 100, (sign.physicalDepthMm ?? 100) * (backingDepth / Math.max(1, sign.extrusionDepth))))
-          : null;
-        const backC = cameraBack ?? c.map(p => ({ x: p.x + depthX, y: p.y + depthY }));
+        const visualBackingDepth = getVisualExtrusionDepthPx(c, backingDepth);
+        const backingPhysicalDepth = Math.min(
+          sign.physicalDepthMm ?? 100,
+          (sign.physicalDepthMm ?? 100) * (backingDepth / Math.max(1, sign.extrusionDepth)),
+        );
+        const backC = projectExtrudedQuad(
+          c,
+          plane,
+          placement?.camera ?? null,
+          images.backgroundSize,
+          backingPhysicalDepth,
+          visualBackingDepth,
+          sign.extrusionAngle,
+          sign.projectionMode === 'camera-3d' && placement?.camera?.enabled && !!plane ? 'physical' : 'visual',
+        );
         
         drawQuad(c[0], c[1], backC[1], backC[0], sideColor, false);
         drawQuad(c[1], c[2], backC[2], backC[1], shadowColor, false);
@@ -1095,9 +1110,6 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
         gl.uniform1i(eLocs.image, 0);
         gl.uniform1i(eLocs.mask, 1);
 
-        // Converts element depths (sign-image px) to background px on the quad
-        const pxScale = ((distance(c[0], c[1]) + distance(c[3], c[2])) / 2) / sw;
-
         const setAttribs = (buffer: WebGLBuffer) => {
           gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
           gl.enableVertexAttribArray(eLocs.aPos);
@@ -1111,8 +1123,13 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
         [...activeElements].sort((a, b) => a.depth - b.depth).forEach(elDef => {
           const geo = elemCache.elements.get(elDef.id);
           if (!geo) return;
-          const off = elDef.depth * pxScale;
-          const depthMm = (sign.physicalDepthMm ?? 100) * (off / Math.max(1, sign.extrusionDepth));
+          // Depth is stored in the sign artwork's source-pixel space. Mapping
+          // it directly against the persisted source width keeps every element
+          // independent: editing or disabling a deeper neighbour cannot make
+          // the remaining letters jump forward.
+          const off = getElementExtrusionDepthPx(c, sw, elDef.depth);
+          const relativeDepth = getElementPhysicalDepthMultiplier(sw, elDef.depth, sign.extrusionDepth);
+          const depthMm = (sign.physicalDepthMm ?? 100) * relativeDepth;
           // A calibrated wall supplies a camera-facing raised plane. Mapping
           // the same artwork through base and top homographies makes every
           // return converge with the face perspective instead of receiving a
@@ -1126,6 +1143,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
             depthMm,
             off,
             sign.extrusionAngle,
+            sign.projectionMode === 'camera-3d' && placement?.camera?.enabled && !!plane ? 'physical' : 'visual',
           );
           const topHm = computeHomography(sourceQuad!, topCorners);
           gl.uniformMatrix3fv(eLocs.topH, false, [topHm[0], topHm[3], topHm[6], topHm[1], topHm[4], topHm[7], topHm[2], topHm[5], topHm[8]]);

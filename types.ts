@@ -100,10 +100,10 @@ export interface Sign {
   corners: [Point, Point, Point, Point]; // TL, TR, BR, BL
   signType: SignType; // New field for specification
   extrusionEnabled: boolean; // New field
-  extrusionDepth: number;
+  extrusionDepth: number; // Relative visual-depth units (15 = 5% of placed sign width).
   extrusionAngle: number; // in degrees
   extrusionMode?: 'backed' | 'individual'; // Raised copy on a board, or individual letters/logo only.
-  backingDepth?: number; // Visual depth of a backing board in background-image px.
+  backingDepth?: number; // Relative visual-depth units; kept shallower than the raised artwork.
   opacity: number;
   blendMode: string;
   sideColor: string;
@@ -118,6 +118,7 @@ export interface Sign {
   // Per-element variable extrusion (undefined/empty = classic single-slab)
   elements?: SignElement[];
   elementsSourceSize?: Size; // image dims detection ran against (guards image swaps)
+  elementDepthModel?: 'relative-width-v1'; // Auto-detected depths are proportional to artwork width.
 }
 
 export interface Dimension {

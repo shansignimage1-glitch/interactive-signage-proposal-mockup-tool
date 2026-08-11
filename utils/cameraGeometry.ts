@@ -233,11 +233,32 @@ export const projectExtrudedQuad = (
   depthMm: number,
   visualDepthPx: number,
   angleDeg: number,
+  mode: 'physical' | 'visual' = 'physical',
 ): [Point, Point, Point, Point] => {
   const projected = plane && camera
     ? projectPlaneDepth(corners, plane, camera, imageSize, depthMm)
     : null;
-  if (projected) return projected;
+  if (projected) {
+    if (mode === 'physical') return projected;
+
+    // A physical camera projection can be only a few source-image pixels at
+    // normal building distances. Visual mode keeps the converging direction
+    // from that projection, but normalises its mean screen-space length to the
+    // depth requested by the editor. This preserves perspective without
+    // allowing a high-resolution source photo to collapse the return.
+    const offsets = projected.map((point, index) => ({
+      x: point.x - corners[index].x,
+      y: point.y - corners[index].y,
+    }));
+    const meanLength = offsets.reduce((total, offset) => total + Math.hypot(offset.x, offset.y), 0) / offsets.length;
+    if (meanLength > 1e-6 && visualDepthPx > 0) {
+      const scale = visualDepthPx / meanLength;
+      return corners.map((point, index) => ({
+        x: point.x + offsets[index].x * scale,
+        y: point.y + offsets[index].y * scale,
+      })) as [Point, Point, Point, Point];
+    }
+  }
   const radians = angleDeg * Math.PI / 180;
   return corners.map(point => ({
     x: point.x - Math.cos(radians) * visualDepthPx,

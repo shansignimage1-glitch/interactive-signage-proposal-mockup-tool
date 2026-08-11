@@ -52,6 +52,25 @@ const calibrateCanvas = async (page: Page) => {
   await page.getByRole('button', { name: 'Apply calibration' }).click();
 };
 
+const calibratePerspectiveCanvas = async (page: Page) => {
+  const openAllControls = page.getByRole('button', { name: 'Open all controls' });
+  if (await openAllControls.isVisible()) await openAllControls.click();
+  await page.getByRole('button', { name: /Set real-world scale/ }).click();
+  await page.getByRole('button', { name: /Angled facade/ }).click();
+  const surface = page.locator('#export-target');
+  const bounds = await surface.boundingBox();
+  expect(bounds).not.toBeNull();
+  for (const position of [
+    { x: bounds!.width * 0.2, y: bounds!.height * 0.2 },
+    { x: bounds!.width * 0.78, y: bounds!.height * 0.24 },
+    { x: bounds!.width * 0.72, y: bounds!.height * 0.78 },
+    { x: bounds!.width * 0.24, y: bounds!.height * 0.72 },
+  ]) await surface.click({ position });
+  await page.getByRole('button', { name: 'Continue' }).click();
+  await page.getByRole('button', { name: 'Review calibration' }).click();
+  await page.getByRole('button', { name: 'Apply calibration' }).click();
+};
+
 test('touch drawing and dimension resize handles show a finger-offset precision magnifier', async ({ page }, testInfo) => {
   test.skip(testInfo.project.name === 'desktop-chromium', 'Touch precision UI is specific to iPad and phone layouts.');
 
@@ -327,6 +346,33 @@ test('canvas undo and redo restore a completed sign placement gesture', async ({
   await expect(redoButton).toBeDisabled();
 });
 
+const readRenderedSignBounds = (page: Page) => page.locator('#export-target canvas.pointer-events-none').evaluate(canvasElement => {
+  const canvas = canvasElement as HTMLCanvasElement;
+  const gl = canvas.getContext('webgl');
+  if (!gl) return null;
+  const pixels = new Uint8Array(canvas.width * canvas.height * 4);
+  gl.readPixels(0, 0, canvas.width, canvas.height, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+  let minX = canvas.width;
+  let minY = canvas.height;
+  let maxX = -1;
+  let maxY = -1;
+  for (let y = 0; y < canvas.height; y += 1) {
+    for (let x = 0; x < canvas.width; x += 1) {
+      if (pixels[(y * canvas.width + x) * 4 + 3] === 0) continue;
+      minX = Math.min(minX, x);
+      minY = Math.min(minY, y);
+      maxX = Math.max(maxX, x);
+      maxY = Math.max(maxY, y);
+    }
+  }
+  if (maxX < minX || maxY < minY) return null;
+  const rect = canvas.getBoundingClientRect();
+  return {
+    width: (maxX - minX + 1) * rect.width / canvas.width,
+    height: (maxY - minY + 1) * rect.height / canvas.height,
+  };
+});
+
 test('placed sign dimensions stay on the sign and update while it is scaled', async ({ page }) => {
   await page.goto('/');
   await page.getByRole('button', { name: 'Continue as Guest' }).click();
@@ -369,7 +415,8 @@ test('placed sign dimensions stay on the sign and update while it is scaled', as
 });
 
 test('3D extrusion automatically isolates artwork and separates board depth', async ({ page }, testInfo) => {
-  test.skip(testInfo.project.name !== 'desktop-chromium', 'WebGL construction-mode coverage runs once on desktop Chromium.');
+  test.setTimeout(90_000);
+  test.skip(!['desktop-chromium', 'ipad', 'ipad-webkit'].includes(testInfo.project.name), 'WebGL construction-mode coverage runs on desktop and iPad engines.');
 
   await page.goto('/');
   await page.getByRole('button', { name: 'Continue as Guest' }).click();
@@ -387,8 +434,30 @@ test('3D extrusion automatically isolates artwork and separates board depth', as
 
   await construction.selectOption('individual');
   await expect(boardDepth).toBeHidden();
+  await letterDepth.fill('1');
+  await page.waitForTimeout(100);
+  const shallowBounds = await readRenderedSignBounds(page);
+  expect(shallowBounds).not.toBeNull();
+  await letterDepth.fill('60');
+  await expect.poll(async () => {
+    const deepBounds = await readRenderedSignBounds(page);
+    if (!deepBounds || !shallowBounds) return 0;
+    return (deepBounds.width - shallowBounds.width) + (deepBounds.height - shallowBounds.height);
+  }).toBeGreaterThan(5);
   await construction.selectOption('backed');
   await expect(boardDepth).toBeVisible();
+
+  await calibratePerspectiveCanvas(page);
+  await page.getByRole('button', { name: 'Select & adjust' }).click();
+  const openAllControls = page.getByRole('button', { name: 'Open all controls' });
+  if (await openAllControls.isVisible()) await openAllControls.click();
+  await page.getByTestId('controls-panel').getByText('Sign 1', { exact: true }).click();
+  if (await openAllControls.isVisible()) await openAllControls.click();
+  const projectionModel = page.getByRole('combobox', { name: 'Sign projection model' });
+  await projectionModel.selectOption('camera-3d');
+  await expect(projectionModel).toHaveValue('camera-3d');
+  await expect(page.getByRole('checkbox', { name: 'Camera pose estimation' })).toBeChecked();
+  await expect(page.getByRole('slider', { name: 'Physical sign depth' })).toBeVisible();
 });
 
 test('sign controls have iPad-sized targets and move on the first drag', async ({ page }) => {

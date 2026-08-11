@@ -86,13 +86,30 @@ const idbOperation = async <T>(
 // --- Cloud-drive asset cache (IndexedDB 'assets' store) ---
 
 export interface CachedAsset { ref: string; blob: Blob; mime: string; cachedAt: number }
+interface StoredCachedAsset {
+    ref: string;
+    blob?: Blob; // Legacy v3/v4 records.
+    bytes?: ArrayBuffer;
+    mime: string;
+    cachedAt: number;
+}
 
-export const getCachedAsset = async (ref: string): Promise<CachedAsset | null> =>
-    (await idbOperation<CachedAsset>(STORE_ASSETS, 'readonly', (store) => store.get(ref))) ?? null;
+export const getCachedAsset = async (ref: string): Promise<CachedAsset | null> => {
+    const stored = (await idbOperation<StoredCachedAsset>(STORE_ASSETS, 'readonly', store => store.get(ref))) ?? null;
+    if (!stored) return null;
+    if (stored.blob instanceof Blob) return { ...stored, blob: stored.blob };
+    if (stored.bytes) return { ...stored, blob: new Blob([stored.bytes], { type: stored.mime }) };
+    return null;
+};
 
 export const putCachedAsset = async (ref: string, blob: Blob): Promise<void> => {
+    // WebKit can reject Blob/File objects during IndexedDB structured cloning
+    // with "Error preparing Blob/File data". ArrayBuffer is consistently
+    // cloneable across Safari, Chromium and Firefox; reconstruct the Blob only
+    // when a consumer reads it back. Existing Blob records remain readable.
+    const bytes = await blob.arrayBuffer();
     await idbOperation(STORE_ASSETS, 'readwrite', (store) =>
-        store.put({ ref, blob, mime: blob.type, cachedAt: Date.now() } as CachedAsset));
+        store.put({ ref, bytes, mime: blob.type, cachedAt: Date.now() } as StoredCachedAsset));
 };
 
 export type SiteCaptureAssetKind = 'original' | 'working' | 'thumbnail' | 'dictation';

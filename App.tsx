@@ -859,7 +859,13 @@ const App: React.FC = () => {
       const canvas = prev.canvases.find(c => c.id === prev.activeCanvasId);
       if (!canvas || !canvas.activeSignId) return;
       const newSigns = canvas.signs.map(s =>
-          s.id === canvas.activeSignId ? { ...s, elements, elementsSourceSize: sourceSize, extrusionEnabled: Boolean(elements?.length) } : s
+          s.id === canvas.activeSignId ? {
+              ...s,
+              elements,
+              elementsSourceSize: sourceSize,
+              elementDepthModel: 'relative-width-v1' as const,
+              extrusionEnabled: Boolean(elements?.length),
+          } : s
       );
       updateActiveCanvasWithHistory({ signs: newSigns });
       setShowElementStudio(false);
@@ -1208,6 +1214,7 @@ const App: React.FC = () => {
             onUpdate={updateState}
             onLoadProject={handleProjectLoad}
             onNewProject={handleNewProject}
+            onSaveProject={handleProjectSave}
             onPromoteCapture={handlePromoteSiteCapture}
             onLogout={handleLogout}
           />
