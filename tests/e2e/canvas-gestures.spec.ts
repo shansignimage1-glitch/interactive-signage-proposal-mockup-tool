@@ -285,6 +285,71 @@ test('view lock freezes pan and zoom while sign editing stays interactive', asyn
   expect(afterUnlockedPan.y - beforeUnlockedPan.y).toBeCloseTo(35, 0);
 });
 
+test('canvas undo and redo restore a completed sign placement gesture', async ({ page }) => {
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Continue as Guest' }).click();
+  await addPlaceholderSign(page);
+  await page.getByRole('button', { name: 'Select & adjust' }).click();
+  await page.evaluate(() => {
+    Element.prototype.setPointerCapture = () => undefined;
+    Element.prototype.releasePointerCapture = () => undefined;
+    Element.prototype.hasPointerCapture = () => false;
+  });
+
+  const undoButton = page.getByTestId('canvas-undo-sign');
+  const redoButton = page.getByTestId('canvas-redo-sign');
+  await expect(undoButton).toBeVisible();
+  await expect(redoButton).toBeDisabled();
+  const undoBounds = await undoButton.boundingBox();
+  expect(undoBounds).not.toBeNull();
+  expect(undoBounds!.width).toBeGreaterThanOrEqual(48);
+  expect(undoBounds!.height).toBeGreaterThanOrEqual(48);
+
+  const moveHandle = page.getByTestId('sign-move-handle');
+  const before = await moveHandle.boundingBox();
+  expect(before).not.toBeNull();
+  const center = { x: before!.x + before!.width / 2, y: before!.y + before!.height / 2 };
+  await dispatchTouch(page, 'pointerdown', 1, center.x, center.y, '[data-testid="sign-move-handle"]');
+  await dispatchTouch(page, 'pointermove', 1, center.x + 44, center.y + 26, '[data-testid="sign-move-handle"]');
+  await dispatchTouch(page, 'pointerup', 1, center.x + 44, center.y + 26, '[data-testid="sign-move-handle"]');
+
+  const after = await moveHandle.boundingBox();
+  expect(after).not.toBeNull();
+  expect(after!.x).toBeGreaterThan(before!.x + 30);
+  await expect(redoButton).toBeDisabled();
+
+  await undoButton.click();
+  await expect.poll(async () => (await moveHandle.boundingBox())!.x).toBeCloseTo(before!.x, 0);
+  await expect(redoButton).toBeEnabled();
+
+  await redoButton.click();
+  await expect.poll(async () => (await moveHandle.boundingBox())!.x).toBeCloseTo(after!.x, 0);
+  await expect(redoButton).toBeDisabled();
+});
+
+test('3D extrusion automatically isolates artwork and separates board depth', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-chromium', 'WebGL construction-mode coverage runs once on desktop Chromium.');
+
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Continue as Guest' }).click();
+  await addPlaceholderSign(page);
+
+  const construction = page.getByRole('combobox', { name: 'Sign extrusion construction' });
+  await expect(construction).toHaveValue('backed');
+  await expect(page.getByTestId('extrusion-detection-status')).toBeHidden({ timeout: 15_000 });
+  await expect(page.getByTitle("Detect the sign's letters/logo and give each its own extrusion depth")).toHaveText(/3D Elements\d+/);
+
+  const letterDepth = page.getByRole('slider', { name: 'Letter and logo extrusion depth' });
+  const boardDepth = page.getByRole('slider', { name: 'Backing board extrusion depth' });
+  await expect(boardDepth).toBeVisible();
+  expect(Number(await boardDepth.getAttribute('max'))).toBeLessThan(Number(await letterDepth.inputValue()));
+
+  await construction.selectOption('individual');
+  await expect(boardDepth).toBeHidden();
+  await construction.selectOption('backed');
+  await expect(boardDepth).toBeVisible();
+});
+
 test('sign controls have iPad-sized targets and move on the first drag', async ({ page }) => {
   await page.goto('/');
   await page.getByRole('button', { name: 'Continue as Guest' }).click();

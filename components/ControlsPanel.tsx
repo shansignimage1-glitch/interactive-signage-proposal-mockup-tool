@@ -11,6 +11,8 @@ import { notify } from '../services/toast';
 import { optimizeDataUri } from '../services/imageProcessing';
 import { materializeTemplateDataUri } from '../services/LibraryService';
 import { calibrationForPlane, getCalibrationPlanes } from '../utils/cameraGeometry';
+import { detectSignArtwork } from '../utils/elementDetection';
+import { defaultExtrusionModeForType, getBackingDepth, getSignExtrusionMode } from '../utils/signExtrusion';
 
 interface ControlsPanelProps {
   state: MockupState;
@@ -152,6 +154,8 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
   const [targetWidth, setTargetWidth] = useState('');
   const [targetHeight, setTargetHeight] = useState('');
   const [nudgeStep, setNudgeStep] = useState<1 | 5>(1);
+  const [preparingExtrusionId, setPreparingExtrusionId] = useState<string | null>(null);
+  const preparedExtrusionKeysRef = useRef(new Set<string>());
 
   const applyPerspectivePreset = (preset: 'flat' | 'left' | 'right') => {
       if (!activeSign) return;
@@ -534,6 +538,58 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
   };
 
   const activeSign = activeCanvas.signs.find(s => s.id === activeCanvas.activeSignId);
+
+  useEffect(() => {
+      if (!activeSign?.extrusionEnabled || activeSign.elements?.length || !activeSign.image) return;
+      const sign = activeSign;
+      const detectionKey = `${sign.id}|${sign.image}`;
+      if (preparedExtrusionKeysRef.current.has(detectionKey)) return;
+      preparedExtrusionKeysRef.current.add(detectionKey);
+      let cancelled = false;
+      setPreparingExtrusionId(sign.id);
+      void detectSignArtwork(sign.image, { sensitivity: 0.5, minAreaPct: 0.05 })
+        .then(({ elements, sourceSize }) => {
+          if (cancelled) return;
+          if (!elements.length) {
+            notify('No letters or logo could be isolated. Open 3D Elements to refine detection.', 'warning');
+            return;
+          }
+          const quadWidth = (Math.hypot(sign.corners[1].x - sign.corners[0].x, sign.corners[1].y - sign.corners[0].y)
+            + Math.hypot(sign.corners[2].x - sign.corners[3].x, sign.corners[2].y - sign.corners[3].y)) / 2;
+          const imageToCanvasScale = quadWidth / Math.max(1, sourceSize.width);
+          const elementDepth = Math.max(2, sign.extrusionDepth / Math.max(0.01, imageToCanvasScale));
+          updateSignById(sign.id, {
+            elements: elements.map((element, index) => ({
+              id: `auto-${index}-${Math.round(element.bbox.x)}-${Math.round(element.bbox.y)}`,
+              name: `Letter / logo ${index + 1}`,
+              contours: element.contours,
+              depth: elementDepth,
+              enabled: true,
+            })),
+            elementsSourceSize: sourceSize,
+          });
+        })
+        .catch(error => {
+          if (!cancelled) notify(error instanceof Error ? error.message : 'Could not prepare 3D artwork.', 'error');
+        })
+        .finally(() => {
+          if (!cancelled) setPreparingExtrusionId(current => current === sign.id ? null : current);
+        });
+      return () => {
+        cancelled = true;
+        preparedExtrusionKeysRef.current.delete(detectionKey);
+      };
+  }, [activeSign?.elements?.length, activeSign?.extrusionEnabled, activeSign?.id, activeSign?.image]);
+
+  const updateLetterDepth = (depth: number) => {
+      if (!activeSign) return;
+      const ratio = depth / Math.max(1, activeSign.extrusionDepth);
+      updateActiveSign({
+          extrusionDepth: depth,
+          backingDepth: Math.min(getBackingDepth(activeSign), depth * 0.8),
+          elements: activeSign.elements?.map(element => ({ ...element, depth: Math.max(1, element.depth * ratio) })),
+      });
+  };
 
   // --- Measurement / Calibration ---
   const calibration = activeCanvas.calibration ?? null;
@@ -1071,9 +1127,12 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
                                       </label>
                                       {activeSign.extrusionEnabled && (
                                           <div className="mt-3 space-y-3">
+                                              <label className="block text-xs text-gray-400">Sign construction<select aria-label="Sign extrusion construction" value={getSignExtrusionMode(activeSign)} onChange={event => updateActiveSign({ extrusionMode: event.target.value as 'backed' | 'individual' })} className="mt-1 min-h-10 w-full rounded-lg border border-gray-700 bg-gray-900 px-2 text-xs text-white"><option value="backed">Backing board + raised letters/logo</option><option value="individual">Individual letters/logo (no board)</option></select></label>
+                                              {preparingExtrusionId === activeSign.id && <div data-testid="extrusion-detection-status" className="flex items-center gap-2 rounded-lg border border-cyan-500/20 bg-cyan-500/10 px-3 py-2 text-[10px] text-cyan-200"><Loader2 className="h-3.5 w-3.5 animate-spin" /> Isolating letters and logo…</div>}
                                               {planes.length > 0 && <label className="block text-xs text-gray-400">Projection model<select aria-label="Sign projection model" value={activeSign.projectionMode ?? 'planar'} onChange={event => updateActiveSign({ projectionMode: event.target.value as 'planar' | 'camera-3d' })} className="mt-1 min-h-10 w-full rounded-lg border border-gray-700 bg-gray-900 px-2 text-xs text-white"><option value="planar">Visual 2D extrusion</option><option value="camera-3d">Camera-pose 3D</option></select></label>}
                                               {activeSign.projectionMode === 'camera-3d' && <div><div className="mb-1 flex justify-between"><label className="text-xs text-gray-400">Physical depth</label><span className="font-mono text-xs text-cyan-300">{activeSign.physicalDepthMm ?? 100}mm</span></div><input aria-label="Physical sign depth" type="range" min="10" max="2000" step="10" value={activeSign.physicalDepthMm ?? 100} onChange={event => updateActiveSign({ physicalDepthMm: Number(event.target.value) })} className="h-2 w-full accent-cyan-500" /><p className="mt-1 text-[9px] text-gray-500">Projected with the selected plane and camera field of view.</p></div>}
-                                              <div><div className="mb-1 flex justify-between"><label className="text-xs text-gray-400">Depth</label><span className="font-mono text-xs text-cyan-300">{activeSign.extrusionDepth}px</span></div><input type="range" min="0" max="100" value={activeSign.extrusionDepth} onChange={(e) => updateActiveSign({ extrusionDepth: parseInt(e.target.value) })} className="h-2 w-full accent-cyan-500" /></div>
+                                              <div><div className="mb-1 flex justify-between"><label className="text-xs text-gray-400">Letter / logo depth</label><span className="font-mono text-xs text-cyan-300">{activeSign.extrusionDepth}px</span></div><input aria-label="Letter and logo extrusion depth" type="range" min="1" max="100" value={activeSign.extrusionDepth} onChange={(e) => updateLetterDepth(parseInt(e.target.value))} className="h-2 w-full accent-cyan-500" /></div>
+                                              {getSignExtrusionMode(activeSign) === 'backed' && <div><div className="mb-1 flex justify-between"><label className="text-xs text-gray-400">Backing board depth</label><span className="font-mono text-xs text-cyan-300">{getBackingDepth(activeSign).toFixed(0)}px</span></div><input aria-label="Backing board extrusion depth" type="range" min="0" max={Math.max(1, Math.floor(activeSign.extrusionDepth * 0.8))} value={getBackingDepth(activeSign)} onChange={event => updateActiveSign({ backingDepth: Number(event.target.value) })} className="h-2 w-full accent-cyan-500" /><p className="mt-1 text-[9px] text-gray-500">The board remains shallower than the raised copy.</p></div>}
                                               <div><div className="mb-1 flex justify-between"><label className="text-xs text-gray-400">Direction</label><span className="font-mono text-xs text-cyan-300">{activeSign.extrusionAngle}°</span></div><input type="range" min="0" max="360" value={activeSign.extrusionAngle} onChange={(e) => updateActiveSign({ extrusionAngle: parseInt(e.target.value) })} className="h-2 w-full accent-cyan-500" /></div>
                                               <label className="flex items-center justify-between text-xs text-gray-400"><span>Side colour</span><input type="color" value={activeSign.sideColor} onChange={(e) => updateActiveSign({ sideColor: e.target.value })} className="h-8 w-12 cursor-pointer rounded border border-gray-600 bg-transparent p-0.5" /></label>
                                           </div>
@@ -1121,7 +1180,7 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
                               <label className="text-xs text-gray-400 mb-1 block">Sign Type</label>
                               <select 
                                 value={activeSign.signType || 'fascia_non_ill'} 
-                                onChange={(e) => updateActiveSign({ signType: e.target.value as SignType })} 
+                                onChange={(e) => { const signType = e.target.value as SignType; updateActiveSign({ signType, extrusionMode: defaultExtrusionModeForType(signType) }); }}
                                 className="w-full bg-gray-800 text-sm text-white border border-gray-600 rounded p-1"
                               >
                                 {SIGN_TYPES.map(type => (

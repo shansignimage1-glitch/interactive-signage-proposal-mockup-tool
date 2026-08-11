@@ -235,7 +235,7 @@ const ElementStudio: React.FC<ElementStudioProps> = ({ sign, quadWidthMm, unitSy
                   onClick={() => onApply(undefined, undefined)}
                   className="w-full flex items-center justify-center gap-2 bg-gray-800 hover:bg-gray-700 text-red-400 py-2 rounded-lg text-xs transition-colors border border-gray-700"
                 >
-                  <Trash2 className="w-3.5 h-3.5" /> Remove 3D Elements (back to slab)
+                  <Trash2 className="w-3.5 h-3.5" /> Disable detected 3D elements
                 </button>
               )}
             </div>

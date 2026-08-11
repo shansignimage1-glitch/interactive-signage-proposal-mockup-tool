@@ -1,4 +1,5 @@
 import { MockupState } from '../types';
+import { defaultExtrusionModeForType } from './signExtrusion';
 
 /** Normalizes projects saved by older app versions before they enter React state. */
 export const normalizeProjectState = (input: MockupState): MockupState => {
@@ -16,6 +17,8 @@ export const normalizeProjectState = (input: MockupState): MockupState => {
       placementAnchor: sign.placementAnchor ?? 'center',
       projectionMode: sign.projectionMode ?? 'planar',
       physicalDepthMm: sign.physicalDepthMm ?? 100,
+      extrusionMode: sign.extrusionMode ?? defaultExtrusionModeForType(sign.signType ?? 'fascia_non_ill'),
+      backingDepth: sign.backingDepth ?? Math.max(2, Math.round((sign.extrusionDepth ?? 15) / 3)),
       calibrationPlaneId: sign.calibrationPlaneId ?? activePlaneId,
     })) : [],
     dimensions: Array.isArray(canvas.dimensions) ? canvas.dimensions : [],

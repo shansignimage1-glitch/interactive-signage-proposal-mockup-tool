@@ -7,12 +7,13 @@ import { buildElementMask } from '../utils/elementDetection';
 import { reportError } from '../services/monitoring';
 import { notify } from '../services/toast';
 import { MAX_SOURCE_BYTES } from '../services/imageProcessing';
-import { ZoomIn, ZoomOut, Maximize, Check, X, Lock, Unlock } from 'lucide-react';
+import { ZoomIn, ZoomOut, Maximize, Check, X, Lock, Unlock, Undo2, Redo2 } from 'lucide-react';
 import { ToolMode } from '../App';
 import { TITLE_BLOCK_TEMPLATES } from '../data/titleBlockTemplates';
 import { clampViewScale, viewForPinch, zoomViewAtPoint, type ViewTransform } from '../utils/viewport';
 import { calibrationForPlane, getActiveCalibrationPlane, getCalibrationPlanes, getVanishingPoints, projectPlaneDepth, snapSign } from '../utils/cameraGeometry';
 import LensCorrectedBackground from './LensCorrectedBackground';
+import { getBackingDepth, getSignExtrusionPlan } from '../utils/signExtrusion';
 
 interface MockupCanvasProps {
   images: AppImages;
@@ -35,6 +36,12 @@ interface MockupCanvasProps {
   onCalibrationDraftPointsChange: (points: Point[]) => void;
   showCalibrationReference: boolean;
   updateSignById: (id: string, updates: Partial<Sign>) => void;
+  undo: () => void;
+  redo: () => void;
+  canUndo: boolean;
+  canRedo: boolean;
+  onSignPlacementStart: () => void;
+  onSignPlacementEnd: (changed: boolean) => void;
   setActiveSign: (id: string | null) => void;
   updateDimension: (id: string, updates: Partial<Dimension>) => void;
   setActiveDimension: (id: string) => void;
@@ -135,6 +142,12 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
     onCalibrationDraftPointsChange,
     showCalibrationReference,
     updateSignById,
+    undo,
+    redo,
+    canUndo,
+    canRedo,
+    onSignPlacementStart,
+    onSignPlacementEnd,
     setActiveSign, 
     updateDimension,
     setActiveDimension,
@@ -247,6 +260,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
   const startMousePos = useRef<Point>({ x: 0, y: 0 });
   const startCornersRef = useRef<[Point, Point, Point, Point] | null>(null);
   const dragSignIdRef = useRef<string | null>(null);
+  const signPlacementChangedRef = useRef(false);
   const dragDimensionIdRef = useRef<string | null>(null);
   const startDimRef = useRef<{ start: Point, end: Point } | null>(null);
   const activeEditPointerRef = useRef<number | null>(null);
@@ -341,7 +355,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
     applyView(next);
   }, [applyView, getContainerSize, viewportSize]);
 
-  // Escape to Cancel Drawing
+  // Canvas editing shortcuts
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
         if (e.key === 'Escape' && isDrawing) {
@@ -350,11 +364,22 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
             drawingCurrent.current = null;
             drawingTouchRef.current = null;
             clearPrecisionLoupe();
+            return;
+        }
+        const target = e.target as HTMLElement | null;
+        const isTyping = target?.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target?.tagName ?? '');
+        if (!isTyping && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
+            const wantsRedo = e.shiftKey;
+            if ((wantsRedo && canRedo) || (!wantsRedo && canUndo)) {
+                e.preventDefault();
+                if (wantsRedo) redo();
+                else undo();
+            }
         }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [clearPrecisionLoupe, isDrawing]);
+  }, [canRedo, canUndo, clearPrecisionLoupe, isDrawing, redo, undo]);
 
   // --- Reset View & Calc Base Scale ---
   const fitToContainer = useCallback(() => {
@@ -1004,15 +1029,17 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
       const rgb = hexToRgb(sign.sideColor);
       const sideColor = [rgb[0], rgb[1], rgb[2], sign.opacity];
       const shadowColor = [rgb[0]*0.7, rgb[1]*0.7, rgb[2]*0.7, sign.opacity];
+      const extrusionPlan = getSignExtrusionPlan(sign);
 
-      if (sign.extrusionEnabled) {
+      if (extrusionPlan.renderBacking) {
         const rad = (sign.extrusionAngle * Math.PI) / 180;
-        const depthX = Math.cos(rad) * sign.extrusionDepth;
-        const depthY = Math.sin(rad) * sign.extrusionDepth;
+        const backingDepth = getBackingDepth(sign);
+        const depthX = Math.cos(rad) * backingDepth;
+        const depthY = Math.sin(rad) * backingDepth;
         const placement = state.canvases.find(item => item.id === state.activeCanvasId)?.placement;
         const plane = getActiveCalibrationPlane(calibration, sign.calibrationPlaneId);
         const cameraBack = sign.projectionMode === 'camera-3d' && placement?.camera.enabled && plane
-          ? projectPlaneDepth(c, plane, placement.camera, images.backgroundSize, sign.physicalDepthMm ?? 100)
+          ? projectPlaneDepth(c, plane, placement.camera, images.backgroundSize, Math.min(sign.physicalDepthMm ?? 100, (sign.physicalDepthMm ?? 100) * (backingDepth / Math.max(1, sign.extrusionDepth))))
           : null;
         const backC = cameraBack ?? c.map(p => ({ x: p.x + depthX, y: p.y + depthY }));
         
@@ -1023,7 +1050,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
       }
 
       const tex = textureCacheRef.current.get(sign.image);
-      if (tex) {
+      if (tex && extrusionPlan.renderFullFace) {
           gl.bindTexture(gl.TEXTURE_2D, tex);
           drawQuad(c[0], c[1], c[2], c[3], [1,1,1, sign.opacity], true);
       }
@@ -1032,8 +1059,8 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
       const elemCache = elementCacheRef.current.get(sign.id);
       const elemProgram = elemProgramRef.current;
       const eLocs = elemLocsRef.current;
-      const activeElements = sign.elements?.filter(e => e.enabled) ?? [];
-      if (elemCache && elemProgram && eLocs && activeElements.length && sign.elementsSourceSize && tex) {
+      const activeElements = extrusionPlan.activeElements;
+      if (extrusionPlan.renderElements && elemCache && elemProgram && eLocs && sign.elementsSourceSize && tex) {
         const { width: sw, height: sh } = sign.elementsSourceSize;
         gl.useProgram(elemProgram);
 
@@ -1141,6 +1168,8 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
     } else if (activeSignId) {
         const activeSign = signs.find(s => s.id === activeSignId);
         if (activeSign) {
+            onSignPlacementStart();
+            signPlacementChangedRef.current = false;
             startCornersRef.current = [...activeSign.corners];
             dragSignIdRef.current = activeSign.id;
             if (index >= 0 && index < 4) {
@@ -1180,6 +1209,8 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
       e.currentTarget.setPointerCapture(e.pointerId);
       activeEditPointerRef.current = e.pointerId;
       setActiveSign(sign.id);
+      onSignPlacementStart();
+      signPlacementChangedRef.current = false;
       startMousePos.current = getMousePos(e);
       startCornersRef.current = [...sign.corners];
       dragSignIdRef.current = sign.id;
@@ -1328,6 +1359,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
             if (interactionHandle < 4) {
                 const newCorners = [...activeSign.corners] as [Point, Point, Point, Point]; 
                 newCorners[interactionHandle] = pos;
+                signPlacementChangedRef.current = true;
                 updateSignById(dragSignId, { corners: newCorners });
                 if (precisionPointerRef.current?.kind === 'sign' && precisionPointerRef.current.pointerId === e.pointerId) {
                     showPrecisionLoupe('sign', e, pos);
@@ -1342,6 +1374,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
                     movedCorners = snapped.corners;
                     setSnapGuides({ vertical: snapped.vertical, horizontal: snapped.horizontal });
                 }
+                signPlacementChangedRef.current = true;
                 updateSignById(dragSignId, { corners: movedCorners });
             } 
             else if (interactionHandle === 5) {
@@ -1356,6 +1389,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
                 const signCalibration = calibrationForPlane(calibration, activeSign.calibrationPlaneId);
                 const newCorners = scaleSignOnPlane(startCorners, scaleX, keepRatio ? scaleX : 1, signCalibration);
                 const realSize = signCalibration ? measureSignSizeMm(newCorners, signCalibration) : null;
+                signPlacementChangedRef.current = true;
                 updateSignById(dragSignId, { corners: newCorners, realWidthMm: realSize?.width, realHeightMm: realSize?.height });
             }
             else if (interactionHandle === 6) {
@@ -1370,6 +1404,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
                 const signCalibration = calibrationForPlane(calibration, activeSign.calibrationPlaneId);
                 const newCorners = scaleSignOnPlane(startCorners, keepRatio ? scaleY : 1, scaleY, signCalibration);
                 const realSize = signCalibration ? measureSignSizeMm(newCorners, signCalibration) : null;
+                signPlacementChangedRef.current = true;
                 updateSignById(dragSignId, { corners: newCorners, realWidthMm: realSize?.width, realHeightMm: realSize?.height });
             }
         } else if (updateDraggedDimension(interactionHandle, pos)) {
@@ -1418,6 +1453,10 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
     }
 
     if (activeHandleRef.current !== null) updateDraggedDimension(activeHandleRef.current, getMousePos(e));
+    if (dragSignIdRef.current) {
+        onSignPlacementEnd(signPlacementChangedRef.current);
+        signPlacementChangedRef.current = false;
+    }
     
     // Only stop propagation if we were dragging a handle
     if (activeHandleRef.current !== null) {
@@ -1432,6 +1471,10 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
   };
 
   const handleCanvasPointerCancel = (e: React.PointerEvent) => {
+    if (dragSignIdRef.current) {
+        onSignPlacementEnd(signPlacementChangedRef.current);
+        signPlacementChangedRef.current = false;
+    }
     setIsDrawing(false);
     drawingStart.current = null;
     drawingCurrent.current = null;
@@ -1713,6 +1756,41 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
           {viewLocked ? <Lock className="h-5 w-5" /> : <Unlock className="h-5 w-5" />}
         </button>
       </div>
+      {!isSheetView && !isCropping && toolMode === 'select' && signs.length > 0 && (
+        <div
+          data-canvas-ui
+          data-testid="sign-placement-history"
+          className="absolute bottom-[calc(88px+env(safe-area-inset-bottom))] left-1/2 z-50 flex -translate-x-1/2 items-center overflow-hidden rounded-xl border border-slate-600/90 bg-slate-950/95 shadow-2xl backdrop-blur lg:bottom-4"
+        >
+          <span className="hidden border-r border-slate-700 px-3 text-[10px] font-bold uppercase tracking-[0.16em] text-slate-400 sm:block">Placement</span>
+          <button
+            type="button"
+            data-testid="canvas-undo-sign"
+            aria-label="Undo sign placement"
+            aria-keyshortcuts="Control+Z Meta+Z"
+            title="Undo sign placement (Ctrl/Cmd+Z)"
+            disabled={!canUndo}
+            onPointerDown={(event) => event.stopPropagation()}
+            onClick={undo}
+            className="flex min-h-12 min-w-12 items-center justify-center border-r border-slate-700 text-slate-100 transition-colors enabled:hover:bg-slate-800 enabled:active:bg-slate-700 disabled:cursor-not-allowed disabled:text-slate-600"
+          >
+            <Undo2 className="h-5 w-5" />
+          </button>
+          <button
+            type="button"
+            data-testid="canvas-redo-sign"
+            aria-label="Redo sign placement"
+            aria-keyshortcuts="Control+Shift+Z Meta+Shift+Z"
+            title="Redo sign placement (Ctrl/Cmd+Shift+Z)"
+            disabled={!canRedo}
+            onPointerDown={(event) => event.stopPropagation()}
+            onClick={redo}
+            className="flex min-h-12 min-w-12 items-center justify-center text-slate-100 transition-colors enabled:hover:bg-slate-800 enabled:active:bg-slate-700 disabled:cursor-not-allowed disabled:text-slate-600"
+          >
+            <Redo2 className="h-5 w-5" />
+          </button>
+        </div>
+      )}
       {(toolMode === 'draw_line' || toolMode === 'draw_box') && (
         <div data-canvas-ui className="pointer-events-none absolute bottom-[max(1rem,env(safe-area-inset-bottom))] left-1/2 z-40 -translate-x-1/2 rounded-full border border-blue-400/40 bg-gray-950/90 px-4 py-2 text-center text-sm font-medium text-white shadow-xl backdrop-blur">
           {isDrawing

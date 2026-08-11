@@ -35,8 +35,16 @@ const loadImage = (url: string): Promise<HTMLImageElement> =>
   new Promise((resolve, reject) => {
     const img = new Image();
     img.crossOrigin = 'anonymous';
-    img.onload = () => resolve(img);
-    img.onerror = () => reject(new Error('Could not load sign image for detection'));
+    const finish = (error?: Error) => {
+      window.clearTimeout(timeout);
+      img.onload = null;
+      img.onerror = null;
+      if (error) reject(error);
+      else resolve(img);
+    };
+    const timeout = window.setTimeout(() => finish(new Error('Sign artwork detection timed out')), 12_000);
+    img.onload = () => finish();
+    img.onerror = () => finish(new Error('Could not load sign image for detection'));
     img.src = url;
   });
 
@@ -253,6 +261,24 @@ export const elementDetectionTestables = {
   traceBoundary,
   simplifyClosed,
   traceHoles,
+  isLikelyPerimeterFrame: (component: Component, width: number, height: number) => {
+    const boxWidth = component.maxX - component.minX + 1;
+    const boxHeight = component.maxY - component.minY + 1;
+    // Artwork keylines are commonly inset a few percent from each edge, so
+    // use axis-specific tolerances rather than the shorter image dimension.
+    const edgeToleranceX = Math.max(1, Math.round(width * 0.05));
+    const edgeToleranceY = Math.max(1, Math.round(height * 0.05));
+    const touchesEdges = [
+      component.minX <= edgeToleranceX,
+      component.minY <= edgeToleranceY,
+      component.maxX >= width - 1 - edgeToleranceX,
+      component.maxY >= height - 1 - edgeToleranceY,
+    ].filter(Boolean).length;
+    const coverageX = boxWidth / Math.max(1, width);
+    const coverageY = boxHeight / Math.max(1, height);
+    const density = component.area / Math.max(1, boxWidth * boxHeight);
+    return touchesEdges >= 3 && coverageX >= 0.9 && coverageY >= 0.9 && density < 0.35;
+  },
 };
 
 // --- Public API ---
@@ -281,6 +307,10 @@ export const classicalDetector: ElementDetector = {
 
     return components
       .filter(c => c.area >= Math.max(4, minArea))
+      // Decorative keylines and transparent-image frames span the whole image
+      // but contain very little filled area. They are not fabricated letters
+      // and were the source of the large extruded rectangle around signs.
+      .filter(c => !elementDetectionTestables.isLikelyPerimeterFrame(c, w, h))
       .sort((a, b) => b.area - a.area)
       .slice(0, 64) // hard cap — beyond this the artwork needs a higher min-size, not more elements
       .map(c => {
@@ -295,6 +325,15 @@ export const classicalDetector: ElementDetector = {
       })
       .filter(e => e.contours[0].length >= 3);
   },
+};
+
+export const detectSignArtwork = async (imageUrl: string, opts: DetectionOptions) => {
+  const image = await loadImage(imageUrl);
+  const elements = await classicalDetector.detect(imageUrl, opts);
+  return {
+    elements,
+    sourceSize: { width: image.naturalWidth, height: image.naturalHeight },
+  };
 };
 
 // Fills an element's contours white on transparent — used for the WebGL face
