@@ -10,6 +10,39 @@ export interface Size {
   height: number;
 }
 
+export type PlacementAnchor = 'center' | 'top-left' | 'top-center' | 'top-right' | 'bottom-left' | 'bottom-center' | 'bottom-right';
+
+export interface CalibrationPlane {
+  id: string;
+  name: string;
+  corners: [Point, Point, Point, Point];
+  widthMm: number;
+  heightMm: number;
+}
+
+export interface LensCorrection {
+  enabled: boolean;
+  /** Brown-Conrady radial coefficients. Positive k1 corrects barrel distortion. */
+  k1: number;
+  k2: number;
+}
+
+export interface CameraModel {
+  enabled: boolean;
+  /** Horizontal field of view used when focalLengthPx is not known. */
+  fieldOfViewDeg: number;
+  focalLengthPx?: number;
+  principalPoint?: Point;
+  estimated: boolean;
+}
+
+export interface PlacementSettings {
+  snapEnabled: boolean;
+  showVanishingGuides: boolean;
+  lens: LensCorrection;
+  camera: CameraModel;
+}
+
 export type SignType = 
   | 'fascia_non_ill'
   | 'fascia_ill'
@@ -64,6 +97,13 @@ export interface Sign {
   opacity: number;
   blendMode: string;
   sideColor: string;
+  realWidthMm?: number;
+  realHeightMm?: number;
+  aspectLocked?: boolean; // Undefined is treated as locked for existing projects.
+  placementAnchor?: PlacementAnchor;
+  calibrationPlaneId?: string;
+  projectionMode?: 'planar' | 'camera-3d';
+  physicalDepthMm?: number;
 
   // Per-element variable extrusion (undefined/empty = classic single-slab)
   elements?: SignElement[];
@@ -99,6 +139,9 @@ export interface Calibration {
     widthMm: number;
     heightMm: number;
   };
+  /** Multiple independently calibrated surfaces. plane mirrors the active item for old projects. */
+  planes?: CalibrationPlane[];
+  activePlaneId?: string;
 }
 
 export interface Revision {
@@ -173,6 +216,7 @@ export interface Canvas {
 
   // Real-world scale reference for this view's photo (null/undefined = not calibrated)
   calibration?: Calibration | null;
+  placement?: PlacementSettings;
 
   // Sheet Specifics
   sheetTitle: string; 

@@ -2,7 +2,7 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { AppImages, MockupState, Point, Sign, Dimension, TitleBlock, Revision, PaperSize, Orientation, Calibration } from '../types';
 import { hexToRgb, isPointInPolygon, distance, computeHomography } from '../utils/math';
-import { measureLine, measureBox } from '../utils/measure';
+import { measureLine, measureBox, measureSignSizeMm, moveSignOnPlane, scaleSignOnPlane } from '../utils/measure';
 import { buildElementMask } from '../utils/elementDetection';
 import { reportError } from '../services/monitoring';
 import { notify } from '../services/toast';
@@ -11,6 +11,8 @@ import { ZoomIn, ZoomOut, Maximize, Check, X, Lock, Unlock } from 'lucide-react'
 import { ToolMode } from '../App';
 import { TITLE_BLOCK_TEMPLATES } from '../data/titleBlockTemplates';
 import { clampViewScale, viewForPinch, zoomViewAtPoint, type ViewTransform } from '../utils/viewport';
+import { calibrationForPlane, getActiveCalibrationPlane, getCalibrationPlanes, getVanishingPoints, projectPlaneDepth, snapSign } from '../utils/cameraGeometry';
+import LensCorrectedBackground from './LensCorrectedBackground';
 
 interface MockupCanvasProps {
   images: AppImages;
@@ -183,6 +185,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
   const precisionPointerRef = useRef<{ pointerId: number; kind: PrecisionLoupeKind } | null>(null);
   const [precisionLoupe, setPrecisionLoupe] = useState<PrecisionLoupeState | null>(null);
   const [webGlGeneration, setWebGlGeneration] = useState(0);
+  const [snapGuides, setSnapGuides] = useState<{ vertical?: number; horizontal?: number } | null>(null);
 
   const showPrecisionLoupe = (kind: PrecisionLoupeKind, e: React.PointerEvent, point: Point) => {
     precisionPointerRef.current = { pointerId: e.pointerId, kind };
@@ -1006,7 +1009,12 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
         const rad = (sign.extrusionAngle * Math.PI) / 180;
         const depthX = Math.cos(rad) * sign.extrusionDepth;
         const depthY = Math.sin(rad) * sign.extrusionDepth;
-        const backC = c.map(p => ({ x: p.x + depthX, y: p.y + depthY }));
+        const placement = state.canvases.find(item => item.id === state.activeCanvasId)?.placement;
+        const plane = getActiveCalibrationPlane(calibration, sign.calibrationPlaneId);
+        const cameraBack = sign.projectionMode === 'camera-3d' && placement?.camera.enabled && plane
+          ? projectPlaneDepth(c, plane, placement.camera, images.backgroundSize, sign.physicalDepthMm ?? 100)
+          : null;
+        const backC = cameraBack ?? c.map(p => ({ x: p.x + depthX, y: p.y + depthY }));
         
         drawQuad(c[0], c[1], backC[1], backC[0], sideColor, false);
         drawQuad(c[1], c[2], backC[2], backC[1], shadowColor, false);
@@ -1091,7 +1099,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
       }
     });
 
-  }, [signs, texturesLoaded, images.backgroundSize]);
+  }, [signs, texturesLoaded, images.backgroundSize, calibration, state.activeCanvasId, state.canvases]);
 
   useEffect(() => { requestAnimationFrame(render); }, [render]);
 
@@ -1311,8 +1319,6 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
         e.stopPropagation();
         
         const pos = getMousePos(e);
-        const dx = pos.x - startMousePos.current.x;
-        const dy = pos.y - startMousePos.current.y;
         
         const dragSignId = dragSignIdRef.current ?? activeSignId;
         if (dragSignId && startCornersRef.current) {
@@ -1328,7 +1334,14 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
                 }
             } 
             else if (interactionHandle === 4) {
-                const movedCorners = startCorners.map(p => ({ x: p.x + dx, y: p.y + dy })) as [Point, Point, Point, Point]; 
+                const signCalibration = calibrationForPlane(calibration, activeSign.calibrationPlaneId);
+                let movedCorners = moveSignOnPlane(startCorners, startMousePos.current, pos, signCalibration);
+                const placement = state.canvases.find(item => item.id === state.activeCanvasId)?.placement;
+                if (placement?.snapEnabled !== false) {
+                    const snapped = snapSign(movedCorners, activeSign.placementAnchor ?? 'center', images.backgroundSize, getActiveCalibrationPlane(calibration, activeSign.calibrationPlaneId), 10 / Math.max(baseScale * view.scale, 0.01));
+                    movedCorners = snapped.corners;
+                    setSnapGuides({ vertical: snapped.vertical, horizontal: snapped.horizontal });
+                }
                 updateSignById(dragSignId, { corners: movedCorners });
             } 
             else if (interactionHandle === 5) {
@@ -1339,8 +1352,11 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
                 const startDistance = startMousePos.current.x - center.x;
                 if (Math.abs(startDistance) < 1) return;
                 const scaleX = Math.max(0.05, (pos.x - center.x) / startDistance);
-                const newCorners = startCorners.map(p => ({ x: center.x + (p.x - center.x) * scaleX, y: p.y })) as [Point, Point, Point, Point];
-                updateSignById(dragSignId, { corners: newCorners });
+                const keepRatio = activeSign.aspectLocked !== false;
+                const signCalibration = calibrationForPlane(calibration, activeSign.calibrationPlaneId);
+                const newCorners = scaleSignOnPlane(startCorners, scaleX, keepRatio ? scaleX : 1, signCalibration);
+                const realSize = signCalibration ? measureSignSizeMm(newCorners, signCalibration) : null;
+                updateSignById(dragSignId, { corners: newCorners, realWidthMm: realSize?.width, realHeightMm: realSize?.height });
             }
             else if (interactionHandle === 6) {
                 const center = {
@@ -1350,8 +1366,11 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
                 const startDistance = startMousePos.current.y - center.y;
                 if (Math.abs(startDistance) < 1) return;
                 const scaleY = Math.max(0.05, (pos.y - center.y) / startDistance);
-                const newCorners = startCorners.map(p => ({ x: p.x, y: center.y + (p.y - center.y) * scaleY })) as [Point, Point, Point, Point];
-                updateSignById(dragSignId, { corners: newCorners });
+                const keepRatio = activeSign.aspectLocked !== false;
+                const signCalibration = calibrationForPlane(calibration, activeSign.calibrationPlaneId);
+                const newCorners = scaleSignOnPlane(startCorners, keepRatio ? scaleY : 1, scaleY, signCalibration);
+                const realSize = signCalibration ? measureSignSizeMm(newCorners, signCalibration) : null;
+                updateSignById(dragSignId, { corners: newCorners, realWidthMm: realSize?.width, realHeightMm: realSize?.height });
             }
         } else if (updateDraggedDimension(interactionHandle, pos)) {
             if (precisionPointerRef.current?.kind === 'dimension' && precisionPointerRef.current.pointerId === e.pointerId) {
@@ -1406,6 +1425,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
     }
     
     setCalibrationDragIndex(null);
+    setSnapGuides(null);
     clearPrecisionLoupe();
     activeEditPointerRef.current = null;
     setActiveHandle(null); startCornersRef.current = null; dragSignIdRef.current = null; dragDimensionIdRef.current = null; startDimRef.current = null;
@@ -1511,6 +1531,9 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
   };
 
   const activeSign = signs.find(s => s.id === activeSignId);
+  const placement = state.canvases.find(item => item.id === state.activeCanvasId)?.placement;
+  const activePlane = getActiveCalibrationPlane(calibration, activeSign?.calibrationPlaneId);
+  const calibratedPlanes = getCalibrationPlanes(calibration);
   const activeSignCenter = activeSign ? { x: (activeSign.corners[0].x + activeSign.corners[1].x + activeSign.corners[2].x + activeSign.corners[3].x) / 4, y: (activeSign.corners[0].y + activeSign.corners[1].y + activeSign.corners[2].y + activeSign.corners[3].y) / 4 } : null;
   const activeSignBounds = activeSign ? {
       maxX: Math.max(...activeSign.corners.map(point => point.x)),
@@ -1954,7 +1977,15 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
                 pointerEvents: isSheetView ? 'none' : 'auto' // Prevent scene interaction in sheet view
             }}
         >
-            {images.background && (
+            {images.background && (placement?.lens.enabled ? (
+                <LensCorrectedBackground
+                    src={images.background}
+                    size={images.backgroundSize}
+                    lens={placement.lens}
+                    className="absolute inset-0 h-full w-full pointer-events-none select-none"
+                    style={{ opacity: state.isNightMode ? 0.82 : 1, filter: state.isNightMode ? 'brightness(0.32) contrast(1.32) saturate(0.72)' : 'none' }}
+                />
+            ) : (
                 <img 
                     src={images.background}
                     alt="Background"
@@ -1966,7 +1997,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
                         transition: 'filter 320ms ease, opacity 320ms ease',
                     }}
                 />
-            )}
+            ))}
             {isCropping && cropRect && (
                 <svg
                     aria-hidden="true"
@@ -2005,6 +2036,17 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
             {!isCropping && (
             <>
                 <svg className="absolute inset-0 z-20 w-full h-full overflow-visible pointer-events-none" viewBox={`0 0 ${images.backgroundSize.width} ${images.backgroundSize.height}`}>
+                    {placement?.showVanishingGuides && calibratedPlanes.map(plane => {
+                        const vanishing = getVanishingPoints(plane);
+                        const selected = plane.id === activePlane?.id;
+                        return <g key={`plane-guide-${plane.id}`} opacity={selected ? 0.9 : 0.4}>
+                            <polygon points={plane.corners.map(point => `${point.x},${point.y}`).join(' ')} fill="none" stroke={selected ? '#22d3ee' : '#64748b'} strokeWidth={2 * handleScale} strokeDasharray={`${8 * handleScale} ${5 * handleScale}`} />
+                            {vanishing.horizontal && <><line x1={plane.corners[0].x} y1={plane.corners[0].y} x2={vanishing.horizontal.x} y2={vanishing.horizontal.y} stroke="#38bdf8" strokeWidth={1.5 * handleScale}/><line x1={plane.corners[3].x} y1={plane.corners[3].y} x2={vanishing.horizontal.x} y2={vanishing.horizontal.y} stroke="#38bdf8" strokeWidth={1.5 * handleScale}/><circle cx={vanishing.horizontal.x} cy={vanishing.horizontal.y} r={6 * handleScale} fill="#38bdf8" /></>}
+                            {vanishing.vertical && <><line x1={plane.corners[0].x} y1={plane.corners[0].y} x2={vanishing.vertical.x} y2={vanishing.vertical.y} stroke="#a78bfa" strokeWidth={1.5 * handleScale}/><line x1={plane.corners[1].x} y1={plane.corners[1].y} x2={vanishing.vertical.x} y2={vanishing.vertical.y} stroke="#a78bfa" strokeWidth={1.5 * handleScale}/><circle cx={vanishing.vertical.x} cy={vanishing.vertical.y} r={6 * handleScale} fill="#a78bfa" /></>}
+                        </g>;
+                    })}
+                    {snapGuides?.vertical !== undefined && <line x1={snapGuides.vertical} y1={0} x2={snapGuides.vertical} y2={images.backgroundSize.height} stroke="#22d3ee" strokeWidth={2 * handleScale} strokeDasharray={`${6 * handleScale} ${4 * handleScale}`} />}
+                    {snapGuides?.horizontal !== undefined && <line x1={0} y1={snapGuides.horizontal} x2={images.backgroundSize.width} y2={snapGuides.horizontal} stroke="#22d3ee" strokeWidth={2 * handleScale} strokeDasharray={`${6 * handleScale} ${4 * handleScale}`} />}
                     {calibrationDraft && calibrationDraft.points.length > 0 && (() => {
                         const points = calibrationDraft.points;
                         const closed = calibrationDraft.method === 'plane' && points.length === 4;
@@ -2214,12 +2256,12 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
                                 <div className={`w-1.5 h-1.5 rounded-full ${activeHandle === 4 ? 'bg-blue-400' : 'bg-white'}`} />
                             </div>
                         </div>
-                        <div data-canvas-object data-testid="sign-scale-x-handle" role="button" aria-label="Scale sign horizontally" title="Drag to change the sign width" className="absolute flex items-center justify-center cursor-ew-resize pointer-events-auto" style={{ left: activeSignBounds.maxX + SCALE_HANDLE_GAP * handleScale, top: activeSignCenter.y, width: SIGN_CORNER_HIT_SIZE, height: SIGN_CORNER_HIT_SIZE, transform: `translate(-50%, -50%) scale(${handleScale})`, zIndex: activeHandle === 5 ? 50 : 40, touchAction: 'none' }}
+                        <div data-canvas-object data-testid="sign-scale-x-handle" role="button" aria-label="Scale sign horizontally" title={activeSign.aspectLocked !== false ? 'Drag horizontally to scale width and height proportionally' : 'Drag to change the sign width'} className="absolute flex items-center justify-center cursor-ew-resize pointer-events-auto" style={{ left: activeSignBounds.maxX + SCALE_HANDLE_GAP * handleScale, top: activeSignCenter.y, width: SIGN_CORNER_HIT_SIZE, height: SIGN_CORNER_HIT_SIZE, transform: `translate(-50%, -50%) scale(${handleScale})`, zIndex: activeHandle === 5 ? 50 : 40, touchAction: 'none' }}
                              onPointerDown={handlePointerDown(5)} onPointerMove={handlePointerMove} onPointerUp={handlePointerUp} 
                              onPointerEnter={() => setHoveredHandle(5)} onPointerLeave={() => setHoveredHandle(null)}>
                             <div aria-hidden="true" className={`rounded-sm border-2 transition-transform duration-100 ${activeHandle === 5 ? 'bg-blue-100 border-blue-600 shadow-[0_0_15px_rgba(59,130,246,1)] scale-125' : 'bg-white border-blue-500 shadow-md'}`} style={{ width: SIGN_CORNER_VISUAL_SIZE, height: SIGN_CORNER_VISUAL_SIZE }} />
                         </div>
-                        <div data-canvas-object data-testid="sign-scale-y-handle" role="button" aria-label="Scale sign vertically" title="Drag to change the sign height" className="absolute flex items-center justify-center cursor-ns-resize pointer-events-auto" style={{ left: activeSignCenter.x, top: activeSignBounds.maxY + SCALE_HANDLE_GAP * handleScale, width: SIGN_CORNER_HIT_SIZE, height: SIGN_CORNER_HIT_SIZE, transform: `translate(-50%, -50%) scale(${handleScale})`, zIndex: activeHandle === 6 ? 50 : 40, touchAction: 'none' }}
+                        <div data-canvas-object data-testid="sign-scale-y-handle" role="button" aria-label="Scale sign vertically" title={activeSign.aspectLocked !== false ? 'Drag vertically to scale width and height proportionally' : 'Drag to change the sign height'} className="absolute flex items-center justify-center cursor-ns-resize pointer-events-auto" style={{ left: activeSignCenter.x, top: activeSignBounds.maxY + SCALE_HANDLE_GAP * handleScale, width: SIGN_CORNER_HIT_SIZE, height: SIGN_CORNER_HIT_SIZE, transform: `translate(-50%, -50%) scale(${handleScale})`, zIndex: activeHandle === 6 ? 50 : 40, touchAction: 'none' }}
                              onPointerDown={handlePointerDown(6)} onPointerMove={handlePointerMove} onPointerUp={handlePointerUp}
                              onPointerEnter={() => setHoveredHandle(6)} onPointerLeave={() => setHoveredHandle(null)}>
                             <div aria-hidden="true" className={`rounded-sm border-2 transition-transform duration-100 ${activeHandle === 6 ? 'bg-blue-100 border-blue-600 shadow-[0_0_15px_rgba(59,130,246,1)] scale-125' : 'bg-white border-blue-500 shadow-md'}`} style={{ width: SIGN_CORNER_VISUAL_SIZE, height: SIGN_CORNER_VISUAL_SIZE }} />

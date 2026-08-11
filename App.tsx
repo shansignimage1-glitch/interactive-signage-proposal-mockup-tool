@@ -716,19 +716,22 @@ const App: React.FC = () => {
   };
 
   // --- Guided calibration workflow ---
-  const openCalibration = () => {
+  const openCalibration = (options?: { addPlane?: boolean }) => {
       const existing = activeCanvas?.calibration ?? null;
-      const isPlane = !!existing?.plane;
+      const isPlane = !!existing?.plane && !options?.addPlane;
       setCalibrationDraft({
-          stage: 'choose',
-          method: isPlane ? 'plane' : existing ? 'line' : null,
+          stage: options?.addPlane ? 'place' : 'choose',
+          method: options?.addPlane ? 'plane' : isPlane ? 'plane' : existing ? 'line' : null,
           points: existing?.plane ? [...existing.plane.corners] : existing ? [existing.start, existing.end] : [],
           presetId: isPlane ? 'custom_plane' : existing ? 'custom' : 'door_height',
           value: existing && !isPlane ? String(existing.realValue) : '',
-          width: existing?.plane ? String(existing.plane.widthMm / 1000) : '0.813',
-          height: existing?.plane ? String(existing.plane.heightMm / 1000) : '2.032',
+          width: options?.addPlane ? '0.813' : existing?.plane ? String(existing.plane.widthMm / 1000) : '0.813',
+          height: options?.addPlane ? '2.032' : existing?.plane ? String(existing.plane.heightMm / 1000) : '2.032',
           unit: isPlane ? 'm' : existing?.unit ?? 'm',
           reapply: false,
+          planeName: options?.addPlane ? `Wall ${(existing?.planes?.length ?? (existing?.plane ? 1 : 0)) + 1}` : (existing?.planes?.find(plane => plane.id === existing.activePlaneId)?.name ?? 'Wall 1'),
+          addPlane: !!options?.addPlane,
+          editingPlaneId: options?.addPlane ? null : existing?.activePlaneId ?? (existing?.plane ? 'legacy-plane' : null),
       });
   };
 
@@ -739,6 +742,32 @@ const App: React.FC = () => {
 
   const applyCalibration = (calibration: Calibration, reapply: boolean) => {
       if (!activeCanvas) return;
+      if (calibrationDraft?.addPlane && calibration.plane) {
+          const current = activeCanvas.calibration;
+          const currentPlanes = current?.planes?.length
+              ? current.planes
+              : current?.plane ? [{ id: 'legacy-plane', name: 'Wall 1', ...current.plane }] : [];
+          const added = calibration.planes?.[0] ?? { id: `plane-${Date.now()}`, name: calibrationDraft.planeName || `Wall ${currentPlanes.length + 1}`, ...calibration.plane };
+          calibration = {
+              ...calibration,
+              planes: [...currentPlanes, added],
+              activePlaneId: added.id,
+              plane: { corners: added.corners, widthMm: added.widthMm, heightMm: added.heightMm },
+          };
+      } else if (calibration.plane && calibration.planes?.length) {
+          const incoming = calibration.planes[0];
+          const current = activeCanvas.calibration;
+          const currentPlanes = current?.planes?.length
+              ? current.planes
+              : current?.plane ? [{ id: 'legacy-plane', name: 'Wall 1', ...current.plane }] : [];
+          if (calibrationDraft?.editingPlaneId && currentPlanes.length) {
+              const edited = { ...incoming, id: calibrationDraft.editingPlaneId, name: calibrationDraft.planeName || incoming.name };
+              const planes = currentPlanes.map(plane => plane.id === edited.id ? edited : plane);
+              calibration = { ...calibration, planes, activePlaneId: edited.id, plane: { corners: edited.corners, widthMm: edited.widthMm, heightMm: edited.heightMm } };
+          } else {
+              calibration.activePlaneId = incoming.id;
+          }
+      }
       let newDims = activeCanvas.dimensions;
       if (reapply) {
           newDims = activeCanvas.dimensions.map(d => ({
@@ -831,7 +860,8 @@ const App: React.FC = () => {
              updateActiveCanvas({
                  backgroundImage: result,
                  backgroundSize: { width: img.width, height: img.height },
-                 calibration: null // new photo, old scale no longer applies
+                 calibration: null, // new photo, old scale no longer applies
+                 placement: activeCanvas ? { ...(activeCanvas.placement ?? { snapEnabled: true, showVanishingGuides: false, lens: { enabled: false, k1: 0, k2: 0 }, camera: { enabled: false, fieldOfViewDeg: 60, estimated: true } }), lens: { enabled: false, k1: 0, k2: 0 }, camera: { enabled: false, fieldOfViewDeg: 60, estimated: true } } : undefined,
              });
           }
           img.src = result;
@@ -867,14 +897,19 @@ const App: React.FC = () => {
         ...activeCanvas.calibration,
         start: { x: activeCanvas.calibration.start.x - cropOffset.x, y: activeCanvas.calibration.start.y - cropOffset.y },
         end: { x: activeCanvas.calibration.end.x - cropOffset.x, y: activeCanvas.calibration.end.y - cropOffset.y },
-        plane: activeCanvas.calibration.plane ? { ...activeCanvas.calibration.plane, corners: activeCanvas.calibration.plane.corners.map(p => ({ x: p.x - cropOffset.x, y: p.y - cropOffset.y })) as [Point, Point, Point, Point] } : undefined
+        plane: activeCanvas.calibration.plane ? { ...activeCanvas.calibration.plane, corners: activeCanvas.calibration.plane.corners.map(p => ({ x: p.x - cropOffset.x, y: p.y - cropOffset.y })) as [Point, Point, Point, Point] } : undefined,
+        planes: activeCanvas.calibration.planes?.map(plane => ({ ...plane, corners: plane.corners.map(p => ({ x: p.x - cropOffset.x, y: p.y - cropOffset.y })) as [Point, Point, Point, Point] })),
     } : activeCanvas.calibration;
     updateActiveCanvasWithHistory({
         backgroundImage: newImageUrl,
         backgroundSize: newSize,
         signs: newSigns,
         dimensions: newDims,
-        calibration: newCalibration
+        calibration: newCalibration,
+        placement: activeCanvas.placement?.camera.principalPoint ? {
+            ...activeCanvas.placement,
+            camera: { ...activeCanvas.placement.camera, principalPoint: { x: activeCanvas.placement.camera.principalPoint.x - cropOffset.x, y: activeCanvas.placement.camera.principalPoint.y - cropOffset.y } }
+        } : activeCanvas.placement
     });
     setIsCropping(false);
   };
@@ -887,7 +922,8 @@ const App: React.FC = () => {
           updateActiveCanvas({
               backgroundImage: newImageUrl,
               backgroundSize: { width: img.width, height: img.height },
-              calibration: null
+              calibration: null,
+              placement: activeCanvas ? { ...(activeCanvas.placement ?? { snapEnabled: true, showVanishingGuides: false, lens: { enabled: false, k1: 0, k2: 0 }, camera: { enabled: false, fieldOfViewDeg: 60, estimated: true } }), lens: { enabled: false, k1: 0, k2: 0 }, camera: { enabled: false, fieldOfViewDeg: 60, estimated: true } } : undefined,
           });
           setShowCleanupTool(false);
       };

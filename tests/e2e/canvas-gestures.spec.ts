@@ -381,14 +381,17 @@ test('desktop Select & adjust handles show a precision magnifier', async ({ page
   const horizontalScaleHandle = page.getByTestId('sign-scale-x-handle');
   const horizontalScaleBounds = await horizontalScaleHandle.boundingBox();
   expect(horizontalScaleBounds).not.toBeNull();
+  const verticalScaleHandle = page.getByTestId('sign-scale-y-handle');
+  const verticalBeforeHorizontalScale = await verticalScaleHandle.boundingBox();
+  expect(verticalBeforeHorizontalScale).not.toBeNull();
   await page.mouse.move(horizontalScaleBounds!.x + horizontalScaleBounds!.width / 2, horizontalScaleBounds!.y + horizontalScaleBounds!.height / 2);
   await page.mouse.down();
   await expect(loupe).toBeHidden();
   await page.mouse.move(horizontalScaleBounds!.x + horizontalScaleBounds!.width / 2 + 30, horizontalScaleBounds!.y + horizontalScaleBounds!.height / 2);
   await page.mouse.up();
   await expect.poll(async () => (await horizontalScaleHandle.boundingBox())!.x).toBeGreaterThan(horizontalScaleBounds!.x + 10);
+  await expect.poll(async () => (await verticalScaleHandle.boundingBox())!.y).toBeGreaterThan(verticalBeforeHorizontalScale!.y + 1);
 
-  const verticalScaleHandle = page.getByTestId('sign-scale-y-handle');
   const verticalScaleBounds = await verticalScaleHandle.boundingBox();
   expect(verticalScaleBounds).not.toBeNull();
   await page.mouse.move(verticalScaleBounds!.x + verticalScaleBounds!.width / 2, verticalScaleBounds!.y + verticalScaleBounds!.height / 2);
@@ -399,6 +402,17 @@ test('desktop Select & adjust handles show a precision magnifier', async ({ page
   await expect.poll(async () => (await verticalScaleHandle.boundingBox())!.y).toBeGreaterThan(verticalScaleBounds!.y + 10);
 
   await calibrateCanvas(page);
+  await page.getByRole('button', { name: 'Select & adjust' }).click();
+  await page.locator('[data-testid^="sign-hit-area-"]').first().click({ force: true });
+  const widthInput = page.getByRole('spinbutton', { name: 'Sign width in m' });
+  const heightInput = page.getByRole('spinbutton', { name: 'Sign height in m' });
+  await expect(widthInput).toBeVisible();
+  const heightBeforeExactSize = await heightInput.inputValue();
+  await widthInput.fill('2');
+  await expect(heightInput).not.toHaveValue(heightBeforeExactSize);
+  await page.getByRole('button', { name: 'Place at exact size' }).click();
+  await expect(widthInput).toHaveValue('2');
+
   const surface = page.locator('#export-target');
   const surfaceBounds = await surface.boundingBox();
   expect(surfaceBounds).not.toBeNull();
