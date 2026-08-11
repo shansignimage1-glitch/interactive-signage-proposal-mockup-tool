@@ -378,13 +378,25 @@ test('desktop Select & adjust handles show a precision magnifier', async ({ page
   await expect(loupe).toBeHidden();
   await page.mouse.up();
 
-  const scaleHandle = page.getByTestId('sign-scale-handle');
-  const scaleBounds = await scaleHandle.boundingBox();
-  expect(scaleBounds).not.toBeNull();
-  await page.mouse.move(scaleBounds!.x + scaleBounds!.width / 2, scaleBounds!.y + scaleBounds!.height / 2);
+  const horizontalScaleHandle = page.getByTestId('sign-scale-x-handle');
+  const horizontalScaleBounds = await horizontalScaleHandle.boundingBox();
+  expect(horizontalScaleBounds).not.toBeNull();
+  await page.mouse.move(horizontalScaleBounds!.x + horizontalScaleBounds!.width / 2, horizontalScaleBounds!.y + horizontalScaleBounds!.height / 2);
   await page.mouse.down();
   await expect(loupe).toBeHidden();
+  await page.mouse.move(horizontalScaleBounds!.x + horizontalScaleBounds!.width / 2 + 30, horizontalScaleBounds!.y + horizontalScaleBounds!.height / 2);
   await page.mouse.up();
+  await expect.poll(async () => (await horizontalScaleHandle.boundingBox())!.x).toBeGreaterThan(horizontalScaleBounds!.x + 10);
+
+  const verticalScaleHandle = page.getByTestId('sign-scale-y-handle');
+  const verticalScaleBounds = await verticalScaleHandle.boundingBox();
+  expect(verticalScaleBounds).not.toBeNull();
+  await page.mouse.move(verticalScaleBounds!.x + verticalScaleBounds!.width / 2, verticalScaleBounds!.y + verticalScaleBounds!.height / 2);
+  await page.mouse.down();
+  await expect(loupe).toBeHidden();
+  await page.mouse.move(verticalScaleBounds!.x + verticalScaleBounds!.width / 2, verticalScaleBounds!.y + verticalScaleBounds!.height / 2 + 30);
+  await page.mouse.up();
+  await expect.poll(async () => (await verticalScaleHandle.boundingBox())!.y).toBeGreaterThan(verticalScaleBounds!.y + 10);
 
   await calibrateCanvas(page);
   const surface = page.locator('#export-target');

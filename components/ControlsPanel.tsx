@@ -436,6 +436,9 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
               activeSignId: id
           });
       }
+      // A library sign must be immediately editable even when the user opened
+      // the library while Pan or a measurement tool was active.
+      activateTool('select');
       setIsLibraryOpen(false);
   };
 

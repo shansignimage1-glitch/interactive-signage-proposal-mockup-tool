@@ -43,7 +43,7 @@ interface MockupCanvasProps {
   onCancelCrop: () => void;
 }
 
-const SCALE_HANDLE_OFFSET = 72;
+const SCALE_HANDLE_GAP = 30;
 const SIGN_CORNER_HIT_SIZE = 52;
 const DIMENSION_HANDLE_HIT_RADIUS = 32;
 const SIGN_CORNER_VISUAL_SIZE = 18;
@@ -1332,12 +1332,25 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
                 updateSignById(dragSignId, { corners: movedCorners });
             } 
             else if (interactionHandle === 5) {
-                const center = { x: (startCorners[0].x + startCorners[2].x) / 2, y: (startCorners[0].y + startCorners[2].y) / 2 }; 
-                const distStart = distance(center, startMousePos.current); 
-                const distCurr = distance(center, pos); 
-                if (distStart < 1) return; 
-                const scale = distCurr / distStart; 
-                const newCorners = startCorners.map(p => ({ x: center.x + (p.x - center.x) * scale, y: center.y + (p.y - center.y) * scale })) as [Point, Point, Point, Point]; 
+                const center = {
+                    x: startCorners.reduce((sum, point) => sum + point.x, 0) / startCorners.length,
+                    y: startCorners.reduce((sum, point) => sum + point.y, 0) / startCorners.length,
+                };
+                const startDistance = startMousePos.current.x - center.x;
+                if (Math.abs(startDistance) < 1) return;
+                const scaleX = Math.max(0.05, (pos.x - center.x) / startDistance);
+                const newCorners = startCorners.map(p => ({ x: center.x + (p.x - center.x) * scaleX, y: p.y })) as [Point, Point, Point, Point];
+                updateSignById(dragSignId, { corners: newCorners });
+            }
+            else if (interactionHandle === 6) {
+                const center = {
+                    x: startCorners.reduce((sum, point) => sum + point.x, 0) / startCorners.length,
+                    y: startCorners.reduce((sum, point) => sum + point.y, 0) / startCorners.length,
+                };
+                const startDistance = startMousePos.current.y - center.y;
+                if (Math.abs(startDistance) < 1) return;
+                const scaleY = Math.max(0.05, (pos.y - center.y) / startDistance);
+                const newCorners = startCorners.map(p => ({ x: p.x, y: center.y + (p.y - center.y) * scaleY })) as [Point, Point, Point, Point];
                 updateSignById(dragSignId, { corners: newCorners });
             }
         } else if (updateDraggedDimension(interactionHandle, pos)) {
@@ -1499,6 +1512,10 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
 
   const activeSign = signs.find(s => s.id === activeSignId);
   const activeSignCenter = activeSign ? { x: (activeSign.corners[0].x + activeSign.corners[1].x + activeSign.corners[2].x + activeSign.corners[3].x) / 4, y: (activeSign.corners[0].y + activeSign.corners[1].y + activeSign.corners[2].y + activeSign.corners[3].y) / 4 } : null;
+  const activeSignBounds = activeSign ? {
+      maxX: Math.max(...activeSign.corners.map(point => point.x)),
+      maxY: Math.max(...activeSign.corners.map(point => point.y)),
+  } : null;
   const totalScale = baseScale * view.scale;
 
   // Render Title Block Layout Overlay
@@ -2155,10 +2172,11 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
                             >REF {calibration.realValue}{calibration.unit}</text>
                         </g>
                     )}
-                    {activeSign && activeSignCenter && (
+                    {activeSign && activeSignCenter && activeSignBounds && (
                         <>
                             <path d={`M ${activeSign.corners[0].x} ${activeSign.corners[0].y} L ${activeSign.corners[1].x} ${activeSign.corners[1].y} L ${activeSign.corners[2].x} ${activeSign.corners[2].y} L ${activeSign.corners[3].x} ${activeSign.corners[3].y} Z`} fill="none" stroke="#3b82f6" strokeWidth={1 * handleScale} strokeDasharray={`${4*handleScale} ${2*handleScale}`} opacity="0.6" />
-                            <line x1={activeSignCenter.x} y1={activeSignCenter.y} x2={activeSignCenter.x + SCALE_HANDLE_OFFSET * handleScale} y2={activeSignCenter.y} stroke="#3b82f6" strokeWidth={1 * handleScale} opacity="0.8" />
+                            <line x1={activeSignBounds.maxX} y1={activeSignCenter.y} x2={activeSignBounds.maxX + SCALE_HANDLE_GAP * handleScale} y2={activeSignCenter.y} stroke="#3b82f6" strokeWidth={1 * handleScale} opacity="0.8" />
+                            <line x1={activeSignCenter.x} y1={activeSignBounds.maxY} x2={activeSignCenter.x} y2={activeSignBounds.maxY + SCALE_HANDLE_GAP * handleScale} stroke="#3b82f6" strokeWidth={1 * handleScale} opacity="0.8" />
                         </>
                     )}
                 </svg>
@@ -2177,7 +2195,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
                             </div>
                         );
                     })}
-                    {activeSign && activeSignCenter && !isSheetView && toolMode === 'select' && (
+                    {activeSign && activeSignCenter && activeSignBounds && !isSheetView && toolMode === 'select' && (
                         <>
                         {activeSign.corners.map((p, i) => {
                         const isActive = activeHandle === i;
@@ -2196,10 +2214,15 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
                                 <div className={`w-1.5 h-1.5 rounded-full ${activeHandle === 4 ? 'bg-blue-400' : 'bg-white'}`} />
                             </div>
                         </div>
-                        <div data-canvas-object data-testid="sign-scale-handle" role="button" aria-label="Resize sign" title="Drag to resize the whole sign" className="absolute flex items-center justify-center cursor-ew-resize pointer-events-auto" style={{ left: activeSignCenter.x + SCALE_HANDLE_OFFSET * handleScale, top: activeSignCenter.y, width: SIGN_CORNER_HIT_SIZE, height: SIGN_CORNER_HIT_SIZE, transform: `translate(-50%, -50%) scale(${handleScale})`, zIndex: activeHandle === 5 ? 40 : 25, touchAction: 'none' }}
+                        <div data-canvas-object data-testid="sign-scale-x-handle" role="button" aria-label="Scale sign horizontally" title="Drag to change the sign width" className="absolute flex items-center justify-center cursor-ew-resize pointer-events-auto" style={{ left: activeSignBounds.maxX + SCALE_HANDLE_GAP * handleScale, top: activeSignCenter.y, width: SIGN_CORNER_HIT_SIZE, height: SIGN_CORNER_HIT_SIZE, transform: `translate(-50%, -50%) scale(${handleScale})`, zIndex: activeHandle === 5 ? 50 : 40, touchAction: 'none' }}
                              onPointerDown={handlePointerDown(5)} onPointerMove={handlePointerMove} onPointerUp={handlePointerUp} 
                              onPointerEnter={() => setHoveredHandle(5)} onPointerLeave={() => setHoveredHandle(null)}>
                             <div aria-hidden="true" className={`rounded-sm border-2 transition-transform duration-100 ${activeHandle === 5 ? 'bg-blue-100 border-blue-600 shadow-[0_0_15px_rgba(59,130,246,1)] scale-125' : 'bg-white border-blue-500 shadow-md'}`} style={{ width: SIGN_CORNER_VISUAL_SIZE, height: SIGN_CORNER_VISUAL_SIZE }} />
+                        </div>
+                        <div data-canvas-object data-testid="sign-scale-y-handle" role="button" aria-label="Scale sign vertically" title="Drag to change the sign height" className="absolute flex items-center justify-center cursor-ns-resize pointer-events-auto" style={{ left: activeSignCenter.x, top: activeSignBounds.maxY + SCALE_HANDLE_GAP * handleScale, width: SIGN_CORNER_HIT_SIZE, height: SIGN_CORNER_HIT_SIZE, transform: `translate(-50%, -50%) scale(${handleScale})`, zIndex: activeHandle === 6 ? 50 : 40, touchAction: 'none' }}
+                             onPointerDown={handlePointerDown(6)} onPointerMove={handlePointerMove} onPointerUp={handlePointerUp}
+                             onPointerEnter={() => setHoveredHandle(6)} onPointerLeave={() => setHoveredHandle(null)}>
+                            <div aria-hidden="true" className={`rounded-sm border-2 transition-transform duration-100 ${activeHandle === 6 ? 'bg-blue-100 border-blue-600 shadow-[0_0_15px_rgba(59,130,246,1)] scale-125' : 'bg-white border-blue-500 shadow-md'}`} style={{ width: SIGN_CORNER_VISUAL_SIZE, height: SIGN_CORNER_VISUAL_SIZE }} />
                         </div>
                         </>
                     )}
