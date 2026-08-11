@@ -56,6 +56,8 @@ const createDefaultSign = (id: string, cx: number, cy: number, index: number): S
   extrusionEnabled: true,
   extrusionDepth: 15,
   extrusionAngle: 45,
+  extrusionMode: 'backed',
+  backingDepth: 5,
   opacity: 0.95,
   blendMode: 'normal',
   sideColor: '#1e3a8a',
@@ -533,15 +535,40 @@ const App: React.FC = () => {
   const activeCanvas = state.canvases.find(c => c.id === state.activeCanvasId) || state.canvases[0];
 
   const addToHistory = useCallback((newState: MockupState) => {
+      const currentIndex = historyIndexRef.current;
+      const nextIndex = Math.min(currentIndex + 1, 19);
       setHistory(prev => {
-          // Use the ref so this callback never captures a stale historyIndex value
-          const newHistory = prev.slice(0, historyIndexRef.current + 1);
+          const newHistory = prev.slice(0, currentIndex + 1);
           newHistory.push(newState);
           if (newHistory.length > 20) newHistory.shift();
           return newHistory;
       });
-      setHistoryIndex(prev => Math.min(prev + 1, 19));
+      historyIndexRef.current = nextIndex;
+      setHistoryIndex(nextIndex);
   }, []); // stable — reads historyIndexRef.current at call time
+
+  const addHistoryTransaction = useCallback((before: MockupState, after: MockupState) => {
+      const currentIndex = historyIndexRef.current;
+      const nextIndex = Math.min(currentIndex + 2, 19);
+      setHistory(prev => {
+          const newHistory = prev.slice(0, currentIndex + 1);
+          newHistory.push(before, after);
+          return newHistory.length > 20 ? newHistory.slice(-20) : newHistory;
+      });
+      historyIndexRef.current = nextIndex;
+      setHistoryIndex(nextIndex);
+  }, []);
+
+  const signPlacementStartRef = useRef<MockupState | null>(null);
+  const beginSignPlacement = useCallback(() => {
+      signPlacementStartRef.current = stateRef.current;
+  }, []);
+  const finishSignPlacement = useCallback((changed: boolean) => {
+      const before = signPlacementStartRef.current;
+      signPlacementStartRef.current = null;
+      if (!changed || !before || before === stateRef.current) return;
+      addHistoryTransaction(before, stateRef.current);
+  }, [addHistoryTransaction]);
 
   const undo = useCallback(() => {
       if (historyIndex > 0) {
@@ -571,12 +598,13 @@ const App: React.FC = () => {
   }, [addToHistory]);
 
   const updateActiveCanvas = useCallback((canvasUpdates: Partial<Canvas>) => {
-      setState(prev => {
-          const newCanvases = prev.canvases.map(c => 
-              c.id === prev.activeCanvasId ? { ...c, ...canvasUpdates } : c
-          );
-          return { ...prev, canvases: newCanvases };
-      });
+      const prev = stateRef.current;
+      const newCanvases = prev.canvases.map(c =>
+          c.id === prev.activeCanvasId ? { ...c, ...canvasUpdates } : c
+      );
+      const newState = { ...prev, canvases: newCanvases };
+      stateRef.current = newState;
+      setState(newState);
   }, []);
   
   const updateActiveCanvasWithHistory = useCallback((canvasUpdates: Partial<Canvas>) => {
@@ -632,16 +660,17 @@ const App: React.FC = () => {
   }, []);
   
   const updateSignById = useCallback((id: string, updates: Partial<Sign>) => {
-      setState(prev => {
-        const canvas = prev.canvases.find(c => c.id === prev.activeCanvasId);
-        if (!canvas) return prev;
-        const newSigns = canvas.signs.map(s => s.id === id ? { ...s, ...updates } : s);
-        const newCanvas = { ...canvas, signs: newSigns };
-        return {
-            ...prev,
-            canvases: prev.canvases.map(c => c.id === prev.activeCanvasId ? newCanvas : c)
-        };
-      });
+      const prev = stateRef.current;
+      const canvas = prev.canvases.find(c => c.id === prev.activeCanvasId);
+      if (!canvas) return;
+      const newSigns = canvas.signs.map(s => s.id === id ? { ...s, ...updates } : s);
+      const newCanvas = { ...canvas, signs: newSigns };
+      const newState = {
+          ...prev,
+          canvases: prev.canvases.map(c => c.id === prev.activeCanvasId ? newCanvas : c)
+      };
+      stateRef.current = newState;
+      setState(newState);
   }, []);
 
   const updateTitleBlock = useCallback((updates: Partial<TitleBlock>) => {
@@ -802,7 +831,7 @@ const App: React.FC = () => {
       const canvas = prev.canvases.find(c => c.id === prev.activeCanvasId);
       if (!canvas || !canvas.activeSignId) return;
       const newSigns = canvas.signs.map(s =>
-          s.id === canvas.activeSignId ? { ...s, elements, elementsSourceSize: sourceSize } : s
+          s.id === canvas.activeSignId ? { ...s, elements, elementsSourceSize: sourceSize, extrusionEnabled: Boolean(elements?.length) } : s
       );
       updateActiveCanvasWithHistory({ signs: newSigns });
       setShowElementStudio(false);
@@ -1266,6 +1295,12 @@ const App: React.FC = () => {
            onCalibrationDraftPointsChange={points => setCalibrationDraft(current => current ? { ...current, points } : current)}
            showCalibrationReference={showCalibrationReference}
            updateSignById={updateSignById}
+           undo={undo}
+           redo={redo}
+           canUndo={historyIndex > 0}
+           canRedo={historyIndex < history.length - 1}
+           onSignPlacementStart={beginSignPlacement}
+           onSignPlacementEnd={finishSignPlacement}
            setActiveSign={setActiveSign}
            updateDimension={updateDimension}
            setActiveDimension={setActiveDimension}

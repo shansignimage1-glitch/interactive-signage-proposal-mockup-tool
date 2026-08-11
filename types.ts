@@ -94,6 +94,8 @@ export interface Sign {
   extrusionEnabled: boolean; // New field
   extrusionDepth: number;
   extrusionAngle: number; // in degrees
+  extrusionMode?: 'backed' | 'individual'; // Raised copy on a board, or individual letters/logo only.
+  backingDepth?: number; // Visual depth of a backing board in background-image px.
   opacity: number;
   blendMode: string;
   sideColor: string;

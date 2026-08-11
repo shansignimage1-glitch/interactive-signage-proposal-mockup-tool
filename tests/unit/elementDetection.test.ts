@@ -40,4 +40,11 @@ describe('classical element detection', () => {
     expect(holes).toHaveLength(1);
     expect(holes[0].length).toBeGreaterThanOrEqual(3);
   });
+
+  it('rejects a thin perimeter keyline without rejecting dense artwork', () => {
+    const frame = { label: 1, area: 144, minX: 2, minY: 1, maxX: 37, maxY: 18 };
+    const filledLogo = { label: 2, area: 420, minX: 4, minY: 2, maxX: 34, maxY: 17 };
+    expect(elementDetectionTestables.isLikelyPerimeterFrame(frame, 40, 20)).toBe(true);
+    expect(elementDetectionTestables.isLikelyPerimeterFrame(filledLogo, 40, 20)).toBe(false);
+  });
 });
