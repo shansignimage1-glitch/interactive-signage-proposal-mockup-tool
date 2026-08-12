@@ -40,6 +40,14 @@ test('layout remains usable at the configured device viewport', async ({ page },
     await expect(page.getByRole('button', { name: 'Download PDF/PNG to device' })).toBeVisible();
     await expect(page.getByText('Dimensions', { exact: true })).toBeVisible();
     await expect(page.getByTestId('controls-panel')).toHaveAttribute('data-mobile-expanded', 'true');
+    if (isTablet) {
+      for (const name of ['Sign Out', 'Zoom in', 'Zoom out', 'Fit canvas to screen', 'Lock canvas view', 'Open 3D proposal viewer']) {
+        const bounds = await page.getByRole('button', { name }).boundingBox();
+        expect(bounds, `${name} should have a tablet-sized touch target`).not.toBeNull();
+        expect(bounds!.width, `${name} target width`).toBeGreaterThanOrEqual(44);
+        expect(bounds!.height, `${name} target height`).toBeGreaterThanOrEqual(44);
+      }
+    }
     return;
   }
   expect(viewport?.width).toBeGreaterThan(700);
