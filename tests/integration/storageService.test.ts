@@ -15,7 +15,7 @@ const mocks = vi.hoisted(() => {
   };
   return {
     transactionSet, getDownloadURL, uploadBytes, listAll, deleteObject, uploadImage, ensureReady, connector,
-    remoteExists: false, remoteRevision: 0, remoteData: {} as Record<string, unknown>,
+    remoteExists: false, remoteRevision: 0,
   };
 });
 
@@ -33,7 +33,7 @@ vi.mock('firebase/firestore', () => ({
   runTransaction: vi.fn(async (_db, callback) => callback({
     get: vi.fn(async () => ({
       exists: () => mocks.remoteExists,
-      data: () => ({ ...mocks.remoteData, cloudRevision: mocks.remoteRevision }),
+      data: () => ({ cloudRevision: mocks.remoteRevision }),
     })),
     set: mocks.transactionSet,
   })),
@@ -69,7 +69,6 @@ describe('StorageService save/load', () => {
     mocks.ensureReady.mockResolvedValue(true);
     mocks.remoteExists = false;
     mocks.remoteRevision = 0;
-    mocks.remoteData = {};
     Object.defineProperty(navigator, 'onLine', { configurable: true, value: true });
   });
 
@@ -219,21 +218,15 @@ describe('StorageService save/load', () => {
     await StorageService.deleteProjectLocal(project.projectId);
   });
 
-  it('cleans deleted cloud photo trees only after Firestore accepts the new revision', async () => {
+  it('never deletes shared cloud photo paths while saving a newer project revision', async () => {
     const project = makeProject({ projectId: `capture-delete-cloud-${Date.now()}` });
     mocks.remoteExists = true;
-    mocks.remoteData = {
-      siteCaptures: [{ id: 'removed-front', supportingPhotos: [{ id: 'removed-detail' }] }],
-    };
 
     await expect(StorageService.saveProject('user-1', project)).resolves.toBe('cloud');
 
-    const cleanedPaths = mocks.listAll.mock.calls.map(([ref]) => ref.path);
-    expect(cleanedPaths).toEqual(expect.arrayContaining([
-      `users/user-1/captures/${project.projectId}/removed-front`,
-      `users/user-1/captures/${project.projectId}/removed-detail`,
-    ]));
-    expect(mocks.transactionSet.mock.invocationCallOrder[0]).toBeLessThan(mocks.listAll.mock.invocationCallOrder[0]);
+    expect(mocks.transactionSet).toHaveBeenCalledOnce();
+    expect(mocks.listAll).not.toHaveBeenCalled();
+    expect(mocks.deleteObject).not.toHaveBeenCalled();
     await StorageService.deleteProjectLocal(project.projectId);
   });
 });

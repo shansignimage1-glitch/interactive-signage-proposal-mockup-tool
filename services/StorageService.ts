@@ -511,27 +511,23 @@ export const StorageService = {
           const projectRef = doc(db, FIRESTORE_COLLECTION, `${userId}_${state.projectId}`);
           const key = revisionKey(userId, state.projectId);
           const baseRevision = knownCloudRevisions.get(key) ?? state.cloudRevision ?? 0;
-          const transactionResult = await runTransaction(db, async transaction => {
+          const nextRevision = await runTransaction(db, async transaction => {
               const remote = await transaction.get(projectRef);
-              const remoteState = remote.exists() ? remote.data() : null;
-              const remoteRevision = remoteState?.cloudRevision ?? 0;
+              const remoteRevision = remote.exists() ? (remote.data().cloudRevision ?? 0) : 0;
               if (!force && remote.exists() && remoteRevision > baseRevision) return null;
               const revision = remoteRevision + 1;
-              const retainedCaptureIds = new Set(collectSiteCaptureAssetIds(cloudState));
-              const removedCaptureIds = collectSiteCaptureAssetIds(remoteState).filter(id => !retainedCaptureIds.has(id));
               transaction.set(projectRef, { ...cloudState, userId, updatedAt: Date.now(), cloudRevision: revision });
-              return { revision, removedCaptureIds };
+              return revision;
           });
-          if (transactionResult === null) return 'conflict';
-          knownCloudRevisions.set(key, transactionResult.revision);
-          await StorageService.saveProjectLocal({ ...state, cloudRevision: transactionResult.revision });
-          // Firebase objects are removed only after Firestore no longer points
-          // at them. A failed/conflicted save therefore cannot strand another
-          // device with broken elevation-photo URLs.
-          await Promise.all(transactionResult.removedCaptureIds.map(captureId =>
-              deleteStorageTree(storageRef(storage, `users/${userId}/captures/${state.projectId}/${captureId}`)).catch(error => {
-                  reportWarning('capture-delete', 'Cloud capture cleanup failed', { projectId: state.projectId, captureId, error: String(error) });
-              })));
+          if (nextRevision === null) return 'conflict';
+          knownCloudRevisions.set(key, nextRevision);
+          await StorageService.saveProjectLocal({ ...state, cloudRevision: nextRevision });
+
+          // Do not garbage-collect individual cloud capture trees here. A
+          // concurrent device can legitimately restore an older elevation in
+          // a newer forced revision after this save commits. Deleting the
+          // shared path would then break that newer revision. Project/account
+          // deletion remains the safe, lossless cloud cleanup boundary.
 
           return 'cloud';
       } catch (e) {
