@@ -478,6 +478,12 @@ export const StorageService = {
               originalRef: await uploadSiteCaptureAsset(userId, state.projectId, capture.id, 'original', capture.originalRef),
               workingRef: await uploadSiteCaptureAsset(userId, state.projectId, capture.id, 'working', capture.workingRef),
               thumbnailRef: await uploadSiteCaptureAsset(userId, state.projectId, capture.id, 'thumbnail', capture.thumbnailRef),
+              supportingPhotos: await Promise.all((capture.supportingPhotos ?? []).map(async photo => ({
+                  ...photo,
+                  originalRef: await uploadSiteCaptureAsset(userId, state.projectId, photo.id, 'original', photo.originalRef),
+                  workingRef: await uploadSiteCaptureAsset(userId, state.projectId, photo.id, 'working', photo.workingRef),
+                  thumbnailRef: await uploadSiteCaptureAsset(userId, state.projectId, photo.id, 'thumbnail', photo.thumbnailRef),
+              }))),
           })));
 
           const cloudState = {
