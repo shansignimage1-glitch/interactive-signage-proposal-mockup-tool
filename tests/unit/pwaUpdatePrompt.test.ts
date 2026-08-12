@@ -81,4 +81,22 @@ describe('PwaUpdatePrompt', () => {
     expect(pwaMocks.setNeedRefresh).toHaveBeenCalledWith(false);
     expect(pwaMocks.updateServiceWorker).not.toHaveBeenCalled();
   });
+
+  it('does not block editor controls behind the offline-ready notice', async () => {
+    const setOfflineReady = vi.fn();
+    pwaMocks.useRegisterSW.mockReturnValue({
+      needRefresh: [false, pwaMocks.setNeedRefresh],
+      offlineReady: [true, setOfflineReady],
+      updateServiceWorker: pwaMocks.updateServiceWorker,
+    });
+
+    await act(async () => root.render(React.createElement(PwaUpdatePrompt)));
+
+    const notice = document.querySelector('aside');
+    expect(notice?.className).toContain('pointer-events-none');
+    expect(findButton('Dismiss').className).toContain('pointer-events-auto');
+
+    await act(async () => findButton('Dismiss').click());
+    expect(setOfflineReady).toHaveBeenCalledWith(false);
+  });
 });
