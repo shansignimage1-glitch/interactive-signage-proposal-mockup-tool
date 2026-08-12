@@ -22,8 +22,10 @@ test('layout remains usable at the configured device viewport', async ({ page },
   await page.goto('/');
   await page.getByRole('button', { name: 'Continue as Guest' }).click();
   const viewport = page.viewportSize();
-  if (testInfo.project.name === 'iphone' || testInfo.project.name === 'ipad') {
-    if (testInfo.project.name === 'iphone') {
+  const isPhone = testInfo.project.name.startsWith('iphone');
+  const isTablet = testInfo.project.name.startsWith('ipad');
+  if (isPhone || isTablet) {
+    if (isPhone) {
       expect(viewport?.width).toBe(390);
       expect(viewport?.height).toBe(664);
     } else {
@@ -43,4 +45,27 @@ test('layout remains usable at the configured device viewport', async ({ page },
   expect(viewport?.width).toBeGreaterThan(700);
   await expect(page.getByRole('button', { name: 'Download PDF/PNG to device' })).toBeVisible();
   await expect(page.getByText('Dimensions', { exact: true })).toBeVisible();
+});
+
+test('desktop editor controls remain clear of the legal footer and show keyboard focus', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-chromium', 'Desktop layout and keyboard-focus coverage.');
+
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Continue as Guest' }).click();
+
+  const viewName = page.getByPlaceholder('View Name');
+  await viewName.focus();
+  const focusStyle = await viewName.evaluate(element => ({
+    outline: getComputedStyle(element).outlineStyle,
+    shadow: getComputedStyle(element).boxShadow,
+  }));
+  expect(focusStyle.outline !== 'none' || focusStyle.shadow !== 'none').toBeTruthy();
+
+  const download = page.getByRole('button', { name: 'Download PDF/PNG to device' });
+  const privacy = page.getByRole('link', { name: 'Privacy' });
+  const downloadBox = await download.boundingBox();
+  const privacyBox = await privacy.boundingBox();
+  expect(downloadBox).not.toBeNull();
+  expect(privacyBox).not.toBeNull();
+  expect(downloadBox!.y + downloadBox!.height).toBeLessThanOrEqual(privacyBox!.y);
 });
