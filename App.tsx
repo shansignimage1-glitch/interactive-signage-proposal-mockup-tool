@@ -1,7 +1,7 @@
 
 import React, { useState, useCallback, useRef, useEffect, Suspense } from 'react';
 import { auth, googleProvider } from './firebase';
-import { getIdTokenResult, getRedirectResult, onAuthStateChanged, signInWithPopup, signInWithRedirect, signOut } from 'firebase/auth';
+import { getIdTokenResult, getRedirectResult, onAuthStateChanged, signInWithPopup, signOut } from 'firebase/auth';
 
 import ControlsPanel from './components/ControlsPanel';
 import MockupCanvas from './components/MockupCanvas';
@@ -17,6 +17,7 @@ const MobileSiteCapture = React.lazy(() => import('./components/MobileSiteCaptur
 import { MockupState, AppImages, Point, Sign, Dimension, TitleBlock, TitleBlockField, Canvas, Calibration, SignElement, Size, ConnectorStatus, CloudProvider, UserProfile, SiteCapturePhoto } from './types';
 import { getActiveConnector, getPreferredProvider, setConnectorUid, connectors, getConnectorForRef } from './services/driveConnectors';
 import { distance } from './utils/math';
+import { isMissingRedirectStateError } from './utils/authErrors';
 import { measureLine, measureBox, getMmPerPx } from './utils/measure';
 import { normalizeProjectState } from './utils/projectMigration';
 import CalibrationWizard, { CalibrationDraft } from './components/CalibrationWizard';
@@ -268,18 +269,15 @@ const App: React.FC = () => {
       setIsAuthLoading(false);
   }, [startSession]);
 
-  const prefersRedirectSignIn = () => {
-    const ua = navigator.userAgent || '';
-    const iOS = /iPad|iPhone|iPod/.test(ua) ||
-      (navigator.maxTouchPoints > 1 && /Macintosh/.test(ua));
-    const safari = /Safari/.test(ua) && !/Chrome|CriOS|FxiOS|Edg/.test(ua);
-    return iOS || safari;
-  };
-
-  // Complete the same-origin redirect started on Safari/iPad. In production,
-  // Vercel transparently proxies the Firebase helper under /__/auth/*.
+  // Complete redirects created by older app versions. Missing redirect state is
+  // recoverable: Safari may partition or clear the temporary session storage.
   useEffect(() => {
     getRedirectResult(auth).catch((err: any) => {
+      if (isMissingRedirectStateError(err)) {
+        reportWarning('auth-redirect', 'Discarded stale redirect result because browser state was unavailable');
+        setIsAuthLoading(false);
+        return;
+      }
       setAuthError(err?.message ?? 'Sign-in failed after returning from Google.');
       setIsAuthLoading(false);
     });
@@ -429,15 +427,6 @@ const App: React.FC = () => {
 
   const handleLogin = async () => {
     setAuthError(null);
-    if (prefersRedirectSignIn()) {
-      try {
-        await signInWithRedirect(auth, googleProvider);
-      } catch (err: any) {
-        setAuthError(err?.message ?? 'Sign-in failed. Please try again.');
-      }
-      return;
-    }
-
     try {
       await signInWithPopup(auth, googleProvider);
       // onAuthStateChanged above handles the rest
@@ -445,11 +434,7 @@ const App: React.FC = () => {
       const code = err?.code ?? '';
       if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') return;
       if (code === 'auth/popup-blocked' || code === 'auth/operation-not-supported-in-this-environment') {
-        try {
-          await signInWithRedirect(auth, googleProvider);
-        } catch (redirectError: any) {
-          setAuthError(redirectError?.message ?? 'Sign-in failed. Please try again.');
-        }
+        setAuthError('Google sign-in was blocked. Allow pop-ups for this site, then tap Sign in with Google again.');
       } else {
         setAuthError(err?.message ?? 'Sign-in failed. Please try again.');
       }
