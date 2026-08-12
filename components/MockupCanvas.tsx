@@ -1761,7 +1761,6 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
       }
       context.setTransform(1, 0, 0, 1, 0, 0);
       context.clearRect(0, 0, target.width, target.height);
-      context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
       context.imageSmoothingEnabled = true;
       context.imageSmoothingQuality = 'high';
 
@@ -1776,6 +1775,17 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
       const clippedHeight = clippedBottom - clippedTop;
       if (clippedWidth <= 0 || clippedHeight <= 0) return;
 
+      // The loupe is circular, but its backing canvas is rectangular. Clip the
+      // rendered sign layer as well so pixels outside the visible lens cannot
+      // leak into the transparent corner samples or create a square halo.
+      context.save();
+      context.beginPath();
+      // Leave a small transparent margin around the lens. The outer HTML
+      // element supplies the visible white/cyan rim, while the canvas contains
+      // only the magnified sign pixels.
+      context.arc(loupeCenter * pixelRatio, loupeCenter * pixelRatio, (loupeCenter - 6) * pixelRatio, 0, Math.PI * 2);
+      context.clip();
+
       const backingScaleX = source.width / Math.max(1, images.backgroundSize.width);
       const backingScaleY = source.height / Math.max(1, images.backgroundSize.height);
 
@@ -1785,11 +1795,12 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
         clippedTop * backingScaleY,
         clippedWidth * backingScaleX,
         clippedHeight * backingScaleY,
-        (clippedLeft - sourceLeft) * loupeScale,
-        (clippedTop - sourceTop) * loupeScale,
-        clippedWidth * loupeScale,
-        clippedHeight * loupeScale,
+        (clippedLeft - sourceLeft) * loupeScale * pixelRatio,
+        (clippedTop - sourceTop) * loupeScale * pixelRatio,
+        clippedWidth * loupeScale * pixelRatio,
+        clippedHeight * loupeScale * pixelRatio,
       );
+      context.restore();
     });
 
     return () => window.cancelAnimationFrame(frame);
