@@ -33,6 +33,20 @@ describe('project migration and normalization', () => {
     expect(normalized).not.toBe(state);
   });
 
+  it('defaults supporting elevation photos for projects saved before multi-photo capture', () => {
+    const legacy = makeProject() as any;
+    legacy.siteCaptures = [{
+      id: 'legacy-front', label: 'Front', originalRef: 'original', workingRef: 'working', thumbnailRef: 'thumb',
+      fileName: 'front.jpg', mimeType: 'image/jpeg', byteSize: 1, pixelWidth: 10, pixelHeight: 10,
+      capturedAt: Date.now(), notes: '', referenceWall: { wallName: 'Front', method: 'laser' },
+    }];
+
+    const normalized = normalizeProjectState(legacy);
+
+    expect(normalized.siteCaptures[0].supportingPhotos).toEqual([]);
+    expect(normalizeProjectState(normalized).siteCaptures[0].supportingPhotos).toEqual([]);
+  });
+
   it('migrates legacy auto-detected extrusion to a stable sign-relative depth once', () => {
     const legacy = makeProject() as any;
     legacy.canvases[0].signs = [{

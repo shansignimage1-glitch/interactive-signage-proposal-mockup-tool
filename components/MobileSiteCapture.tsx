@@ -355,12 +355,7 @@ const MobileSiteCapture: React.FC<MobileSiteCaptureProps> = ({ state, syncStatus
   };
 
   const deleteCapture = async (capture: SiteCapturePhoto) => {
-    if (!window.confirm(`Delete ${capture.label} and its locally stored photographs?`)) return;
-    const userId = state.user?.uid ?? 'guest_unknown';
-    await Promise.all([
-      StorageService.deleteSiteCapture(userId, state.projectId, capture.id),
-      ...(capture.supportingPhotos ?? []).map(photo => StorageService.deleteSiteCapture(userId, state.projectId, photo.id)),
-    ]);
+    if (!window.confirm(`Delete ${capture.label} and all of its photographs?`)) return;
     onUpdate({ siteCaptures: captures.filter(item => item.id !== capture.id), lastSaved: Date.now() });
     if (activeCaptureId === capture.id) setActiveCaptureId(captures.find(item => item.id !== capture.id)?.id ?? null);
   };

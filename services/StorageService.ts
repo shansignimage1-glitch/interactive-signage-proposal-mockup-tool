@@ -161,6 +161,19 @@ const deleteStorageTree = async (root: StorageReference): Promise<void> => {
     await Promise.all(listing.prefixes.map(deleteStorageTree));
 };
 
+const collectSiteCaptureAssetIds = (project: any): string[] => {
+    const ids = new Set<string>();
+    if (!Array.isArray(project?.siteCaptures)) return [];
+    project.siteCaptures.forEach((capture: any) => {
+        if (typeof capture?.id === 'string' && capture.id) ids.add(capture.id);
+        if (!Array.isArray(capture?.supportingPhotos)) return;
+        capture.supportingPhotos.forEach((photo: any) => {
+            if (typeof photo?.id === 'string' && photo.id) ids.add(photo.id);
+        });
+    });
+    return [...ids];
+};
+
 // --- Cloud Image Upload Helpers ---
 // Firestore documents cap out at 1MB, so base64 images can't be stored inline.
 // Images are uploaded to Firebase Storage (content-addressed by SHA-256 hash)
@@ -247,6 +260,9 @@ export const StorageService = {
 
   saveProjectLocal: async (state: MockupState, thumbnail?: string): Promise<void> => {
       const { projectId, projectName, lastSaved } = state;
+      const previous = await idbOperation<MockupState>(STORE_PROJECTS, 'readonly', store => store.get(projectId));
+      const retainedCaptureIds = new Set(collectSiteCaptureAssetIds(state));
+      const removedCaptureIds = collectSiteCaptureAssetIds(previous).filter(id => !retainedCaptureIds.has(id));
       const metadata: ProjectMetadata = {
           id: projectId,
           name: projectName,
@@ -260,6 +276,13 @@ export const StorageService = {
       await idbOperation(STORE_PROJECTS, 'readwrite', (store) => store.put(state));
       // Save Metadata
       await idbOperation(STORE_METADATA, 'readwrite', (store) => store.put(metadata));
+      // Keep the previous blobs until the replacement project revision is
+      // durable. If IndexedDB persistence fails, the last saved project still
+      // has every photograph it references.
+      await Promise.all(removedCaptureIds.map(captureId =>
+          deleteSiteCaptureAssets(projectId, captureId).catch(error => {
+              reportWarning('capture-delete', 'Local capture cleanup failed', { projectId, captureId, error: String(error) });
+          })));
   },
 
   loadProjectLocal: async (projectId: string): Promise<MockupState | null> => {
@@ -274,15 +297,6 @@ export const StorageService = {
       await idbOperation(STORE_PROJECTS, 'readwrite', (store) => store.delete(projectId));
       await idbOperation(STORE_METADATA, 'readwrite', (store) => store.delete(projectId));
       await deleteSiteCaptureAssets(projectId);
-  },
-
-  deleteSiteCapture: async (userId: string, projectId: string, captureId: string): Promise<void> => {
-      await deleteSiteCaptureAssets(projectId, captureId);
-      if (!userId.startsWith('guest_')) {
-          await deleteStorageTree(storageRef(storage, `users/${userId}/captures/${projectId}/${captureId}`)).catch(error => {
-              reportWarning('capture-delete', 'Cloud capture cleanup failed', { projectId, captureId, error: String(error) });
-          });
-      }
   },
 
   queueProjectSync: async (userId: string, projectId: string): Promise<void> => {
@@ -497,17 +511,27 @@ export const StorageService = {
           const projectRef = doc(db, FIRESTORE_COLLECTION, `${userId}_${state.projectId}`);
           const key = revisionKey(userId, state.projectId);
           const baseRevision = knownCloudRevisions.get(key) ?? state.cloudRevision ?? 0;
-          const nextRevision = await runTransaction(db, async transaction => {
+          const transactionResult = await runTransaction(db, async transaction => {
               const remote = await transaction.get(projectRef);
-              const remoteRevision = remote.exists() ? (remote.data().cloudRevision ?? 0) : 0;
+              const remoteState = remote.exists() ? remote.data() : null;
+              const remoteRevision = remoteState?.cloudRevision ?? 0;
               if (!force && remote.exists() && remoteRevision > baseRevision) return null;
               const revision = remoteRevision + 1;
+              const retainedCaptureIds = new Set(collectSiteCaptureAssetIds(cloudState));
+              const removedCaptureIds = collectSiteCaptureAssetIds(remoteState).filter(id => !retainedCaptureIds.has(id));
               transaction.set(projectRef, { ...cloudState, userId, updatedAt: Date.now(), cloudRevision: revision });
-              return revision;
+              return { revision, removedCaptureIds };
           });
-          if (nextRevision === null) return 'conflict';
-          knownCloudRevisions.set(key, nextRevision);
-          await StorageService.saveProjectLocal({ ...state, cloudRevision: nextRevision });
+          if (transactionResult === null) return 'conflict';
+          knownCloudRevisions.set(key, transactionResult.revision);
+          await StorageService.saveProjectLocal({ ...state, cloudRevision: transactionResult.revision });
+          // Firebase objects are removed only after Firestore no longer points
+          // at them. A failed/conflicted save therefore cannot strand another
+          // device with broken elevation-photo URLs.
+          await Promise.all(transactionResult.removedCaptureIds.map(captureId =>
+              deleteStorageTree(storageRef(storage, `users/${userId}/captures/${state.projectId}/${captureId}`)).catch(error => {
+                  reportWarning('capture-delete', 'Cloud capture cleanup failed', { projectId: state.projectId, captureId, error: String(error) });
+              })));
 
           return 'cloud';
       } catch (e) {
