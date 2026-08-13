@@ -98,6 +98,7 @@ The user must sign out and back in to receive the refreshed token. Administrator
 
 - Install SignagePro from Safari's **Share → Add to Home Screen** on iPad. Open it once online before relying on the offline app shell.
 - iPads and other tablets open the full editor automatically; phone-sized touch devices open Site Capture. Add `?editor=1` to force the editor or `?mobileCapture=1` to force Site Capture.
+- The phone Site Capture camera and the tablet editor camera display a centered horizontal level guide. Site Capture offers a guided preview photo plus the device's full-resolution camera for final artwork. Camera access starts only after the user opens the camera and stops when the preview closes, the page is hidden or the app exits.
 - Photos are resized to a maximum 4096-pixel edge before Drive or Firebase upload. Sources over 40 MB or 80 megapixels are rejected with a safe, actionable message.
 - Device storage is checked before local saves. If space is low, free storage and reopen the project before retrying.
 - Use **Plane** calibration for angled walls: tap the visible wall corners clockwise (top-left, top-right, bottom-right, bottom-left), then enter its known width and height.

@@ -17,6 +17,7 @@ import { defaultExtrusionModeForType, getBackingDepth, getSignExtrusionMode, VIS
 interface ControlsPanelProps {
   state: MockupState;
   activeCanvas: Canvas;
+  forceSidePanel?: boolean;
   updateState: (updates: Partial<MockupState>) => void;
   updateStateWithHistory: (updates: Partial<MockupState>) => void;
   updateActiveCanvas: (updates: Partial<Canvas>) => void;
@@ -88,6 +89,7 @@ export const readImageAspectRatio = (src: string): Promise<number | null> => new
 const ControlsPanel: React.FC<ControlsPanelProps> = ({
   state,
   activeCanvas,
+  forceSidePanel = false,
   updateState,
   updateStateWithHistory,
   updateActiveCanvas,
@@ -728,8 +730,15 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
 
   return (
     <>
-      <div data-testid="controls-panel" data-mobile-expanded={mobilePanelExpanded} className={`fixed inset-x-0 bottom-0 z-[80] flex flex-col transition-[height] duration-300 ease-out lg:static lg:z-20 lg:h-full lg:w-80 lg:flex-shrink-0 lg:border-r lg:border-gray-700 lg:bg-gray-900 lg:shadow-xl lg:pointer-events-auto ${mobilePanelExpanded ? 'h-[min(78dvh,720px)] rounded-t-3xl border-t border-gray-700 bg-gray-900 shadow-[0_-18px_60px_rgba(0,0,0,0.55)]' : 'h-[calc(78px+env(safe-area-inset-bottom))] pointer-events-none'}`}>
-        {!mobilePanelExpanded && (
+      <div
+        data-testid="controls-panel"
+        data-mobile-expanded={mobilePanelExpanded}
+        data-layout={forceSidePanel ? 'tablet-side-panel' : 'responsive'}
+        className={forceSidePanel
+          ? 'static z-20 flex h-full w-80 flex-shrink-0 flex-col border-r border-gray-700 bg-gray-900 shadow-xl pointer-events-auto'
+          : `fixed inset-x-0 bottom-0 z-[80] flex flex-col transition-[height] duration-300 ease-out lg:static lg:z-20 lg:h-full lg:w-80 lg:flex-shrink-0 lg:border-r lg:border-gray-700 lg:bg-gray-900 lg:shadow-xl lg:pointer-events-auto ${mobilePanelExpanded ? 'h-[min(78dvh,720px)] rounded-t-3xl border-t border-gray-700 bg-gray-900 shadow-[0_-18px_60px_rgba(0,0,0,0.55)]' : 'h-[calc(78px+env(safe-area-inset-bottom))] pointer-events-none'}`}
+      >
+        {!forceSidePanel && !mobilePanelExpanded && (
           <div data-testid="mobile-tool-dock" className="pointer-events-auto mx-2 mb-[max(0.5rem,env(safe-area-inset-bottom))] mt-auto rounded-2xl border border-gray-700/90 bg-gray-900/95 p-1.5 shadow-2xl backdrop-blur-xl lg:hidden">
             <div className="grid grid-cols-5 gap-1">
               <MobileDockButton label="Select" ariaLabel="Select & adjust" active={toolMode === 'select'} onClick={() => activateTool('select')} icon={<MousePointer2 className="h-5 w-5" />} />
@@ -748,9 +757,9 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
           </div>
         )}
 
-        {mobilePanelExpanded && <button onClick={() => setMobilePanelExpanded(false)} className="grid min-h-6 w-full place-items-center lg:hidden" aria-label="Collapse controls"><span className="h-1 w-10 rounded-full bg-gray-600" /></button>}
+        {!forceSidePanel && mobilePanelExpanded && <button onClick={() => setMobilePanelExpanded(false)} className="grid min-h-6 w-full place-items-center lg:hidden" aria-label="Collapse controls"><span className="h-1 w-10 rounded-full bg-gray-600" /></button>}
 
-        <div className={`${mobilePanelExpanded ? 'flex' : 'hidden'} flex-shrink-0 items-center justify-between border-b border-gray-700 bg-gray-800 px-3 py-2.5 lg:flex lg:p-6`}>
+        <div className={`${forceSidePanel || mobilePanelExpanded ? 'flex' : 'hidden'} flex-shrink-0 items-center justify-between border-b border-gray-700 bg-gray-800 ${forceSidePanel ? 'p-6' : 'px-3 py-2.5 lg:flex lg:p-6'}`}>
           <div className="flex-1 min-w-0 pr-2">
             <h1 className="flex items-center gap-2 truncate text-base font-bold text-white lg:text-xl">
                 <Move3d className="h-5 w-5 flex-shrink-0 text-blue-400 lg:h-6 lg:w-6" />
@@ -762,7 +771,7 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
              <button 
                 onClick={onOpenProjectManager} 
                 aria-label="Manage projects"
-                className="inline-flex min-h-9 items-center gap-1.5 rounded-lg px-2 text-blue-300 transition-colors hover:bg-gray-700 hover:text-white"
+                className={`inline-flex items-center gap-1.5 rounded-lg px-2 text-blue-300 transition-colors hover:bg-gray-700 hover:text-white ${forceSidePanel ? 'min-h-11 min-w-11 justify-center' : 'min-h-9'}`}
                 title="Manage Projects"
              >
                 <FolderOpen className="w-4 h-4" />
@@ -771,7 +780,7 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
              <div className="w-px h-4 bg-gray-600 mx-1"></div>
              <button 
                 onClick={() => setShowAssistant(!showAssistant)} 
-                className={`p-1.5 transition-colors rounded hover:bg-gray-700 ${showAssistant ? 'text-blue-400 bg-blue-900/30' : 'text-gray-400 hover:text-white'}`}
+                className={`${forceSidePanel ? 'grid h-11 w-11 place-items-center' : 'p-1.5'} transition-colors rounded hover:bg-gray-700 ${showAssistant ? 'text-blue-400 bg-blue-900/30' : 'text-gray-400 hover:text-white'}`}
                 title={showAssistant ? "Hide Assistant" : "Show Assistant"}
              >
                 <Sparkles className="w-4 h-4" />
@@ -780,7 +789,7 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
              <button 
                 onClick={undo} 
                 disabled={!canUndo}
-                className="p-1.5 text-gray-400 hover:text-white disabled:opacity-30 disabled:hover:text-gray-400 transition-colors rounded hover:bg-gray-700"
+                className={`${forceSidePanel ? 'grid h-11 w-11 place-items-center' : 'p-1.5'} text-gray-400 hover:text-white disabled:opacity-30 disabled:hover:text-gray-400 transition-colors rounded hover:bg-gray-700`}
                 title="Undo"
              >
                 <Undo2 className="w-4 h-4" />
@@ -788,17 +797,17 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
              <button 
                 onClick={redo} 
                 disabled={!canRedo}
-                className="p-1.5 text-gray-400 hover:text-white disabled:opacity-30 disabled:hover:text-gray-400 transition-colors rounded hover:bg-gray-700"
+                className={`${forceSidePanel ? 'grid h-11 w-11 place-items-center' : 'p-1.5'} text-gray-400 hover:text-white disabled:opacity-30 disabled:hover:text-gray-400 transition-colors rounded hover:bg-gray-700`}
                 title="Redo"
              >
                 <Redo2 className="w-4 h-4" />
              </button>
-             <button onClick={() => setMobilePanelExpanded(false)} className="ml-1 grid h-10 w-10 place-items-center rounded-xl text-gray-300 hover:bg-gray-700 lg:hidden" aria-label="Collapse controls"><ChevronDown className="h-5 w-5" /></button>
+             {!forceSidePanel && <button onClick={() => setMobilePanelExpanded(false)} className="ml-1 grid h-10 w-10 place-items-center rounded-xl text-gray-300 hover:bg-gray-700 lg:hidden" aria-label="Collapse controls"><ChevronDown className="h-5 w-5" /></button>}
           </div>
         </div>
 
         {/* Tab Header */}
-        <div className={`${mobilePanelExpanded ? 'flex' : 'hidden'} flex-shrink-0 overflow-x-auto border-b border-gray-700 bg-gray-900 no-scrollbar lg:flex`}>
+        <div className={`${forceSidePanel || mobilePanelExpanded ? 'flex' : 'hidden'} flex-shrink-0 overflow-x-auto border-b border-gray-700 bg-gray-900 no-scrollbar lg:flex`}>
            <button 
               onClick={() => setActiveTab('editor')}
               className={`flex-1 py-3 text-sm font-medium flex items-center justify-center gap-2 transition-colors border-b-2 min-w-[80px] ${activeTab === 'editor' ? 'text-blue-400 border-blue-400 bg-gray-800' : 'text-gray-400 border-transparent hover:text-gray-200 hover:bg-gray-800/50'}`}
@@ -819,7 +828,7 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
            </button>
         </div>
 
-        <div className={`${mobilePanelExpanded ? 'block' : 'hidden'} flex-1 space-y-5 overflow-y-auto p-3 custom-scrollbar lg:block lg:space-y-8 lg:p-6`}>
+        <div className={`${forceSidePanel || mobilePanelExpanded ? 'block' : 'hidden'} flex-1 overflow-y-auto custom-scrollbar ${forceSidePanel ? 'space-y-8 p-6' : 'space-y-5 p-3 lg:block lg:space-y-8 lg:p-6'}`}>
           
           {/* EDITOR TAB CONTENT */}
           {activeTab === 'editor' && (
@@ -1604,7 +1613,7 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
           )}
         </div>
 
-        <div className={`${mobilePanelExpanded ? 'block' : 'hidden'} flex-shrink-0 border-t border-gray-700 bg-gray-800 px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-3 lg:block lg:px-3 lg:pb-8 lg:pt-3`}>
+        <div className={`${forceSidePanel || mobilePanelExpanded ? 'block' : 'hidden'} flex-shrink-0 border-t border-gray-700 bg-gray-800 px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-3 lg:block lg:px-3 lg:pb-8 lg:pt-3`}>
           <div className="grid grid-cols-2 gap-2">
           <button
             onClick={() => onDownload('device')}

@@ -1,7 +1,7 @@
 
 import React, { useState, useCallback, useRef, useEffect, Suspense } from 'react';
 import { auth, googleProvider } from './firebase';
-import { getIdTokenResult, getRedirectResult, onAuthStateChanged, signInWithPopup, signOut } from 'firebase/auth';
+import { getIdTokenResult, getRedirectResult, onAuthStateChanged, signInWithPopup, signOut, type User as FirebaseUser } from 'firebase/auth';
 
 import ControlsPanel from './components/ControlsPanel';
 import MockupCanvas from './components/MockupCanvas';
@@ -17,7 +17,7 @@ const MobileSiteCapture = React.lazy(() => import('./components/MobileSiteCaptur
 import { MockupState, AppImages, Point, Sign, Dimension, TitleBlock, TitleBlockField, Canvas, Calibration, SignElement, Size, ConnectorStatus, CloudProvider, UserProfile, SiteCapturePhoto } from './types';
 import { getActiveConnector, getPreferredProvider, setConnectorUid, connectors, getConnectorForRef } from './services/driveConnectors';
 import { distance } from './utils/math';
-import { readDeviceModeEnvironment, shouldUsePhoneCapture } from './utils/deviceMode';
+import { isPhoneSizedTouchDevice, readDeviceModeEnvironment, shouldUsePhoneCapture, type DeviceModeEnvironment } from './utils/deviceMode';
 import { isMissingRedirectStateError } from './utils/authErrors';
 import { measureLine, measureBox, getMmPerPx } from './utils/measure';
 import { normalizeProjectState } from './utils/projectMigration';
@@ -33,7 +33,13 @@ import { blobToDataUri } from './services/imageHash';
 
 const GUEST_PROJECT_ID_KEY = 'signagepro_guest_project_id';
 const AUTH_BOOT_TIMEOUT_MS = 20_000;
-const AUTH_CALLBACK_TIMEOUT_MS = 12_000;
+const AUTH_OBSERVER_BOOT_TIMEOUT_MS = 12_000;
+const TABLET_SIDE_PANEL_MIN_VIEWPORT_WIDTH = 640;
+
+const shouldUseTabletSidePanel = (environment: DeviceModeEnvironment): boolean =>
+  (environment.coarsePointer || environment.mobileUserAgent)
+  && !isPhoneSizedTouchDevice(environment)
+  && environment.viewportWidth >= TABLET_SIDE_PANEL_MIN_VIEWPORT_WIDTH;
 
 const withTimeout = <T,>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> =>
   new Promise<T>((resolve, reject) => {
@@ -174,6 +180,7 @@ const createCleanProjectState = (user: UserProfile | null, isOnline: boolean): M
 const App: React.FC = () => {
   const [state, setState] = useState<MockupState>(getInitialState);
   const [isAuthLoading, setIsAuthLoading] = useState(true);
+  const [isLoginPending, setIsLoginPending] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
   
   // Track sync status beyond just boolean
@@ -201,12 +208,18 @@ const App: React.FC = () => {
   const [showAccountSettings, setShowAccountSettings] = useState(false);
   const [showProposal3D, setShowProposal3D] = useState(false);
   const [isPhoneCapture, setIsPhoneCapture] = useState(() => shouldUsePhoneCapture(readDeviceModeEnvironment(window)));
+  const [useTabletSidePanel, setUseTabletSidePanel] = useState(() => shouldUseTabletSidePanel(readDeviceModeEnvironment(window)));
   const [driveStatus, setDriveStatus] = useState<ConnectorStatus>('disconnected');
   const [driveNeedsReconnect, setDriveNeedsReconnect] = useState(false);
   const [driveReconnectProvider, setDriveReconnectProvider] = useState<CloudProvider | null>(null);
   
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const stateRef = useRef(state);
+  const authObserverCalledRef = useRef(false);
+  const authAttemptInProgressRef = useRef(false);
+  const authSessionRef = useRef<{ uid: string | null; epoch: number }>({ uid: null, epoch: 0 });
+  const completedAuthUidRef = useRef<string | null>(null);
+  const authBootstrapPromisesRef = useRef(new Map<string, { epoch: number; promise: Promise<void> }>());
   useEffect(() => { stateRef.current = state; }, [state]);
   useEffect(() => {
       document.documentElement.classList.toggle('signagepro-authenticated', !!state.user);
@@ -214,7 +227,11 @@ const App: React.FC = () => {
   }, [state.user]);
   useEffect(() => {
       const pointerMedia = window.matchMedia('(pointer: coarse)');
-      const updateMode = () => setIsPhoneCapture(shouldUsePhoneCapture(readDeviceModeEnvironment(window)));
+      const updateMode = () => {
+          const environment = readDeviceModeEnvironment(window);
+          setIsPhoneCapture(shouldUsePhoneCapture(environment));
+          setUseTabletSidePanel(shouldUseTabletSidePanel(environment));
+      };
       window.addEventListener('resize', updateMode);
       window.addEventListener('orientationchange', updateMode);
       window.addEventListener('popstate', updateMode);
@@ -238,6 +255,7 @@ const App: React.FC = () => {
   // never step back into a pre-login (user: null) state
   const startSession = useCallback((state: MockupState) => {
       const newState = normalizeProjectState(state);
+      stateRef.current = newState;
       setState(newState);
       setHistory([newState]);
       setHistoryIndex(0);
@@ -246,7 +264,116 @@ const App: React.FC = () => {
       setToolMode('select');
   }, []);
 
+  const selectAuthUser = useCallback((uid: string | null): number => {
+      const current = authSessionRef.current;
+      if (current.uid !== uid) {
+          authSessionRef.current = { uid, epoch: current.epoch + 1 };
+          completedAuthUidRef.current = null;
+      }
+      return authSessionRef.current.epoch;
+  }, []);
+
+  // Firebase can deliver a successful sign-in through the popup result, a
+  // legacy redirect result, and onAuthStateChanged. Run one bootstrap per user
+  // and let any of those signals recover an iPad session if another is missed.
+  const bootstrapFirebaseUser = useCallback((firebaseUser: FirebaseUser): Promise<void> => {
+      const uid = firebaseUser.uid;
+      const epoch = selectAuthUser(uid);
+      if (completedAuthUidRef.current === uid && stateRef.current.user?.uid === uid) {
+          return Promise.resolve();
+      }
+
+      const existing = authBootstrapPromisesRef.current.get(uid);
+      if (existing?.epoch === epoch) return existing.promise;
+
+      const isCurrentSession = () => {
+          const current = authSessionRef.current;
+          return current.uid === uid && current.epoch === epoch;
+      };
+
+      let promise!: Promise<void>;
+      promise = Promise.resolve().then(async () => {
+          setIsLoginPending(false);
+          setIsAuthLoading(true);
+          try {
+              let isAdmin = false;
+              try {
+                  const token = await withTimeout(getIdTokenResult(firebaseUser), 8_000, 'Authentication token');
+                  isAdmin = token.claims.admin === true;
+              } catch (error) {
+                  reportWarning('auth-bootstrap', 'Could not load token claims; continuing as a standard user', { error: String(error) });
+              }
+
+              if (!isCurrentSession()) return;
+              const user = {
+                  uid,
+                  displayName: firebaseUser.displayName,
+                  email: firebaseUser.email,
+                  photoURL: firebaseUser.photoURL,
+                  isAdmin,
+              };
+              setConnectorUid(uid);
+              setDriveStatus(getActiveConnector() ? 'connected' : 'disconnected');
+
+              const projects = await withTimeout(
+                  StorageService.listProjectsCloud(uid),
+                  10_000,
+                  'Cloud project list',
+              );
+              if (!isCurrentSession()) return;
+              if (projects.length > 0) {
+                  const latest = projects.sort((a, b) => (b.lastModified ?? 0) - (a.lastModified ?? 0))[0];
+                  const loaded = await withTimeout(
+                      StorageService.loadProjectCloud(uid, latest.id, ({ needsReconnect, failedRefs }) => {
+                          if (!isCurrentSession() || !needsReconnect) return;
+                          setDriveNeedsReconnect(true);
+                          setDriveReconnectProvider(failedRefs[0] ? getConnectorForRef(failedRefs[0])?.id ?? null : null);
+                          setDriveStatus('expired');
+                      }),
+                      AUTH_BOOT_TIMEOUT_MS,
+                      'Cloud project load',
+                  );
+                  if (!isCurrentSession()) return;
+                  if (loaded) {
+                      startSession({ ...loaded, user, isOnline: navigator.onLine, isSyncing: false });
+                      completedAuthUidRef.current = uid;
+                      return;
+                  }
+              }
+
+              startSession({ ...getInitialState(), user, isOnline: navigator.onLine });
+              completedAuthUidRef.current = uid;
+          } catch (error) {
+              reportError('auth-bootstrap', error, { uid });
+              if (!isCurrentSession()) return;
+              const user = {
+                  uid,
+                  displayName: firebaseUser.displayName,
+                  email: firebaseUser.email,
+                  photoURL: firebaseUser.photoURL,
+                  isAdmin: false,
+              };
+              startSession({ ...getInitialState(), user, isOnline: navigator.onLine, isSyncing: false });
+              completedAuthUidRef.current = uid;
+              setSyncStatus('error');
+              notify('Signed in. Cloud projects are taking too long to load; you can continue working and retry sync.', 'warning');
+          } finally {
+              const entry = authBootstrapPromisesRef.current.get(uid);
+              if (entry?.promise === promise) authBootstrapPromisesRef.current.delete(uid);
+              if (isCurrentSession()) {
+                  authAttemptInProgressRef.current = false;
+                  setIsAuthLoading(false);
+              }
+          }
+      });
+
+      authBootstrapPromisesRef.current.set(uid, { epoch, promise });
+      return promise;
+  }, [selectAuthUser, startSession]);
+
   const handleGuestLogin = useCallback(async () => {
+      authAttemptInProgressRef.current = false;
+      setIsLoginPending(false);
       const guestId = 'guest_' + Date.now();
       const guestUser = {
           uid: guestId,
@@ -274,7 +401,20 @@ const App: React.FC = () => {
   // Complete redirects created by older app versions. Missing redirect state is
   // recoverable: Safari may partition or clear the temporary session storage.
   useEffect(() => {
-    getRedirectResult(auth).catch((err: any) => {
+    getRedirectResult(auth).then(result => {
+      if (!result?.user) return;
+      authAttemptInProgressRef.current = true;
+      return bootstrapFirebaseUser(result.user);
+    }).catch((err: any) => {
+      const authIsAlreadyRecovering = authAttemptInProgressRef.current
+        || !!auth.currentUser
+        || authBootstrapPromisesRef.current.size > 0;
+      if (authIsAlreadyRecovering) {
+        reportWarning('auth-redirect', 'Ignored a stale redirect result while an authenticated session was loading', { error: String(err) });
+        return;
+      }
+      authAttemptInProgressRef.current = false;
+      setIsLoginPending(false);
       if (isMissingRedirectStateError(err)) {
         reportWarning('auth-redirect', 'Discarded stale redirect result because browser state was unavailable');
         setIsAuthLoading(false);
@@ -283,126 +423,62 @@ const App: React.FC = () => {
       setAuthError(err?.message ?? 'Sign-in failed after returning from Google.');
       setIsAuthLoading(false);
     });
-  }, []);
+  }, [bootstrapFirebaseUser]);
 
-  // onAuthStateChanged can occasionally fail to fire after an OAuth redirect
-  // in iPad standalone/Safari mode. This outer watchdog is deliberately
-  // independent of that callback, so the loading screen can never be permanent.
+  // --- Auth & Data Loading ---
   useEffect(() => {
-    const timer = window.setTimeout(() => {
-      if (stateRef.current.user) {
+    const unsubscribe = onAuthStateChanged(auth, (firebaseUser) => {
+      authObserverCalledRef.current = true;
+      if (firebaseUser) {
+        void bootstrapFirebaseUser(firebaseUser);
+        return;
+      }
+
+      // Ignore a stale null callback if Firebase already exposes a signed-in
+      // user through a popup or redirect result.
+      if (auth.currentUser) {
+        void bootstrapFirebaseUser(auth.currentUser);
+        return;
+      }
+
+      // A late initial signed-out callback must not erase a guest session the
+      // user deliberately entered after Safari's observer fallback appeared.
+      if (stateRef.current.user?.uid.startsWith('guest_')) {
+        authAttemptInProgressRef.current = false;
+        setIsLoginPending(false);
         setIsAuthLoading(false);
         return;
       }
 
-      const firebaseUser = auth.currentUser;
-      if (firebaseUser) {
-        const user = {
-          uid: firebaseUser.uid,
-          displayName: firebaseUser.displayName,
-          email: firebaseUser.email,
-          photoURL: firebaseUser.photoURL,
-          isAdmin: false,
-        };
-        startSession({ ...getInitialState(), user, isOnline: navigator.onLine, isSyncing: false });
-        setSyncStatus('error');
-        reportWarning('auth-bootstrap', 'Auth-state callback timed out; opened a fallback session', { uid: user.uid });
-        notify('Signed in. Cloud data is still connecting; you can continue working.', 'warning');
-      } else {
-        setAuthError('Sign-in took too long to finish. Please try again.');
-      }
-      setIsAuthLoading(false);
-    }, AUTH_CALLBACK_TIMEOUT_MS);
-
-    return () => window.clearTimeout(timer);
-  }, [startSession]);
-
-  // --- Auth & Data Loading ---
-  useEffect(() => {
-    let cancelled = false;
-
-    const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
-      try {
-        if (!firebaseUser) {
-          // Not signed in — show login screen
-          setConnectorUid(null);
-          setState(getInitialState());
-          return;
-        }
-
-        // Token claims are useful for admin UI but must never prevent ordinary
-        // users from entering the app when Safari temporarily stalls a request.
-        let isAdmin = false;
-        try {
-          const token = await withTimeout(getIdTokenResult(firebaseUser), 8_000, 'Authentication token');
-          isAdmin = token.claims.admin === true;
-        } catch (error) {
-          reportWarning('auth-bootstrap', 'Could not load token claims; continuing as a standard user', { error: String(error) });
-        }
-
-        if (cancelled) return;
-        const user = {
-          uid: firebaseUser.uid,
-          displayName: firebaseUser.displayName,
-          email: firebaseUser.email,
-          photoURL: firebaseUser.photoURL,
-          isAdmin,
-        };
-        // Scope drive-connector caches to this user and reflect connection state
-        setConnectorUid(user.uid);
-        setDriveStatus(getActiveConnector() ? 'connected' : 'disconnected');
-        // Try to load the most recent project from cloud, fall back to local
-        const projects = await withTimeout(
-          StorageService.listProjectsCloud(user.uid),
-          10_000,
-          'Cloud project list',
-        );
-        if (projects.length > 0) {
-          const latest = projects.sort((a, b) => (b.lastModified ?? 0) - (a.lastModified ?? 0))[0];
-          const loaded = await withTimeout(
-            StorageService.loadProjectCloud(user.uid, latest.id, ({ needsReconnect, failedRefs }) => {
-              if (needsReconnect) {
-                setDriveNeedsReconnect(true);
-                setDriveReconnectProvider(failedRefs[0] ? getConnectorForRef(failedRefs[0])?.id ?? null : null);
-                setDriveStatus('expired');
-              }
-            }),
-            AUTH_BOOT_TIMEOUT_MS,
-            'Cloud project load',
-          );
-          if (cancelled) return;
-          if (loaded) {
-            startSession({ ...loaded, user, isOnline: navigator.onLine, isSyncing: false });
-            return;
-          }
-        }
-        // No cloud project — start fresh
-        startSession({ ...getInitialState(), user, isOnline: navigator.onLine });
-      } catch (error) {
-        reportError('auth-bootstrap', error, { uid: firebaseUser?.uid });
-        // A cloud/Drive outage must not trap an authenticated user behind the
-        // loading screen. Open a usable local session and let autosave retry.
-        if (firebaseUser && !cancelled) {
-          const user = {
-            uid: firebaseUser.uid,
-            displayName: firebaseUser.displayName,
-            email: firebaseUser.email,
-            photoURL: firebaseUser.photoURL,
-            isAdmin: false,
-          };
-          startSession({ ...getInitialState(), user, isOnline: navigator.onLine, isSyncing: false });
-          setSyncStatus('error');
-          notify('Signed in. Cloud projects are taking too long to load; you can continue working and retry sync.', 'warning');
-        }
-      } finally {
-        if (!cancelled) setIsAuthLoading(false);
+      selectAuthUser(null);
+      setConnectorUid(null);
+      const initialState = getInitialState();
+      stateRef.current = initialState;
+      setState(initialState);
+      if (authBootstrapPromisesRef.current.size > 0) {
+        authAttemptInProgressRef.current = false;
+        setIsAuthLoading(false);
+      } else if (!authAttemptInProgressRef.current) {
+        setIsAuthLoading(false);
       }
     });
-    return () => {
-      cancelled = true;
-      unsubscribe();
-    };
-  }, [startSession]);
+    return unsubscribe;
+  }, [bootstrapFirebaseUser, selectAuthUser]);
+
+  // If Safari never delivers the initial observer callback, reveal a usable
+  // login screen without inventing an error or creating an authenticated blank
+  // project. A current Firebase user is bootstrapped directly instead.
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      if (authObserverCalledRef.current || authAttemptInProgressRef.current || authBootstrapPromisesRef.current.size > 0) return;
+      if (auth.currentUser) {
+        void bootstrapFirebaseUser(auth.currentUser);
+        return;
+      }
+      setIsAuthLoading(false);
+    }, AUTH_OBSERVER_BOOT_TIMEOUT_MS);
+    return () => window.clearTimeout(timer);
+  }, [bootstrapFirebaseUser]);
 
   // Re-open the current project after the user reconnects their drive, so
   // unresolved gdrive:// refs get another chance to materialize.
@@ -429,10 +505,15 @@ const App: React.FC = () => {
 
   const handleLogin = async () => {
     setAuthError(null);
+    authAttemptInProgressRef.current = true;
+    setIsLoginPending(true);
     try {
-      await signInWithPopup(auth, googleProvider);
-      // onAuthStateChanged above handles the rest
+      const credential = await signInWithPopup(auth, googleProvider);
+      await bootstrapFirebaseUser(credential.user);
     } catch (err: any) {
+      authAttemptInProgressRef.current = false;
+      setIsLoginPending(false);
+      setIsAuthLoading(false);
       const code = err?.code ?? '';
       if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') return;
       if (code === 'auth/popup-blocked' || code === 'auth/operation-not-supported-in-this-environment') {
@@ -444,8 +525,13 @@ const App: React.FC = () => {
   };
 
   const handleLogout = async () => {
+    authAttemptInProgressRef.current = false;
+    setIsLoginPending(false);
+    selectAuthUser(null);
     await signOut(auth);
-    setState(getInitialState());
+    const initialState = getInitialState();
+    stateRef.current = initialState;
+    setState(initialState);
   };
 
   const updateState = useCallback((updates: Partial<MockupState>) => {
@@ -1170,16 +1256,20 @@ const App: React.FC = () => {
 
                   <button
                       onClick={handleLogin}
-                      className="w-full bg-white hover:bg-gray-100 text-gray-900 font-bold py-3 px-4 rounded-lg transition-colors flex items-center justify-center gap-3 mb-3"
+                      disabled={isLoginPending}
+                      className="w-full bg-white hover:bg-gray-100 disabled:cursor-wait disabled:bg-gray-200 disabled:text-gray-500 text-gray-900 font-bold py-3 px-4 rounded-lg transition-colors flex items-center justify-center gap-3 mb-3"
                       title="Sign in with your Google account"
                   >
-                      <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" className="w-5 h-5" alt="" />
-                      Sign in with Google
+                      {isLoginPending
+                        ? <Loader2 className="h-5 w-5 animate-spin" />
+                        : <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" className="w-5 h-5" alt="" />}
+                      {isLoginPending ? 'Complete sign-in in Google' : 'Sign in with Google'}
                   </button>
 
                   <button 
                       onClick={handleGuestLogin}
-                      className="w-full bg-gray-800 hover:bg-gray-700 text-gray-300 font-semibold py-3 px-4 rounded-lg transition-colors flex items-center justify-center gap-3"
+                      disabled={isLoginPending}
+                      className="w-full bg-gray-800 hover:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-50 text-gray-300 font-semibold py-3 px-4 rounded-lg transition-colors flex items-center justify-center gap-3"
                   >
                       Continue as Guest
                   </button>
@@ -1214,7 +1304,7 @@ const App: React.FC = () => {
   return (
     <div className="relative flex h-[100dvh] w-full overflow-hidden bg-black lg:flex-row">
       {/* Top Bar Status */}
-      <div className="pointer-events-none absolute left-3 top-[max(0.75rem,env(safe-area-inset-top))] z-50 flex max-w-[48vw] items-center gap-2 lg:left-1/2 lg:max-w-none lg:-translate-x-1/2">
+      <div className={`pointer-events-none absolute top-[max(0.75rem,env(safe-area-inset-top))] z-50 flex items-center gap-2 ${useTabletSidePanel ? 'left-[21rem] max-w-[calc(100vw-28rem)]' : 'left-3 max-w-[48vw] lg:left-1/2 lg:max-w-none lg:-translate-x-1/2'}`}>
           {!state.isOnline && !state.user.uid.startsWith('guest_') && (
               <div className="bg-red-600/90 text-white px-3 py-1 rounded-full text-xs font-bold flex items-center gap-1 shadow-lg backdrop-blur">
                   <WifiOff className="w-3 h-3" /> Offline Mode
@@ -1291,6 +1381,7 @@ const App: React.FC = () => {
       <ControlsPanel
         state={state}
         activeCanvas={activeCanvas}
+        forceSidePanel={useTabletSidePanel}
         updateState={updateState}
         updateStateWithHistory={updateStateWithHistory}
         updateActiveCanvas={updateActiveCanvas}

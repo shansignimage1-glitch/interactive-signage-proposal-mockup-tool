@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
   ArrowUpRight, Camera, Check, ChevronDown, Cloud, CloudOff, FolderOpen, Images,
-  Loader2, LogOut, MapPin, Mic, NotebookPen, Plus, Ruler, Save, Square, Trash2, WifiOff,
+  ImagePlus, Loader2, LogOut, MapPin, Mic, NotebookPen, Plus, Ruler, Save, Square, Trash2, WifiOff, X,
 } from 'lucide-react';
 import { MeasureUnit, MockupState, ProjectMetadata, ReferenceWallFieldMeasurement, SiteCapturePhoto, SiteCaptureSupportingPhoto } from '../types';
 import { currentCoordinates, reverseGeocode } from '../services/PhotoLocationService';
@@ -51,6 +51,21 @@ const CaptureImage: React.FC<{ assetRef: string; alt: string; className?: string
     ? <img src={src} alt={alt} className={className} />
     : <div className={`${className ?? ''} grid place-items-center bg-slate-900 text-slate-600`}><Images className="h-7 w-7" /></div>;
 };
+
+const CameraLevelGuide: React.FC = () => (
+  <div className="pointer-events-none absolute inset-0 z-10" data-testid="camera-level-guide" aria-hidden="true">
+    <div className="absolute left-1/2 top-1/2 flex w-[78%] -translate-x-1/2 -translate-y-1/2 items-center drop-shadow-[0_1px_2px_rgba(0,0,0,0.95)]">
+      <span className="h-px flex-1 bg-white/95" />
+      <span className="relative h-4 w-4 shrink-0 rounded-full border-2 border-white bg-emerald-400/80 shadow-[0_0_0_2px_rgba(0,0,0,0.45)]">
+        <span className="absolute left-1/2 top-1/2 h-1 w-1 -translate-x-1/2 -translate-y-1/2 rounded-full bg-white" />
+      </span>
+      <span className="h-px flex-1 bg-white/95" />
+    </div>
+    <div className="absolute left-1/2 top-[calc(50%+1.15rem)] -translate-x-1/2 rounded-full bg-black/55 px-2.5 py-1 text-[9px] font-black uppercase tracking-[0.18em] text-white/90 backdrop-blur-sm">
+      Level guide
+    </div>
+  </div>
+);
 
 const DictationButton: React.FC<{
   onTranscript: (text: string) => void;
@@ -219,6 +234,12 @@ const MobileSiteCapture: React.FC<MobileSiteCaptureProps> = ({ state, syncStatus
   const [projects, setProjects] = useState<ProjectMetadata[]>([]);
   const [projectNameDraft, setProjectNameDraft] = useState(state.projectName);
   const [isSavingProject, setIsSavingProject] = useState(false);
+  const [cameraPreviewOpen, setCameraPreviewOpen] = useState(false);
+  const [cameraStarting, setCameraStarting] = useState(false);
+  const [cameraReady, setCameraReady] = useState(false);
+  const [cameraCapturing, setCameraCapturing] = useState(false);
+  const [cameraError, setCameraError] = useState<string | null>(null);
+  const [cameraStream, setCameraStream] = useState<MediaStream | null>(null);
   const [selectedProjectId, setSelectedProjectId] = useState(state.projectId);
   const [measurementUnit, setMeasurementUnit] = useState<MeasureUnit>('m');
   const captureProjectIdRef = useRef(state.projectId);
@@ -229,7 +250,18 @@ const MobileSiteCapture: React.FC<MobileSiteCaptureProps> = ({ state, syncStatus
   const captureChooserOpenRef = useRef(false);
   const capturesRef = useRef(captures);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const cameraVideoRef = useRef<HTMLVideoElement>(null);
+  const cameraSessionRef = useRef(0);
+  const cameraCaptureSessionRef = useRef<number | null>(null);
+  const cameraStreamRef = useRef<MediaStream | null>(null);
   const activeCapture = captures.find(capture => capture.id === activeCaptureId) ?? captures[0] ?? null;
+
+  const stopCameraTracks = () => {
+    const stream = cameraStreamRef.current;
+    if (!stream) return;
+    cameraStreamRef.current = null;
+    stream.getTracks().forEach(track => track.stop());
+  };
 
   if (captureProjectIdRef.current !== state.projectId) {
     captureProjectIdRef.current = state.projectId;
@@ -251,6 +283,33 @@ const MobileSiteCapture: React.FC<MobileSiteCaptureProps> = ({ state, syncStatus
     };
     return () => { captureRequestEpochRef.current += 1; };
   }, []);
+  useEffect(() => {
+    const video = cameraVideoRef.current;
+    if (!video || !cameraStream) return;
+    video.srcObject = cameraStream;
+    void video.play().catch(() => undefined);
+    return () => {
+      video.pause();
+      video.srcObject = null;
+    };
+  }, [cameraStream, cameraPreviewOpen]);
+  useEffect(() => {
+    const stopCameraForInactiveApp = () => {
+      cameraSessionRef.current += 1;
+      setCameraPreviewOpen(false);
+      stopCameraTracks();
+      setCameraStream(null);
+    };
+    const stopWhenHidden = () => { if (document.visibilityState === 'hidden') stopCameraForInactiveApp(); };
+    document.addEventListener('visibilitychange', stopWhenHidden);
+    window.addEventListener('pagehide', stopCameraForInactiveApp);
+    return () => {
+      document.removeEventListener('visibilitychange', stopWhenHidden);
+      window.removeEventListener('pagehide', stopCameraForInactiveApp);
+      cameraSessionRef.current += 1;
+      stopCameraTracks();
+    };
+  }, []);
 
   const patchCapture = (id: string, updates: Partial<SiteCapturePhoto>) => {
     onUpdate({
@@ -264,15 +323,90 @@ const MobileSiteCapture: React.FC<MobileSiteCaptureProps> = ({ state, syncStatus
     patchCapture(activeCapture.id, { referenceWall: { ...activeCapture.referenceWall, ...updates } });
   };
 
-  const choosePhoto = (intent: CaptureIntent, targetCaptureId = activeCapture?.id ?? null) => {
+  const closeCameraPreview = () => {
+    cameraSessionRef.current += 1;
+    cameraCaptureSessionRef.current = null;
+    setCameraPreviewOpen(false);
+    setCameraStarting(false);
+    setCameraReady(false);
+    setCameraCapturing(false);
+    setCameraError(null);
+    stopCameraTracks();
+    setCameraStream(null);
+  };
+
+  const openDeviceCameraFallback = () => {
+    if (cameraCaptureSessionRef.current !== null) return;
+    closeCameraPreview();
+    captureChooserOpenRef.current = true;
+    fileInputRef.current?.click();
+  };
+
+  const choosePhoto = async (intent: CaptureIntent, targetCaptureId = activeCapture?.id ?? null) => {
     captureRequestRef.current = {
       intent,
       targetCaptureId: intent === 'same-elevation' ? targetCaptureId : null,
       projectId: state.projectId,
       epoch: captureRequestEpochRef.current,
     };
-    captureChooserOpenRef.current = true;
-    fileInputRef.current?.click();
+    setCameraPreviewOpen(true);
+    setCameraStarting(true);
+    setCameraReady(false);
+    setCameraError(null);
+    const session = ++cameraSessionRef.current;
+    try {
+      if (!navigator.mediaDevices?.getUserMedia) throw new Error('Camera preview is unavailable in this browser.');
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: 'environment' }, width: { ideal: 2560 }, height: { ideal: 1920 } },
+        audio: false,
+      });
+      if (session !== cameraSessionRef.current || captureRequestRef.current.projectId !== captureProjectIdRef.current) {
+        stream.getTracks().forEach(track => track.stop());
+        return;
+      }
+      cameraStreamRef.current = stream;
+      setCameraStream(stream);
+    } catch {
+      if (session !== cameraSessionRef.current) return;
+      setCameraError('Live preview could not start. You can still use the device camera.');
+    } finally {
+      if (session === cameraSessionRef.current) setCameraStarting(false);
+    }
+  };
+
+  const captureCameraFrame = async () => {
+    const video = cameraVideoRef.current;
+    const session = cameraSessionRef.current;
+    if (
+      !video || !cameraReady || cameraCaptureSessionRef.current !== null
+      || video.readyState < 2 || !video.videoWidth || !video.videoHeight
+    ) return;
+    cameraCaptureSessionRef.current = session;
+    setCameraCapturing(true);
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      const context = canvas.getContext('2d');
+      if (!context) throw new Error('Camera canvas is unavailable.');
+      context.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const blob = await new Promise<Blob | null>(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.94));
+      if (!blob) throw new Error('The camera frame could not be encoded.');
+      if (session !== cameraSessionRef.current || captureProjectIdRef.current !== captureRequestRef.current.projectId) return;
+      const request = captureRequestRef.current;
+      const file = new File([blob], `guided-site-photo-${Date.now()}.jpg`, { type: 'image/jpeg', lastModified: Date.now() });
+      closeCameraPreview();
+      await capturePhoto(file, request);
+    } catch {
+      if (session === cameraSessionRef.current) {
+        notify('The guided photo could not be captured. Try again or use the full-resolution camera.', 'error');
+      }
+    } finally {
+      if (cameraCaptureSessionRef.current === session) {
+        cameraCaptureSessionRef.current = null;
+        setCameraCapturing(false);
+      }
+    }
   };
 
   const capturePhoto = async (file: File, request: CaptureRequest) => {
@@ -424,6 +558,41 @@ const MobileSiteCapture: React.FC<MobileSiteCaptureProps> = ({ state, syncStatus
         captureChooserOpenRef.current = false;
         if (event.target.files?.[0]) void capturePhoto(event.target.files[0], captureRequestRef.current);
       }} />
+      {cameraPreviewOpen && (
+        <div className="fixed inset-0 z-[130] flex flex-col bg-black text-white" role="dialog" aria-modal="true" aria-label="Site camera with level guide">
+          <div className="relative min-h-0 flex-1 overflow-hidden bg-[#05080b]">
+            <video
+              ref={cameraVideoRef}
+              autoPlay
+              muted
+              playsInline
+              onLoadedData={() => setCameraReady(true)}
+              onCanPlay={() => setCameraReady(true)}
+              className="h-full w-full object-cover"
+              aria-label="Live rear camera preview"
+            />
+            <CameraLevelGuide />
+            <div className="pointer-events-none absolute inset-x-0 top-0 z-20 h-28 bg-gradient-to-b from-black/75 to-transparent" />
+            <button type="button" onClick={closeCameraPreview} className="absolute right-4 top-[max(1rem,env(safe-area-inset-top))] z-30 grid h-12 w-12 place-items-center rounded-full border border-white/25 bg-black/55 backdrop-blur-md" aria-label="Close camera"><X className="h-6 w-6" /></button>
+            <div className="absolute left-4 top-[max(1.1rem,env(safe-area-inset-top))] z-30 rounded-full border border-white/20 bg-black/55 px-3 py-2 text-[10px] font-black uppercase tracking-[0.18em] backdrop-blur-md">Align the building with the line</div>
+            {(cameraStarting || cameraError) && (
+              <div className="absolute inset-0 z-20 grid place-items-center bg-black/65 px-8 text-center backdrop-blur-sm">
+                {cameraStarting ? <div><Loader2 className="mx-auto h-9 w-9 animate-spin text-orange-400" /><p className="mt-4 text-sm font-semibold">Starting rear camera…</p></div> : <div><Camera className="mx-auto h-10 w-10 text-slate-400" /><p className="mt-4 text-sm font-semibold">{cameraError}</p><button type="button" onClick={openDeviceCameraFallback} className="mt-5 min-h-12 rounded-2xl bg-white px-5 text-xs font-black uppercase tracking-[0.12em] text-black"><ImagePlus className="mr-2 inline h-4 w-4" />Use full-resolution camera</button></div>}
+              </div>
+            )}
+          </div>
+          <div className="shrink-0 border-t border-white/10 bg-[#080c11] px-5 pb-[max(1.25rem,env(safe-area-inset-bottom))] pt-4">
+            <div className="mx-auto grid max-w-md grid-cols-[1fr_auto_1fr] items-end gap-4">
+              <button type="button" onClick={openDeviceCameraFallback} disabled={cameraCapturing} className="flex min-h-16 flex-col items-center justify-center rounded-2xl border border-white/15 bg-white/5 px-2 text-[9px] font-black uppercase tracking-[0.1em] text-slate-200 disabled:opacity-40" aria-label="Take full-resolution photo"><ImagePlus className="mb-1 h-5 w-5" />Full resolution</button>
+              <div className="flex flex-col items-center gap-2">
+                <button type="button" onClick={() => void captureCameraFrame()} disabled={!cameraReady || cameraStarting || cameraCapturing || !!cameraError} className="grid h-20 w-20 place-items-center rounded-full border-4 border-white bg-white/20 shadow-[0_0_0_5px_rgba(255,255,255,0.16)] transition active:scale-95 disabled:opacity-35" aria-label="Capture guided photo"><span className="h-14 w-14 rounded-full bg-white" /></button>
+                <span className="text-[9px] font-black uppercase tracking-[0.12em] text-white/80">Guided photo</span>
+              </div>
+              <div className="pb-6 text-center text-[9px] font-medium leading-tight text-slate-500">Use full resolution for final artwork</div>
+            </div>
+          </div>
+        </div>
+      )}
       <header className="shrink-0 border-b border-white/10 bg-[#0c1219]/95 px-4 pb-3 pt-[max(0.75rem,env(safe-area-inset-top))] backdrop-blur-xl">
         <div className="flex items-center justify-between gap-3">
           <button onClick={openProjectPicker} className="flex min-w-0 flex-1 items-center gap-2 text-left" aria-label="Choose project">
@@ -444,7 +613,7 @@ const MobileSiteCapture: React.FC<MobileSiteCaptureProps> = ({ state, syncStatus
               <div className="relative aspect-[4/5] max-h-[58vh] bg-[radial-gradient(circle_at_50%_35%,#243140_0,#111821_42%,#080c11_100%)]">
                 {captures.length ? <CaptureImage assetRef={captures[captures.length - 1].thumbnailRef} alt="Latest site capture" className="h-full w-full object-cover opacity-55" /> : <div className="absolute inset-0 grid place-items-center text-center"><div><Camera className="mx-auto h-12 w-12 text-slate-600" /><p className="mt-3 text-sm font-medium text-slate-400">Capture the first elevation</p><p className="mt-1 text-xs text-slate-600">The original file remains untouched</p></div></div>}
                 <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/90 via-black/45 to-transparent px-5 pb-5 pt-16">
-                  <button onClick={() => choosePhoto('new-elevation')} disabled={isProcessing} className="flex min-h-16 w-full items-center justify-center gap-3 rounded-2xl bg-orange-500 px-5 text-sm font-black uppercase tracking-[0.12em] text-black shadow-[0_14px_38px_rgba(249,115,22,0.3)] transition active:scale-[0.98] disabled:opacity-60" aria-label="Take high-resolution site photo">
+                  <button onClick={() => choosePhoto('new-elevation')} disabled={isProcessing} className="flex min-h-16 w-full items-center justify-center gap-3 rounded-2xl bg-orange-500 px-5 text-sm font-black uppercase tracking-[0.12em] text-black shadow-[0_14px_38px_rgba(249,115,22,0.3)] transition active:scale-[0.98] disabled:opacity-60" aria-label="Open camera with level guide">
                     {isProcessing ? <><Loader2 className="h-6 w-6 animate-spin" /> Preserving original…</> : <><Camera className="h-6 w-6" /> Take site photo</>}
                   </button>
                 </div>

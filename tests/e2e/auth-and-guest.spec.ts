@@ -24,14 +24,9 @@ test('layout remains usable at the configured device viewport', async ({ page },
   const viewport = page.viewportSize();
   const isPhone = testInfo.project.name.startsWith('iphone');
   const isTablet = testInfo.project.name.startsWith('ipad');
-  if (isPhone || isTablet) {
-    if (isPhone) {
-      expect(viewport?.width).toBe(390);
-      expect(viewport?.height).toBe(664);
-    } else {
-      expect(viewport?.width).toBe(834);
-      expect(viewport?.height).toBe(1194);
-    }
+  if (isPhone) {
+    expect(viewport?.width).toBe(390);
+    expect(viewport?.height).toBe(664);
     const dock = page.getByTestId('mobile-tool-dock');
     await expect(dock).toBeVisible();
     expect((await dock.boundingBox())!.height).toBeLessThanOrEqual(90);
@@ -40,13 +35,20 @@ test('layout remains usable at the configured device viewport', async ({ page },
     await expect(page.getByRole('button', { name: 'Download PDF/PNG to device' })).toBeVisible();
     await expect(page.getByText('Dimensions', { exact: true })).toBeVisible();
     await expect(page.getByTestId('controls-panel')).toHaveAttribute('data-mobile-expanded', 'true');
-    if (isTablet) {
-      for (const name of ['Sign Out', 'Zoom in', 'Zoom out', 'Fit canvas to screen', 'Lock canvas view', 'Open 3D proposal viewer']) {
-        const bounds = await page.getByRole('button', { name }).boundingBox();
-        expect(bounds, `${name} should have a tablet-sized touch target`).not.toBeNull();
-        expect(bounds!.width, `${name} target width`).toBeGreaterThanOrEqual(44);
-        expect(bounds!.height, `${name} target height`).toBeGreaterThanOrEqual(44);
-      }
+    return;
+  }
+  if (isTablet) {
+    expect(viewport?.width).toBe(834);
+    expect(viewport?.height).toBe(1194);
+    await expect(page.getByTestId('controls-panel')).toHaveAttribute('data-layout', 'tablet-side-panel');
+    await expect(page.getByTestId('mobile-tool-dock')).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Download PDF/PNG to device' })).toBeVisible();
+    await expect(page.getByText('Dimensions', { exact: true })).toBeVisible();
+    for (const name of ['Manage projects', 'Show Assistant', 'Undo', 'Redo', 'Sign Out', 'Zoom in', 'Zoom out', 'Fit canvas to screen', 'Lock canvas view', 'Open 3D proposal viewer']) {
+      const bounds = await page.getByRole('button', { name }).boundingBox();
+      expect(bounds, `${name} should have a tablet-sized touch target`).not.toBeNull();
+      expect(bounds!.width, `${name} target width`).toBeGreaterThanOrEqual(44);
+      expect(bounds!.height, `${name} target height`).toBeGreaterThanOrEqual(44);
     }
     return;
   }
