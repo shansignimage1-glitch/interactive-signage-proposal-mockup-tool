@@ -2,6 +2,111 @@ import { expect, test } from '@playwright/test';
 
 const PNG_1X1 = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64');
 const PHONE_PROJECTS = ['iphone', 'iphone-webkit', 'android-phone'];
+const CAMERA_GUIDE_PROJECTS = [...PHONE_PROJECTS, 'ipad', 'ipad-webkit'];
+const CAMERA_FRAME_PROJECTS = ['iphone', 'ipad'];
+
+test('phone and tablet cameras show a horizontal level guide and release the camera', async ({ page }, testInfo) => {
+  test.skip(!CAMERA_GUIDE_PROJECTS.includes(testInfo.project.name), 'Camera guide is verified on phone and tablet browser profiles.');
+
+  await page.addInitScript(() => {
+    const lifecycle = { starts: 0, stops: 0 };
+    (window as any).__cameraGuideLifecycle = lifecycle;
+    const track = { stop: () => { lifecycle.stops += 1; } };
+    Object.defineProperty(navigator, 'mediaDevices', {
+      configurable: true,
+      value: { getUserMedia: async () => { lifecycle.starts += 1; return { getTracks: () => [track] }; } },
+    });
+    Object.defineProperty(HTMLMediaElement.prototype, 'srcObject', { configurable: true, writable: true, value: null });
+    HTMLMediaElement.prototype.play = async () => undefined;
+    HTMLMediaElement.prototype.pause = () => undefined;
+  });
+
+  await page.goto('/?mobileCapture=1');
+  await page.getByRole('button', { name: 'Continue as Guest' }).click();
+  await expect(page.getByTestId('camera-level-guide')).toHaveCount(0);
+  expect(await page.evaluate(() => (window as any).__cameraGuideLifecycle.starts)).toBe(0);
+
+  await page.getByRole('button', { name: 'Open camera with level guide' }).click();
+  await expect(page.getByRole('dialog', { name: 'Site camera with level guide' })).toBeVisible();
+  await expect(page.getByTestId('camera-level-guide')).toBeVisible();
+  await expect(page.getByText('Align the building with the line')).toBeVisible();
+  expect(await page.evaluate(() => (window as any).__cameraGuideLifecycle.starts)).toBe(1);
+
+  await page.getByRole('button', { name: 'Close camera' }).click();
+  await expect(page.getByRole('dialog', { name: 'Site camera with level guide' })).toHaveCount(0);
+  expect(await page.evaluate(() => (window as any).__cameraGuideLifecycle.stops)).toBe(1);
+
+  await page.getByRole('button', { name: 'Open camera with level guide' }).click();
+  await expect(page.getByTestId('camera-level-guide')).toBeVisible();
+  await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent('pagehide')));
+  await expect(page.getByRole('dialog', { name: 'Site camera with level guide' })).toHaveCount(0);
+  expect(await page.evaluate(() => (window as any).__cameraGuideLifecycle.stops)).toBe(2);
+});
+
+test('level-guided camera frame is saved as the elevation photograph', async ({ page }, testInfo) => {
+  test.skip(!CAMERA_FRAME_PROJECTS.includes(testInfo.project.name), 'In-app frame capture is sampled on phone and tablet profiles.');
+
+  await page.addInitScript(() => {
+    const track = { stop: () => undefined };
+    Object.defineProperty(navigator, 'mediaDevices', {
+      configurable: true,
+      value: { getUserMedia: async () => ({ getTracks: () => [track] }) },
+    });
+    Object.defineProperty(HTMLMediaElement.prototype, 'srcObject', { configurable: true, writable: true, value: null });
+    Object.defineProperty(HTMLVideoElement.prototype, 'videoWidth', { configurable: true, get: () => 24 });
+    Object.defineProperty(HTMLVideoElement.prototype, 'videoHeight', { configurable: true, get: () => 16 });
+    Object.defineProperty(HTMLVideoElement.prototype, 'readyState', { configurable: true, get: () => 2 });
+    HTMLMediaElement.prototype.play = async () => undefined;
+    HTMLMediaElement.prototype.pause = () => undefined;
+    (window as any).__guidedDrawCalls = 0;
+    CanvasRenderingContext2D.prototype.drawImage = () => { (window as any).__guidedDrawCalls += 1; };
+  });
+
+  await page.goto('/?mobileCapture=1');
+  await page.getByRole('button', { name: 'Continue as Guest' }).click();
+  await page.getByRole('button', { name: 'Open camera with level guide' }).click();
+  const video = page.getByLabel('Live rear camera preview');
+  await video.evaluate(element => element.dispatchEvent(new Event('loadeddata')));
+  const guidedShutter = page.getByRole('button', { name: 'Capture guided photo' });
+  await expect(guidedShutter).toBeEnabled();
+  await guidedShutter.evaluate(element => { (element as HTMLButtonElement).click(); (element as HTMLButtonElement).click(); });
+
+  await expect(page.getByRole('heading', { name: 'Reference wall' })).toBeVisible();
+  await page.getByRole('button', { name: 'Views' }).click();
+  await expect(page.getByText('24 × 16')).toBeVisible();
+  expect(await page.evaluate(() => (window as any).__guidedDrawCalls)).toBe(1);
+});
+
+test('tablet editor camera always shows its level line and stops when inactive', async ({ page }, testInfo) => {
+  test.skip(!['ipad', 'ipad-webkit'].includes(testInfo.project.name), 'The full-editor camera is the tablet capture path.');
+
+  await page.addInitScript(() => {
+    const lifecycle = { starts: 0, stops: 0 };
+    (window as any).__tabletCameraLifecycle = lifecycle;
+    const track = { stop: () => { lifecycle.stops += 1; } };
+    Object.defineProperty(navigator, 'mediaDevices', {
+      configurable: true,
+      value: { getUserMedia: async () => { lifecycle.starts += 1; return { getTracks: () => [track] }; } },
+    });
+    Object.defineProperty(HTMLMediaElement.prototype, 'srcObject', { configurable: true, writable: true, value: null });
+    HTMLMediaElement.prototype.play = async () => undefined;
+    HTMLMediaElement.prototype.pause = () => undefined;
+  });
+
+  await page.goto('/?editor=1');
+  await page.getByRole('button', { name: 'Continue as Guest' }).click();
+  await page.getByRole('button', { name: /New Image \/ Camera/ }).click();
+  await page.getByRole('button', { name: 'Use Camera' }).click();
+
+  await expect(page.getByText('Take Photo')).toBeVisible();
+  await expect(page.getByTestId('live-level-guide')).toBeVisible();
+  await expect(page.getByText('LEVEL GUIDE')).toBeVisible();
+  expect(await page.evaluate(() => (window as any).__tabletCameraLifecycle.starts)).toBe(1);
+
+  await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent('pagehide')));
+  await expect(page.getByText('Select Image Source')).toBeVisible();
+  expect(await page.evaluate(() => (window as any).__tabletCameraLifecycle.stops)).toBe(1);
+});
 
 test('phone mode captures an original, records wall geometry, dictates notes, and creates an editor view', async ({ page }, testInfo) => {
   test.skip(!PHONE_PROJECTS.includes(testInfo.project.name), 'Dedicated phone workflow is verified on iPhone and Android profiles.');
@@ -225,15 +330,17 @@ test('phone user adds supporting photos to an elevation and creates another elev
   await mobile.locator('input[type=file]').setInputFiles({ name: 'front-primary.png', mimeType: 'image/png', buffer: PNG_1X1 });
 
   await mobile.getByRole('button', { name: 'Capture', exact: true }).click();
-  const sameElevationChooser = page.waitForEvent('filechooser');
   await mobile.getByRole('button', { name: 'Add to this elevation' }).click();
+  const sameElevationChooser = page.waitForEvent('filechooser');
+  await page.getByRole('button', { name: 'Take full-resolution photo' }).click();
   await (await sameElevationChooser).setFiles({ name: 'front-detail.png', mimeType: 'image/png', buffer: PNG_1X1 });
   await expect(mobile.getByText('2 photos')).toBeVisible();
   await expect(mobile.locator('article')).toHaveCount(1);
 
   await mobile.getByRole('button', { name: 'Capture', exact: true }).click();
-  const newElevationChooser = page.waitForEvent('filechooser');
   await mobile.getByRole('button', { name: 'Add another elevation' }).click();
+  const newElevationChooser = page.waitForEvent('filechooser');
+  await page.getByRole('button', { name: 'Take full-resolution photo' }).click();
   await (await newElevationChooser).setFiles({ name: 'side-primary.png', mimeType: 'image/png', buffer: PNG_1X1 });
   await expect(mobile.getByRole('heading', { name: 'Reference wall' })).toBeVisible();
   await mobile.getByRole('button', { name: 'Views' }).click();
@@ -278,8 +385,9 @@ test('in-flight photo processing cannot write into a different mobile project', 
   await savedProjects.getByRole('button', { name: 'Save current project' }).click();
   await savedProjects.getByRole('button', { name: /Second Site/ }).click();
 
+  await mobile.getByRole('button', { name: 'Open camera with level guide' }).click();
   const photoChooser = page.waitForEvent('filechooser');
-  await mobile.getByRole('button', { name: 'Take high-resolution site photo' }).click();
+  await page.getByRole('button', { name: 'Take full-resolution photo' }).click();
   await (await photoChooser).setFiles({ name: 'second-site.png', mimeType: 'image/png', buffer: PNG_1X1 });
   await expect.poll(() => page.evaluate(() => typeof (window as any).__releasePhotoProcessing)).toBe('function');
   await mobile.getByRole('button', { name: 'Choose project' }).click();
@@ -314,8 +422,9 @@ test('in-flight supporting photo is discarded when its elevation is deleted', as
     });
   });
 
-  const supportingChooser = page.waitForEvent('filechooser');
   await mobile.getByRole('button', { name: 'Add photo to Elevation 1' }).click();
+  const supportingChooser = page.waitForEvent('filechooser');
+  await page.getByRole('button', { name: 'Take full-resolution photo' }).click();
   await (await supportingChooser).setFiles({ name: 'detail.png', mimeType: 'image/png', buffer: PNG_1X1 });
   await expect.poll(() => page.evaluate(() => typeof (window as any).__releaseSupportingPhoto)).toBe('function');
   page.once('dialog', dialog => dialog.accept());

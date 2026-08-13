@@ -39,7 +39,6 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({
 }) => {
   const [step, setStep] = useState<Step>('select');
   const [sourceImage, setSourceImage] = useState<string | null>(null);
-  const [videoStream, setVideoStream] = useState<MediaStream | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isDecoding, setIsDecoding] = useState(false);
   const [levelPhoto, setLevelPhoto] = useState(false);
@@ -54,6 +53,7 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({
   
   // Camera Refs
   const videoRef = useRef<HTMLVideoElement>(null);
+  const videoStreamRef = useRef<MediaStream | null>(null);
 
   // Crop State
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -98,11 +98,29 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({
   }, [isOpen]);
 
   const stopCamera = () => {
-    if (videoStream) {
-      videoStream.getTracks().forEach(track => track.stop());
-      setVideoStream(null);
+    const stream = videoStreamRef.current;
+    if (stream) {
+      videoStreamRef.current = null;
+      stream.getTracks().forEach(track => track.stop());
     }
   };
+
+  useEffect(() => {
+    const stopCameraWhenInactive = () => {
+      processingGenerationRef.current += 1;
+      stopCamera();
+      setStep('select');
+    };
+    const stopWhenHidden = () => { if (document.visibilityState === 'hidden') stopCameraWhenInactive(); };
+    document.addEventListener('visibilitychange', stopWhenHidden);
+    window.addEventListener('pagehide', stopCameraWhenInactive);
+    return () => {
+      document.removeEventListener('visibilitychange', stopWhenHidden);
+      window.removeEventListener('pagehide', stopCameraWhenInactive);
+      processingGenerationRef.current += 1;
+      stopCamera();
+    };
+  }, []);
 
   const toggleLevelPhoto = async () => {
     const next = !levelPhoto;
@@ -199,7 +217,7 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({
         stream.getTracks().forEach(track => track.stop());
         return;
       }
-      setVideoStream(stream);
+      videoStreamRef.current = stream;
       if (usePhotoLocation) void useCurrentLocation();
       setStep('camera');
       setTimeout(() => {
@@ -777,13 +795,13 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({
           {step === 'camera' && (
             <div className="relative w-full max-w-lg bg-black rounded-lg overflow-hidden">
                <video ref={videoRef} autoPlay playsInline className="w-full h-auto object-cover" />
-               {levelPhoto && (
+               {enableLeveling && (
                  <div className="pointer-events-none absolute inset-0" data-testid="live-level-guide">
-                   <div className="absolute left-1/2 top-1/2 w-[82%] -translate-x-1/2 -translate-y-1/2" style={{ transform: `translate(-50%, -50%) rotate(${deviceRoll ?? 0}deg)` }}>
-                     <div className={`h-0.5 w-full shadow-[0_0_0_1px_rgba(0,0,0,.7)] transition-colors ${deviceRoll !== null && Math.abs(deviceRoll) <= 1.5 ? 'bg-emerald-400' : 'bg-amber-400'}`} />
-                     <div className={`absolute left-1/2 top-1/2 h-5 w-5 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 ${deviceRoll !== null && Math.abs(deviceRoll) <= 1.5 ? 'border-emerald-400 bg-emerald-400/30' : 'border-amber-400 bg-black/30'}`} />
+                   <div className="absolute left-1/2 top-1/2 w-[82%] -translate-x-1/2 -translate-y-1/2" style={{ transform: `translate(-50%, -50%) rotate(${levelPhoto ? deviceRoll ?? 0 : 0}deg)` }}>
+                     <div className={`h-0.5 w-full shadow-[0_0_0_1px_rgba(0,0,0,.85)] transition-colors ${levelPhoto ? deviceRoll !== null && Math.abs(deviceRoll) <= 1.5 ? 'bg-emerald-400' : 'bg-amber-400' : 'bg-white'}`} />
+                     <div className={`absolute left-1/2 top-1/2 h-5 w-5 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 ${levelPhoto ? deviceRoll !== null && Math.abs(deviceRoll) <= 1.5 ? 'border-emerald-400 bg-emerald-400/30' : 'border-amber-400 bg-black/30' : 'border-white bg-emerald-400/70'}`} />
                    </div>
-                   <div className={`absolute left-1/2 top-4 -translate-x-1/2 rounded-full border px-3 py-1 font-mono text-xs font-bold ${deviceRoll !== null && Math.abs(deviceRoll) <= 1.5 ? 'border-emerald-400/70 bg-emerald-950/80 text-emerald-300' : 'border-amber-400/70 bg-gray-950/80 text-amber-300'}`}>{deviceRoll === null ? 'LEVEL SENSOR WAITING' : Math.abs(deviceRoll) <= 1.5 ? 'LEVEL' : `${deviceRoll > 0 ? '+' : ''}${deviceRoll.toFixed(1)}°`}</div>
+                   <div className={`absolute left-1/2 top-4 -translate-x-1/2 rounded-full border px-3 py-1 font-mono text-xs font-bold ${levelPhoto ? deviceRoll !== null && Math.abs(deviceRoll) <= 1.5 ? 'border-emerald-400/70 bg-emerald-950/80 text-emerald-300' : 'border-amber-400/70 bg-gray-950/80 text-amber-300' : 'border-white/40 bg-gray-950/80 text-white'}`}>{levelPhoto ? deviceRoll === null ? 'LEVEL SENSOR WAITING' : Math.abs(deviceRoll) <= 1.5 ? 'LEVEL' : `${deviceRoll > 0 ? '+' : ''}${deviceRoll.toFixed(1)}°` : 'LEVEL GUIDE'}</div>
                  </div>
                )}
                <div className="absolute bottom-4 left-0 right-0 flex justify-center">
