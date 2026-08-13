@@ -19,4 +19,17 @@ describe('Firebase redirect error recovery', () => {
     expect(appSource).not.toContain('signInWithRedirect');
     expect(appSource).not.toContain('prefersRedirectSignIn');
   });
+
+  it('bootstraps directly from successful popup and legacy redirect credentials', () => {
+    const appSource = readFileSync('App.tsx', 'utf8');
+    expect(appSource).toContain('await bootstrapFirebaseUser(credential.user)');
+    expect(appSource).toContain('return bootstrapFirebaseUser(result.user)');
+    expect(appSource).toContain('authBootstrapPromisesRef.current.get(uid)');
+  });
+
+  it('does not show a mount-relative sign-in timeout error', () => {
+    const appSource = readFileSync('App.tsx', 'utf8');
+    expect(appSource).not.toContain('Sign-in took too long to finish');
+    expect(appSource).not.toContain('AUTH_CALLBACK_TIMEOUT_MS');
+  });
 });
