@@ -8,7 +8,6 @@ const environment = (overrides: Partial<DeviceModeEnvironment> = {}): DeviceMode
   viewportWidth: 390,
   viewportHeight: 664,
   coarsePointer: true,
-  maxTouchPoints: 5,
   mobileUserAgent: true,
   ...overrides,
 });
@@ -36,6 +35,10 @@ describe('phone capture device routing', () => {
     }))).toBe(true);
   });
 
+  it('keeps a phone in capture mode when desktop-site mode masks its mobile user agent', () => {
+    expect(shouldUsePhoneCapture(environment({ mobileUserAgent: false }))).toBe(true);
+  });
+
   it('does not treat a narrow desktop window as a phone', () => {
     expect(shouldUsePhoneCapture(environment({
       screenWidth: 1920,
@@ -43,7 +46,6 @@ describe('phone capture device routing', () => {
       viewportWidth: 500,
       viewportHeight: 800,
       coarsePointer: false,
-      maxTouchPoints: 0,
       mobileUserAgent: false,
     }))).toBe(false);
   });
@@ -55,7 +57,6 @@ describe('phone capture device routing', () => {
       viewportWidth: 960,
       viewportHeight: 540,
       coarsePointer: false,
-      maxTouchPoints: 10,
       mobileUserAgent: false,
     }))).toBe(false);
   });
