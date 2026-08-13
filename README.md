@@ -60,7 +60,7 @@ Open [http://localhost:3000](http://localhost:3000). `npm run dev` runs only Vit
 ```powershell
 npm test                 # unit and IndexedDB integration tests
 npm run test:rules       # Firestore/Storage emulator rules; Java 21 required
-npm run test:e2e         # desktop and iPad Playwright workflows
+npm run test:e2e         # desktop, iPad and phone Playwright workflows
 npm run test:all         # complete release sequence
 npx tsc --noEmit         # TypeScript verification
 npm run build            # production bundle
@@ -97,6 +97,7 @@ The user must sign out and back in to receive the refreshed token. Administrator
 ## Field use, image limits and sync conflicts
 
 - Install SignagePro from Safari's **Share → Add to Home Screen** on iPad. Open it once online before relying on the offline app shell.
+- iPads and other tablets open the full editor automatically; phone-sized touch devices open Site Capture. Add `?editor=1` to force the editor or `?mobileCapture=1` to force Site Capture.
 - Photos are resized to a maximum 4096-pixel edge before Drive or Firebase upload. Sources over 40 MB or 80 megapixels are rejected with a safe, actionable message.
 - Device storage is checked before local saves. If space is low, free storage and reopen the project before retrying.
 - Use **Plane** calibration for angled walls: tap the visible wall corners clockwise (top-left, top-right, bottom-right, bottom-left), then enter its known width and height.
