@@ -8,6 +8,7 @@ export interface DeviceModeEnvironment {
   viewportHeight: number;
   coarsePointer: boolean;
   maxTouchPoints: number;
+  mobileUserAgent: boolean;
 }
 
 const usableDimension = (value: number): value is number => Number.isFinite(value) && value > 0;
@@ -19,8 +20,9 @@ export const isPhoneSizedTouchDevice = ({
   viewportHeight,
   coarsePointer,
   maxTouchPoints,
+  mobileUserAgent,
 }: DeviceModeEnvironment): boolean => {
-  if (!coarsePointer && maxTouchPoints < 1) return false;
+  if (!coarsePointer || maxTouchPoints < 1 || !mobileUserAgent) return false;
 
   // Browser chrome, the Safari sidebar, and the onscreen keyboard can shrink
   // the content viewport. The physical screen's short side stays stable and
@@ -47,4 +49,6 @@ export const readDeviceModeEnvironment = (browserWindow: Window): DeviceModeEnvi
   viewportHeight: browserWindow.innerHeight,
   coarsePointer: browserWindow.matchMedia?.('(pointer: coarse)').matches ?? false,
   maxTouchPoints: browserWindow.navigator?.maxTouchPoints ?? 0,
+  mobileUserAgent: (browserWindow.navigator as Navigator & { userAgentData?: { mobile?: boolean } })?.userAgentData?.mobile
+    ?? /Android|iPhone|iPod|iPad/i.test(browserWindow.navigator?.userAgent ?? ''),
 });

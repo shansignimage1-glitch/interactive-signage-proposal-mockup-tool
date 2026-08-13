@@ -9,6 +9,7 @@ const environment = (overrides: Partial<DeviceModeEnvironment> = {}): DeviceMode
   viewportHeight: 664,
   coarsePointer: true,
   maxTouchPoints: 5,
+  mobileUserAgent: true,
   ...overrides,
 });
 
@@ -43,6 +44,19 @@ describe('phone capture device routing', () => {
       viewportHeight: 800,
       coarsePointer: false,
       maxTouchPoints: 0,
+      mobileUserAgent: false,
+    }))).toBe(false);
+  });
+
+  it('does not treat a highly scaled Windows touchscreen as a phone', () => {
+    expect(shouldUsePhoneCapture(environment({
+      screenWidth: 960,
+      screenHeight: 540,
+      viewportWidth: 960,
+      viewportHeight: 540,
+      coarsePointer: false,
+      maxTouchPoints: 10,
+      mobileUserAgent: false,
     }))).toBe(false);
   });
 

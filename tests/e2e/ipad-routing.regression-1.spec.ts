@@ -36,4 +36,10 @@ test('explicit mobile capture remains available on iPad', async ({ page }, testI
 
   await expect(page.getByTestId('mobile-site-capture')).toBeVisible();
   await expect(page.getByTestId('mobile-tool-dock')).toHaveCount(0);
+
+  await page.evaluate(() => { window.location.hash = '/privacy'; });
+  await expect(page.getByRole('heading', { name: 'Privacy policy' })).toBeVisible();
+  await page.getByRole('button', { name: 'Close' }).click();
+  await expect(page).toHaveURL(/\?mobileCapture=1$/);
+  await expect(page.getByTestId('mobile-site-capture')).toBeVisible();
 });
