@@ -17,6 +17,7 @@ const MobileSiteCapture = React.lazy(() => import('./components/MobileSiteCaptur
 import { MockupState, AppImages, Point, Sign, Dimension, TitleBlock, TitleBlockField, Canvas, Calibration, SignElement, Size, ConnectorStatus, CloudProvider, UserProfile, SiteCapturePhoto } from './types';
 import { getActiveConnector, getPreferredProvider, setConnectorUid, connectors, getConnectorForRef } from './services/driveConnectors';
 import { distance } from './utils/math';
+import { readDeviceModeEnvironment, shouldUsePhoneCapture } from './utils/deviceMode';
 import { isMissingRedirectStateError } from './utils/authErrors';
 import { measureLine, measureBox, getMmPerPx } from './utils/measure';
 import { normalizeProjectState } from './utils/projectMigration';
@@ -199,11 +200,7 @@ const App: React.FC = () => {
   const [showDriveSettings, setShowDriveSettings] = useState(false);
   const [showAccountSettings, setShowAccountSettings] = useState(false);
   const [showProposal3D, setShowProposal3D] = useState(false);
-  const [isPhoneCapture, setIsPhoneCapture] = useState(() => {
-      const params = new URLSearchParams(window.location.search);
-      if (params.get('editor') === '1') return false;
-      return params.get('mobileCapture') === '1' || window.matchMedia('(max-width: 699px), (max-height: 699px) and (pointer: coarse)').matches;
-  });
+  const [isPhoneCapture, setIsPhoneCapture] = useState(() => shouldUsePhoneCapture(readDeviceModeEnvironment(window)));
   const [driveStatus, setDriveStatus] = useState<ConnectorStatus>('disconnected');
   const [driveNeedsReconnect, setDriveNeedsReconnect] = useState(false);
   const [driveReconnectProvider, setDriveReconnectProvider] = useState<CloudProvider | null>(null);
@@ -216,13 +213,18 @@ const App: React.FC = () => {
       return () => document.documentElement.classList.remove('signagepro-authenticated');
   }, [state.user]);
   useEffect(() => {
-      const media = window.matchMedia('(max-width: 699px), (max-height: 699px) and (pointer: coarse)');
-      const updateMode = () => {
-          const params = new URLSearchParams(window.location.search);
-          setIsPhoneCapture(params.get('editor') !== '1' && (params.get('mobileCapture') === '1' || media.matches));
+      const pointerMedia = window.matchMedia('(pointer: coarse)');
+      const updateMode = () => setIsPhoneCapture(shouldUsePhoneCapture(readDeviceModeEnvironment(window)));
+      window.addEventListener('resize', updateMode);
+      window.addEventListener('orientationchange', updateMode);
+      window.addEventListener('popstate', updateMode);
+      pointerMedia.addEventListener('change', updateMode);
+      return () => {
+          window.removeEventListener('resize', updateMode);
+          window.removeEventListener('orientationchange', updateMode);
+          window.removeEventListener('popstate', updateMode);
+          pointerMedia.removeEventListener('change', updateMode);
       };
-      media.addEventListener('change', updateMode);
-      return () => media.removeEventListener('change', updateMode);
   }, []);
 
   const handleViewLockedChange = useCallback((locked: boolean) => {
