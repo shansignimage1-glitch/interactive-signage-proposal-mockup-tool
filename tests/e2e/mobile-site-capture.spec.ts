@@ -8,11 +8,15 @@ test('phone mode captures an original, records wall geometry, dictates notes, an
 
   await page.addInitScript(() => {
     class RecognitionStub {
+      static invocation = 0;
       continuous = false; interimResults = false; lang = 'en-US';
       onstart?: () => void; onend?: () => void; onresult?: (event: any) => void;
+      stop() { this.onend?.(); }
+      abort() { this.onend?.(); }
       start() {
         this.onstart?.();
-        this.onresult?.({ results: [[{ transcript: 'Power supply is above the entrance' }]] });
+        const transcript = RecognitionStub.invocation++ === 0 ? 'twelve point five meters' : 'Power supply is above the entrance';
+        this.onresult?.({ results: [[{ transcript }]] });
         this.onend?.();
       }
     }
@@ -29,6 +33,14 @@ test('phone mode captures an original, records wall geometry, dictates notes, an
 
   await mobile.locator('input[type=file]').setInputFiles({ name: 'front-elevation.png', mimeType: 'image/png', buffer: PNG_1X1 });
   await expect(mobile.getByRole('heading', { name: 'Reference wall' })).toBeVisible();
+
+  const width = mobile.getByLabel('Known wall width in m');
+  await width.click();
+  await width.pressSequentially('12');
+  await expect(width).toBeFocused();
+  await mobile.getByRole('button', { name: 'Dictate known wall width' }).click();
+  await expect(width).toHaveValue('12.5');
+
   await mobile.getByLabel('Known wall width in m').fill('12.5');
   await mobile.getByLabel('Known wall height in m').fill('6.2');
   await mobile.getByLabel('Plane depth / offset in m').fill('0.5');
@@ -94,6 +106,224 @@ test('phone capture falls back when the bitmap decoder rejects a camera blob', a
   await mobile.getByRole('button', { name: 'Views' }).click();
   await expect(mobile.getByText('24 × 16')).toBeVisible();
   await expect(page.getByText('The blob could not be prepared for decoding')).toHaveCount(0);
+});
+
+test('phone dictation releases the microphone after completion and when the app becomes inactive', async ({ page }, testInfo) => {
+  test.skip(!PHONE_PROJECTS.includes(testInfo.project.name), 'Microphone lifecycle is verified on phone profiles.');
+
+  await page.addInitScript(() => {
+    (window as any).__dictationLifecycle = { starts: 0, stops: 0, aborts: 0 };
+    class RecognitionLifecycleStub {
+      continuous = false; interimResults = false; lang = 'en-US';
+      onstart?: () => void; onend?: () => void; onresult?: (event: any) => void;
+      start() { (window as any).__dictationLifecycle.starts += 1; this.onstart?.(); }
+      stop() { (window as any).__dictationLifecycle.stops += 1; this.onend?.(); }
+      abort() { (window as any).__dictationLifecycle.aborts += 1; this.onend?.(); }
+      emitResult(text: string) { this.onresult?.({ results: [[{ transcript: text }]] }); }
+    }
+    (window as any).SpeechRecognition = RecognitionLifecycleStub;
+    (window as any).webkitSpeechRecognition = RecognitionLifecycleStub;
+    const Original = RecognitionLifecycleStub;
+    (window as any).SpeechRecognition = class extends Original {
+      constructor() { super(); (window as any).__activeRecognition = this; }
+    };
+    (window as any).webkitSpeechRecognition = (window as any).SpeechRecognition;
+  });
+
+  await page.goto('/?mobileCapture=1');
+  await page.getByRole('button', { name: 'Continue as Guest' }).click();
+  const mobile = page.getByTestId('mobile-site-capture');
+  await mobile.getByRole('button', { name: 'Notes', exact: true }).click();
+  await expect.poll(() => page.evaluate(() => (window as any).__dictationLifecycle.starts)).toBe(0);
+
+  await mobile.getByRole('button', { name: 'Dictate project notes' }).click();
+  await page.evaluate(() => (window as any).__activeRecognition.emitResult('Access is clear'));
+  await expect.poll(() => page.evaluate(() => (window as any).__dictationLifecycle.stops)).toBe(1);
+
+  await mobile.getByRole('button', { name: 'Dictate project notes' }).click();
+  await page.evaluate(() => {
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' });
+    document.dispatchEvent(new Event('visibilitychange'));
+    (window as any).__activeRecognition.emitResult('This result arrived too late');
+  });
+  await expect.poll(() => page.evaluate(() => (window as any).__dictationLifecycle.aborts)).toBe(1);
+  await expect(mobile.getByPlaceholder(/Access, power/)).toHaveValue('Access is clear');
+});
+
+test('recorded dictation discards audio when the app becomes inactive', async ({ page }, testInfo) => {
+  test.skip(!PHONE_PROJECTS.includes(testInfo.project.name), 'Recorded microphone cleanup is verified on phone profiles.');
+
+  await page.addInitScript(() => {
+    (window as any).__audioTracksStopped = 0;
+    delete (window as any).SpeechRecognition;
+    delete (window as any).webkitSpeechRecognition;
+    const track = { stop: () => { (window as any).__audioTracksStopped += 1; } };
+    Object.defineProperty(navigator, 'mediaDevices', { configurable: true, value: { getUserMedia: async () => ({ getTracks: () => [track] }) } });
+    (window as any).MediaRecorder = class {
+      static isTypeSupported() { return true; }
+      state = 'inactive'; mimeType = 'audio/webm';
+      ondataavailable: ((event: { data: Blob }) => void) | null = null;
+      onstop: (() => void) | null = null;
+      constructor(_stream: unknown, _options?: unknown) {}
+      start() { this.state = 'recording'; }
+      stop() { this.state = 'inactive'; this.ondataavailable?.({ data: new Blob(['private audio']) }); this.onstop?.(); }
+    };
+  });
+
+  await page.goto('/?mobileCapture=1');
+  await page.getByRole('button', { name: 'Continue as Guest' }).click();
+  const mobile = page.getByTestId('mobile-site-capture');
+  await mobile.getByRole('button', { name: 'Notes', exact: true }).click();
+  await mobile.getByRole('button', { name: 'Dictate project notes' }).click();
+  await page.evaluate(() => {
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' });
+    document.dispatchEvent(new Event('visibilitychange'));
+  });
+  await expect.poll(() => page.evaluate(() => (window as any).__audioTracksStopped)).toBeGreaterThan(0);
+  await expect(mobile.getByPlaceholder(/Access, power/)).toHaveValue('');
+});
+
+test('delayed microphone permission is discarded after pagehide', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'iphone', 'The delayed-permission lifecycle is platform-independent and runs once on the iPhone profile.');
+
+  await page.addInitScript(() => {
+    delete (window as any).SpeechRecognition;
+    delete (window as any).webkitSpeechRecognition;
+    (window as any).__delayedMic = { tracksStopped: 0, recorders: 0 };
+    const track = { stop: () => { (window as any).__delayedMic.tracksStopped += 1; } };
+    let grant: (() => void) | undefined;
+    const stream = { getTracks: () => [track] };
+    Object.defineProperty(navigator, 'mediaDevices', {
+      configurable: true,
+      value: { getUserMedia: () => new Promise(resolve => { grant = () => resolve(stream); (window as any).__grantMic = grant; }) },
+    });
+    (window as any).MediaRecorder = class {
+      static isTypeSupported() { return true; }
+      constructor() { (window as any).__delayedMic.recorders += 1; }
+    };
+  });
+
+  await page.goto('/?mobileCapture=1');
+  await page.getByRole('button', { name: 'Continue as Guest' }).click();
+  const mobile = page.getByTestId('mobile-site-capture');
+  await mobile.getByRole('button', { name: 'Notes', exact: true }).click();
+  await mobile.getByRole('button', { name: 'Dictate project notes' }).click();
+  await expect.poll(() => page.evaluate(() => typeof (window as any).__grantMic)).toBe('function');
+  await page.evaluate(() => window.dispatchEvent(new Event('pagehide')));
+  await page.evaluate(() => (window as any).__grantMic());
+
+  await expect.poll(() => page.evaluate(() => (window as any).__delayedMic.tracksStopped)).toBe(1);
+  await expect.poll(() => page.evaluate(() => (window as any).__delayedMic.recorders)).toBe(0);
+});
+
+test('phone user adds supporting photos to an elevation and creates another elevation', async ({ page }, testInfo) => {
+  test.skip(!PHONE_PROJECTS.includes(testInfo.project.name), 'Multiple elevation capture is verified on phone profiles.');
+
+  await page.goto('/?mobileCapture=1');
+  await page.getByRole('button', { name: 'Continue as Guest' }).click();
+  const mobile = page.getByTestId('mobile-site-capture');
+  await mobile.locator('input[type=file]').setInputFiles({ name: 'front-primary.png', mimeType: 'image/png', buffer: PNG_1X1 });
+
+  await mobile.getByRole('button', { name: 'Capture', exact: true }).click();
+  const sameElevationChooser = page.waitForEvent('filechooser');
+  await mobile.getByRole('button', { name: 'Add to this elevation' }).click();
+  await (await sameElevationChooser).setFiles({ name: 'front-detail.png', mimeType: 'image/png', buffer: PNG_1X1 });
+  await expect(mobile.getByText('2 photos')).toBeVisible();
+  await expect(mobile.locator('article')).toHaveCount(1);
+
+  await mobile.getByRole('button', { name: 'Capture', exact: true }).click();
+  const newElevationChooser = page.waitForEvent('filechooser');
+  await mobile.getByRole('button', { name: 'Add another elevation' }).click();
+  await (await newElevationChooser).setFiles({ name: 'side-primary.png', mimeType: 'image/png', buffer: PNG_1X1 });
+  await expect(mobile.getByRole('heading', { name: 'Reference wall' })).toBeVisible();
+  await mobile.getByRole('button', { name: 'Views' }).click();
+  await expect(mobile.locator('article')).toHaveCount(2);
+  await expect(mobile.locator('input[value="Elevation 1"]')).toBeVisible();
+  await expect(mobile.locator('input[value="Elevation 2"]')).toBeVisible();
+
+  const firstElevation = mobile.locator('article').filter({ has: page.locator('input[value="Elevation 1"]') });
+  await firstElevation.getByRole('button', { name: 'Add photo to Elevation 1' }).click();
+  await mobile.locator('input[type=file]').setInputFiles({ name: 'front-closeup.png', mimeType: 'image/png', buffer: PNG_1X1 });
+  await expect(firstElevation.getByText('3 photos')).toBeVisible();
+});
+
+test('in-flight photo processing cannot write into a different mobile project', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'iphone', 'The project-switch race is platform-independent and runs once on the iPhone profile.');
+
+  await page.addInitScript(() => {
+    let releasePersist: (() => void) | undefined;
+    Object.defineProperty(navigator, 'storage', {
+      configurable: true,
+      value: {
+        estimate: async () => ({ usage: 0, quota: 1024 * 1024 * 1024 }),
+        persist: () => new Promise<boolean>(resolve => {
+          releasePersist = () => resolve(true);
+          (window as any).__releasePhotoProcessing = releasePersist;
+        }),
+      },
+    });
+  });
+
+  await page.goto('/?mobileCapture=1');
+  await page.getByRole('button', { name: 'Continue as Guest' }).click();
+
+  const mobile = page.getByTestId('mobile-site-capture');
+  await mobile.getByRole('button', { name: 'Choose project' }).click();
+  const savedProjects = page.getByLabel('Saved projects');
+  await savedProjects.getByLabel('Current project name').fill('First Site');
+  await savedProjects.getByRole('button', { name: 'Save current project' }).click();
+  await savedProjects.getByRole('button', { name: 'New project' }).click();
+  await mobile.getByRole('button', { name: 'Choose project' }).click();
+  await savedProjects.getByLabel('Current project name').fill('Second Site');
+  await savedProjects.getByRole('button', { name: 'Save current project' }).click();
+  await savedProjects.getByRole('button', { name: /Second Site/ }).click();
+
+  const photoChooser = page.waitForEvent('filechooser');
+  await mobile.getByRole('button', { name: 'Take high-resolution site photo' }).click();
+  await (await photoChooser).setFiles({ name: 'second-site.png', mimeType: 'image/png', buffer: PNG_1X1 });
+  await expect.poll(() => page.evaluate(() => typeof (window as any).__releasePhotoProcessing)).toBe('function');
+  await mobile.getByRole('button', { name: 'Choose project' }).click();
+  await savedProjects.getByRole('button', { name: /First Site/ }).click();
+  await page.evaluate(() => (window as any).__releasePhotoProcessing());
+
+  await expect(page.getByText('Photo discarded because the active project changed.')).toBeVisible();
+  await mobile.getByRole('button', { name: 'Views' }).click();
+  await expect(mobile.locator('article')).toHaveCount(0);
+});
+
+test('in-flight supporting photo is discarded when its elevation is deleted', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'iphone', 'The deleted-target race is platform-independent and runs once on the iPhone profile.');
+
+  await page.goto('/?mobileCapture=1');
+  await page.getByRole('button', { name: 'Continue as Guest' }).click();
+  const mobile = page.getByTestId('mobile-site-capture');
+  await mobile.locator('input[type=file]').setInputFiles({ name: 'front.png', mimeType: 'image/png', buffer: PNG_1X1 });
+  await expect(mobile.getByRole('heading', { name: 'Reference wall' })).toBeVisible();
+  await mobile.getByRole('button', { name: 'Views' }).click();
+  await expect(mobile.getByRole('button', { name: 'Add photo to Elevation 1' })).toBeVisible();
+
+  await page.evaluate(() => {
+    Object.defineProperty(navigator, 'storage', {
+      configurable: true,
+      value: {
+        estimate: async () => ({ usage: 0, quota: 1024 * 1024 * 1024 }),
+        persist: () => new Promise<boolean>(resolve => {
+          (window as any).__releaseSupportingPhoto = () => resolve(true);
+        }),
+      },
+    });
+  });
+
+  const supportingChooser = page.waitForEvent('filechooser');
+  await mobile.getByRole('button', { name: 'Add photo to Elevation 1' }).click();
+  await (await supportingChooser).setFiles({ name: 'detail.png', mimeType: 'image/png', buffer: PNG_1X1 });
+  await expect.poll(() => page.evaluate(() => typeof (window as any).__releaseSupportingPhoto)).toBe('function');
+  page.once('dialog', dialog => dialog.accept());
+  await mobile.getByRole('button', { name: 'Delete Elevation 1' }).click();
+  await page.evaluate(() => (window as any).__releaseSupportingPhoto());
+
+  await expect(page.getByText('Photo discarded because the selected elevation no longer exists.')).toBeVisible();
+  await expect(mobile.locator('article')).toHaveCount(0);
 });
 
 test('phone user explicitly saves a named project and stays on the saved-project screen', async ({ page }, testInfo) => {

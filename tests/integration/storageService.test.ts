@@ -5,13 +5,18 @@ const mocks = vi.hoisted(() => {
   const transactionSet = vi.fn();
   const getDownloadURL = vi.fn();
   const uploadBytes = vi.fn();
+  const listAll = vi.fn(async (_ref: any) => ({ items: [], prefixes: [] }));
+  const deleteObject = vi.fn();
   const uploadImage = vi.fn();
   const ensureReady = vi.fn();
   const connector = {
     id: 'google', available: true, isConnected: () => true, ensureReady,
     uploadImage, deleteImage: vi.fn(), deleteAllAppData: vi.fn(),
   };
-  return { transactionSet, getDownloadURL, uploadBytes, uploadImage, ensureReady, connector, remoteExists: false, remoteRevision: 0 };
+  return {
+    transactionSet, getDownloadURL, uploadBytes, listAll, deleteObject, uploadImage, ensureReady, connector,
+    remoteExists: false, remoteRevision: 0,
+  };
 });
 
 vi.mock('../../firebase', () => ({ db: {}, storage: {} }));
@@ -26,7 +31,10 @@ vi.mock('firebase/firestore', () => ({
   deleteDoc: vi.fn(),
   setDoc: vi.fn(),
   runTransaction: vi.fn(async (_db, callback) => callback({
-    get: vi.fn(async () => ({ exists: () => mocks.remoteExists, data: () => ({ cloudRevision: mocks.remoteRevision }) })),
+    get: vi.fn(async () => ({
+      exists: () => mocks.remoteExists,
+      data: () => ({ cloudRevision: mocks.remoteRevision }),
+    })),
     set: mocks.transactionSet,
   })),
 }));
@@ -34,8 +42,8 @@ vi.mock('firebase/storage', () => ({
   ref: vi.fn((_storage, path) => ({ path, name: path.split('/').pop() })),
   getDownloadURL: mocks.getDownloadURL,
   uploadBytes: mocks.uploadBytes,
-  listAll: vi.fn(async () => ({ items: [], prefixes: [] })),
-  deleteObject: vi.fn(),
+  listAll: mocks.listAll,
+  deleteObject: mocks.deleteObject,
 }));
 vi.mock('../../services/imageProcessing', () => ({
   assertStorageCapacity: vi.fn(async () => undefined),
@@ -108,6 +116,7 @@ describe('StorageService save/load', () => {
     mocks.remoteRevision = 3;
     await expect(StorageService.saveProject('user-1', project)).resolves.toBe('conflict');
     expect(mocks.transactionSet).not.toHaveBeenCalled();
+    expect(mocks.listAll).not.toHaveBeenCalled();
     await StorageService.deleteProjectLocal(project.projectId);
   });
 
@@ -119,20 +128,33 @@ describe('StorageService save/load', () => {
     await StorageService.deleteProjectLocal(project.projectId);
   });
 
-  it('uploads site-capture originals separately and stores only cloud references in Firestore', async () => {
+  it('uploads primary and supporting site-capture photos and stores only cloud references in Firestore', async () => {
     const project = makeProject({ projectId: `capture-${Date.now()}` });
     const captureId = 'capture-1';
+    const supportingId = 'capture-1-supporting-1';
     const originalRef = makeSiteCaptureAssetRef(project.projectId, captureId, 'original');
     const workingRef = makeSiteCaptureAssetRef(project.projectId, captureId, 'working');
     const thumbnailRef = makeSiteCaptureAssetRef(project.projectId, captureId, 'thumbnail');
     await putSiteCaptureAsset(originalRef, new Blob(['untouched-original'], { type: 'image/jpeg' }));
     await putSiteCaptureAsset(workingRef, new Blob(['working'], { type: 'image/jpeg' }));
     await putSiteCaptureAsset(thumbnailRef, new Blob(['thumb'], { type: 'image/jpeg' }));
+    const supportingOriginalRef = makeSiteCaptureAssetRef(project.projectId, supportingId, 'original');
+    const supportingWorkingRef = makeSiteCaptureAssetRef(project.projectId, supportingId, 'working');
+    const supportingThumbnailRef = makeSiteCaptureAssetRef(project.projectId, supportingId, 'thumbnail');
+    await putSiteCaptureAsset(supportingOriginalRef, new Blob(['supporting-original'], { type: 'image/jpeg' }));
+    await putSiteCaptureAsset(supportingWorkingRef, new Blob(['supporting-working'], { type: 'image/jpeg' }));
+    await putSiteCaptureAsset(supportingThumbnailRef, new Blob(['supporting-thumb'], { type: 'image/jpeg' }));
     project.siteCaptures = [{
       id: captureId, label: 'Front', originalRef, workingRef, thumbnailRef,
       fileName: 'front.jpg', mimeType: 'image/jpeg', byteSize: 18,
       pixelWidth: 6000, pixelHeight: 4000, workingPixelWidth: 4096, workingPixelHeight: 2731,
       capturedAt: Date.now(), notes: '',
+      supportingPhotos: [{
+        id: supportingId, originalRef: supportingOriginalRef, workingRef: supportingWorkingRef, thumbnailRef: supportingThumbnailRef,
+        fileName: 'front-detail.jpg', mimeType: 'image/jpeg', byteSize: 18,
+        pixelWidth: 3000, pixelHeight: 2000, workingPixelWidth: 3000, workingPixelHeight: 2000,
+        capturedAt: Date.now(),
+      }],
       referenceWall: { wallName: 'Front wall', widthMm: 12000, heightMm: 6000, planeDepthMm: 0, planeDepthDirection: 'behind', referencePlaneName: 'Front wall', method: 'laser', notes: '' },
     }];
     mocks.getDownloadURL.mockImplementation(async (ref: any) => `https://storage.example/${ref.path}`);
@@ -143,6 +165,11 @@ describe('StorageService save/load', () => {
         originalRef: expect.stringContaining('/captures/'),
         workingRef: expect.stringContaining('/captures/'),
         thumbnailRef: expect.stringContaining('/captures/'),
+        supportingPhotos: [expect.objectContaining({
+          originalRef: expect.stringContaining(supportingId),
+          workingRef: expect.stringContaining(supportingId),
+          thumbnailRef: expect.stringContaining(supportingId),
+        })],
       })],
     }));
     await StorageService.deleteProjectLocal(project.projectId);
@@ -160,5 +187,46 @@ describe('StorageService save/load', () => {
     expect(restored?.type).toBe('image/heic');
     expect(await restored?.text()).toBe('camera-original');
     await StorageService.deleteProjectLocal(projectId);
+  });
+
+  it('removes primary and supporting local photo assets only after the project revision is saved', async () => {
+    const project = makeProject({ projectId: `capture-delete-local-${Date.now()}` });
+    const primaryId = 'front';
+    const supportingId = 'front-detail';
+    const primaryRef = makeSiteCaptureAssetRef(project.projectId, primaryId, 'original');
+    const supportingRef = makeSiteCaptureAssetRef(project.projectId, supportingId, 'thumbnail');
+    project.siteCaptures = [{
+      id: primaryId, label: 'Front', originalRef: primaryRef, workingRef: primaryRef, thumbnailRef: primaryRef,
+      fileName: 'front.jpg', mimeType: 'image/jpeg', byteSize: 5, pixelWidth: 10, pixelHeight: 10,
+      workingPixelWidth: 10, workingPixelHeight: 10, capturedAt: Date.now(), notes: '',
+      supportingPhotos: [{
+        id: supportingId, originalRef: supportingRef, workingRef: supportingRef, thumbnailRef: supportingRef,
+        fileName: 'detail.jpg', mimeType: 'image/jpeg', byteSize: 6, pixelWidth: 10, pixelHeight: 10,
+        workingPixelWidth: 10, workingPixelHeight: 10, capturedAt: Date.now(),
+      }],
+      referenceWall: { wallName: 'Front', planeDepthMm: 0, planeDepthDirection: 'behind', referencePlaneName: 'Front', method: 'laser', notes: '' },
+    }];
+    await putSiteCaptureAsset(primaryRef, new Blob(['front'], { type: 'image/jpeg' }));
+    await putSiteCaptureAsset(supportingRef, new Blob(['detail'], { type: 'image/jpeg' }));
+    await StorageService.saveProjectLocal(project);
+
+    await StorageService.saveProjectLocal({ ...project, siteCaptures: [], lastSaved: Date.now() + 1 });
+
+    expect((await StorageService.loadProjectLocal(project.projectId))?.siteCaptures).toEqual([]);
+    expect(await getSiteCaptureAsset(primaryRef)).toBeNull();
+    expect(await getSiteCaptureAsset(supportingRef)).toBeNull();
+    await StorageService.deleteProjectLocal(project.projectId);
+  });
+
+  it('never deletes shared cloud photo paths while saving a newer project revision', async () => {
+    const project = makeProject({ projectId: `capture-delete-cloud-${Date.now()}` });
+    mocks.remoteExists = true;
+
+    await expect(StorageService.saveProject('user-1', project)).resolves.toBe('cloud');
+
+    expect(mocks.transactionSet).toHaveBeenCalledOnce();
+    expect(mocks.listAll).not.toHaveBeenCalled();
+    expect(mocks.deleteObject).not.toHaveBeenCalled();
+    await StorageService.deleteProjectLocal(project.projectId);
   });
 });

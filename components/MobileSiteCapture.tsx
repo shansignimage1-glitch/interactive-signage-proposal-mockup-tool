@@ -3,7 +3,7 @@ import {
   ArrowUpRight, Camera, Check, ChevronDown, Cloud, CloudOff, FolderOpen, Images,
   Loader2, LogOut, MapPin, Mic, NotebookPen, Plus, Ruler, Save, Square, Trash2, WifiOff,
 } from 'lucide-react';
-import { MeasureUnit, MockupState, ProjectMetadata, ReferenceWallFieldMeasurement, SiteCapturePhoto } from '../types';
+import { MeasureUnit, MockupState, ProjectMetadata, ReferenceWallFieldMeasurement, SiteCapturePhoto, SiteCaptureSupportingPhoto } from '../types';
 import { currentCoordinates, reverseGeocode } from '../services/PhotoLocationService';
 import { optimizeImageBlob, readImageDimensions } from '../services/imageProcessing';
 import {
@@ -16,6 +16,10 @@ import { normalizeProjectState } from '../utils/projectMigration';
 
 type MobileTab = 'capture' | 'views' | 'measure' | 'notes';
 type DictationState = 'idle' | 'listening' | 'recording' | 'transcribing';
+type CaptureIntent = 'new-elevation' | 'same-elevation';
+type CaptureRequest = { intent: CaptureIntent; targetCaptureId: string | null; projectId: string; epoch: number };
+
+class CaptureContextChangedError extends Error {}
 
 interface MobileSiteCaptureProps {
   state: MockupState;
@@ -54,26 +58,54 @@ const DictationButton: React.FC<{
   label: string;
 }> = ({ onTranscript, disabled, label }) => {
   const [status, setStatus] = useState<DictationState>('idle');
+  const recognitionRef = useRef<any>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const forceRecorderRef = useRef(false);
   const timeoutRef = useRef<number | null>(null);
+  const sessionRef = useRef(0);
 
-  useEffect(() => () => {
-    if (timeoutRef.current) window.clearTimeout(timeoutRef.current);
-    recorderRef.current?.stop();
-    streamRef.current?.getTracks().forEach(track => track.stop());
+  useEffect(() => {
+    const stopActiveDictation = () => {
+      sessionRef.current += 1;
+      if (timeoutRef.current) window.clearTimeout(timeoutRef.current);
+      timeoutRef.current = null;
+      try { recognitionRef.current?.abort(); } catch { /* already stopped */ }
+      recognitionRef.current = null;
+      const recorder = recorderRef.current;
+      recorderRef.current = null;
+      chunksRef.current = [];
+      if (recorder) {
+        recorder.ondataavailable = null;
+        recorder.onstop = null;
+        if (recorder.state === 'recording') recorder.stop();
+      }
+      streamRef.current?.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
+    };
+    const stopWhenInactive = () => { if (document.visibilityState === 'hidden') stopActiveDictation(); };
+    document.addEventListener('visibilitychange', stopWhenInactive);
+    window.addEventListener('pagehide', stopActiveDictation);
+    return () => {
+      document.removeEventListener('visibilitychange', stopWhenInactive);
+      window.removeEventListener('pagehide', stopActiveDictation);
+      stopActiveDictation();
+    };
   }, []);
 
-  const transcribeRecording = async (blob: Blob) => {
+  const transcribeRecording = async (blob: Blob, session: number) => {
     setStatus('transcribing');
     try {
       const transcript = await transcribeAudio(blob);
-      onTranscript(transcript);
+      if (session === sessionRef.current && document.visibilityState !== 'hidden') onTranscript(transcript);
     } catch (error) {
-      notify(error instanceof Error ? error.message : 'Dictation could not be transcribed.', 'error');
-    } finally { setStatus('idle'); }
+      if (session === sessionRef.current && document.visibilityState !== 'hidden') {
+        notify(error instanceof Error ? error.message : 'Dictation could not be transcribed.', 'error');
+      }
+    } finally {
+      if (session === sessionRef.current) setStatus('idle');
+    }
   };
 
   const startRecorder = async () => {
@@ -81,8 +113,13 @@ const DictationButton: React.FC<{
       notify('Use the microphone on your phone keyboard for dictation on this browser.', 'warning');
       return;
     }
+    const session = ++sessionRef.current;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      if (session !== sessionRef.current || document.visibilityState === 'hidden') {
+        stream.getTracks().forEach(track => track.stop());
+        return;
+      }
       streamRef.current = stream;
       const candidates = ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm', 'audio/ogg'];
       const mimeType = candidates.find(type => MediaRecorder.isTypeSupported(type));
@@ -93,8 +130,15 @@ const DictationButton: React.FC<{
       recorder.onstop = () => {
         if (timeoutRef.current) window.clearTimeout(timeoutRef.current);
         stream.getTracks().forEach(track => track.stop());
+        streamRef.current = null;
+        recorderRef.current = null;
         const blob = new Blob(chunksRef.current, { type: recorder.mimeType || mimeType || 'audio/webm' });
-        if (blob.size > 0) void transcribeRecording(blob); else setStatus('idle');
+        if (session !== sessionRef.current || document.visibilityState === 'hidden') {
+          chunksRef.current = [];
+          setStatus('idle');
+          return;
+        }
+        if (blob.size > 0) void transcribeRecording(blob, session); else setStatus('idle');
       };
       recorder.start(500);
       setStatus('recording');
@@ -110,14 +154,26 @@ const DictationButton: React.FC<{
     if (status !== 'idle' || disabled) return;
     const Recognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
     if (!Recognition || forceRecorderRef.current) { void startRecorder(); return; }
+    const session = ++sessionRef.current;
     const recognition = new Recognition();
+    recognitionRef.current = recognition;
     recognition.continuous = false;
     recognition.interimResults = false;
     recognition.lang = navigator.language || 'en-US';
-    recognition.onstart = () => setStatus('listening');
-    recognition.onresult = (event: any) => onTranscript(event.results[0][0].transcript);
-    recognition.onend = () => setStatus('idle');
+    recognition.onstart = () => { if (session === sessionRef.current) setStatus('listening'); };
+    recognition.onresult = (event: any) => {
+      if (session === sessionRef.current && document.visibilityState !== 'hidden') {
+        onTranscript(event.results[0][0].transcript);
+      }
+      try { recognition.stop(); } catch { /* recognition already completed */ }
+    };
+    recognition.onend = () => {
+      if (recognitionRef.current === recognition) recognitionRef.current = null;
+      if (session === sessionRef.current) setStatus('idle');
+    };
     recognition.onerror = (event: any) => {
+      if (recognitionRef.current === recognition) recognitionRef.current = null;
+      if (session !== sessionRef.current) return;
       setStatus('idle');
       if (event.error !== 'not-allowed') {
         forceRecorderRef.current = true;
@@ -135,6 +191,25 @@ const DictationButton: React.FC<{
   );
 };
 
+const MeasurementField: React.FC<{
+  label: string;
+  valueMm: number | undefined;
+  unit: MeasureUnit;
+  onChange: (valueMm: number | undefined) => void;
+}> = ({ label, valueMm, unit, onChange }) => (
+  <label className="block rounded-2xl border border-slate-800 bg-[#111821] p-3">
+    <span className="mb-2 block text-[10px] font-bold uppercase tracking-[0.16em] text-slate-500">{label}</span>
+    <span className="flex items-center gap-2">
+      <input inputMode="decimal" type="number" min="0" step="any" value={displayMeasurement(valueMm, unit)} onChange={event => onChange(event.target.value === '' ? undefined : parseSpokenMeasurementMm(event.target.value, unit) ?? undefined)} className="h-12 min-w-0 flex-1 rounded-xl border border-slate-700 bg-[#090d12] px-3 font-mono text-lg text-white outline-none focus:border-orange-400" aria-label={`${label} in ${unit}`} />
+      <span className="w-7 text-xs font-bold text-orange-300">{unit}</span>
+      <DictationButton label={`Dictate ${label.toLowerCase()}`} onTranscript={text => {
+        const mm = parseSpokenMeasurementMm(text, unit);
+        if (mm === null) notify(`I could not find a measurement in “${text}”.`, 'warning'); else onChange(mm);
+      }} />
+    </span>
+  </label>
+);
+
 const MobileSiteCapture: React.FC<MobileSiteCaptureProps> = ({ state, syncStatus, onUpdate, onLoadProject, onNewProject, onSaveProject, onPromoteCapture, onLogout }) => {
   const captures = state.siteCaptures ?? [];
   const [tab, setTab] = useState<MobileTab>('capture');
@@ -146,12 +221,36 @@ const MobileSiteCapture: React.FC<MobileSiteCaptureProps> = ({ state, syncStatus
   const [isSavingProject, setIsSavingProject] = useState(false);
   const [selectedProjectId, setSelectedProjectId] = useState(state.projectId);
   const [measurementUnit, setMeasurementUnit] = useState<MeasureUnit>('m');
+  const captureProjectIdRef = useRef(state.projectId);
+  const captureRequestEpochRef = useRef(0);
+  const captureRequestRef = useRef<CaptureRequest>({
+    intent: 'new-elevation', targetCaptureId: null, projectId: state.projectId, epoch: 0,
+  });
+  const captureChooserOpenRef = useRef(false);
+  const capturesRef = useRef(captures);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const activeCapture = captures.find(capture => capture.id === activeCaptureId) ?? captures[0] ?? null;
+
+  if (captureProjectIdRef.current !== state.projectId) {
+    captureProjectIdRef.current = state.projectId;
+    captureRequestEpochRef.current += 1;
+    if (!captureChooserOpenRef.current) {
+      captureRequestRef.current = {
+        intent: 'new-elevation', targetCaptureId: null, projectId: state.projectId, epoch: captureRequestEpochRef.current,
+      };
+    }
+  }
 
   useEffect(() => {
     if (!activeCaptureId && captures[0]) setActiveCaptureId(captures[0].id);
   }, [captures, activeCaptureId]);
+  useEffect(() => { capturesRef.current = captures; }, [captures]);
+  useEffect(() => {
+    captureRequestRef.current = {
+      intent: 'new-elevation', targetCaptureId: null, projectId: captureProjectIdRef.current, epoch: captureRequestEpochRef.current,
+    };
+    return () => { captureRequestEpochRef.current += 1; };
+  }, []);
 
   const patchCapture = (id: string, updates: Partial<SiteCapturePhoto>) => {
     onUpdate({
@@ -165,34 +264,45 @@ const MobileSiteCapture: React.FC<MobileSiteCaptureProps> = ({ state, syncStatus
     patchCapture(activeCapture.id, { referenceWall: { ...activeCapture.referenceWall, ...updates } });
   };
 
-  const capturePhoto = async (file: File) => {
+  const choosePhoto = (intent: CaptureIntent, targetCaptureId = activeCapture?.id ?? null) => {
+    captureRequestRef.current = {
+      intent,
+      targetCaptureId: intent === 'same-elevation' ? targetCaptureId : null,
+      projectId: state.projectId,
+      epoch: captureRequestEpochRef.current,
+    };
+    captureChooserOpenRef.current = true;
+    fileInputRef.current?.click();
+  };
+
+  const capturePhoto = async (file: File, request: CaptureRequest) => {
     setIsProcessing(true);
     const id = `capture_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const assertCurrentRequest = () => {
+      if (request.epoch !== captureRequestEpochRef.current || request.projectId !== captureProjectIdRef.current) {
+        throw new CaptureContextChangedError('Photo discarded because the active project changed.');
+      }
+    };
     try {
+      assertCurrentRequest();
       await navigator.storage?.persist?.().catch(() => false);
       const dimensions = await readImageDimensions(file);
       const workingBlob = await optimizeImageBlob(file, 4096);
       const workingDimensions = await readImageDimensions(workingBlob);
       const thumbnailBlob = await optimizeImageBlob(file, 720);
-      const originalRef = makeSiteCaptureAssetRef(state.projectId, id, 'original');
-      const workingRef = makeSiteCaptureAssetRef(state.projectId, id, 'working');
-      const thumbnailRef = makeSiteCaptureAssetRef(state.projectId, id, 'thumbnail');
+      assertCurrentRequest();
+      const originalRef = makeSiteCaptureAssetRef(request.projectId, id, 'original');
+      const workingRef = makeSiteCaptureAssetRef(request.projectId, id, 'working');
+      const thumbnailRef = makeSiteCaptureAssetRef(request.projectId, id, 'thumbnail');
       await Promise.all([
         putSiteCaptureAsset(originalRef, file),
         putSiteCaptureAsset(workingRef, workingBlob),
         putSiteCaptureAsset(thumbnailRef, thumbnailBlob),
       ]);
+      assertCurrentRequest();
 
-      let location: SiteCapturePhoto['location'];
-      try {
-        const coordinates = await currentCoordinates();
-        location = { ...coordinates };
-        try { location.address = (await reverseGeocode(coordinates, 'device')).address; } catch { /* coordinates remain useful */ }
-      } catch { /* location is optional */ }
-
-      const capture: SiteCapturePhoto = {
+      const photo: SiteCaptureSupportingPhoto = {
         id,
-        label: `Elevation ${captures.length + 1}`,
         originalRef,
         workingRef,
         thumbnailRef,
@@ -204,8 +314,40 @@ const MobileSiteCapture: React.FC<MobileSiteCaptureProps> = ({ state, syncStatus
         workingPixelWidth: workingDimensions.width,
         workingPixelHeight: workingDimensions.height,
         capturedAt: Date.now(),
+      };
+
+      const latestCaptures = capturesRef.current;
+      const targetCapture = latestCaptures.find(capture => capture.id === request.targetCaptureId);
+      if (request.intent === 'same-elevation') {
+        if (!targetCapture) {
+          throw new CaptureContextChangedError('Photo discarded because the selected elevation no longer exists.');
+        }
+        onUpdate({
+          siteCaptures: latestCaptures.map(capture => capture.id === targetCapture.id
+            ? { ...capture, supportingPhotos: [...(capture.supportingPhotos ?? []), photo] }
+            : capture),
+          lastSaved: Date.now(),
+        });
+        setTab('views');
+        notify(`Photo added to ${targetCapture.label}.`, 'success');
+        return;
+      }
+
+      let location: SiteCapturePhoto['location'];
+      try {
+        const coordinates = await currentCoordinates();
+        location = { ...coordinates };
+        try { location.address = (await reverseGeocode(coordinates, 'device')).address; } catch { /* coordinates remain useful */ }
+      } catch { /* location is optional */ }
+      assertCurrentRequest();
+      const commitCaptures = capturesRef.current;
+
+      const capture: SiteCapturePhoto = {
+        ...photo,
+        label: `Elevation ${commitCaptures.length + 1}`,
         notes: '',
         location,
+        supportingPhotos: [],
         referenceWall: {
           wallName: 'Reference wall',
           planeDepthMm: 0,
@@ -215,13 +357,16 @@ const MobileSiteCapture: React.FC<MobileSiteCaptureProps> = ({ state, syncStatus
           notes: '',
         },
       };
-      onUpdate({ siteCaptures: [...captures, capture], lastSaved: Date.now() });
+      onUpdate({ siteCaptures: [...commitCaptures, capture], lastSaved: Date.now() });
       setActiveCaptureId(id);
       setTab('measure');
       notify('Original photo saved. Add the field measurements for this elevation.', 'success');
     } catch (error) {
-      await deleteSiteCaptureAssets(state.projectId, id).catch(() => undefined);
-      notify(error instanceof Error ? error.message : 'The photograph could not be saved.', 'error');
+      await deleteSiteCaptureAssets(request.projectId, id).catch(() => undefined);
+      notify(
+        error instanceof Error ? error.message : 'The photograph could not be saved.',
+        error instanceof CaptureContextChangedError ? 'info' : 'error',
+      );
     } finally {
       setIsProcessing(false);
       if (fileInputRef.current) fileInputRef.current.value = '';
@@ -256,14 +401,14 @@ const MobileSiteCapture: React.FC<MobileSiteCaptureProps> = ({ state, syncStatus
   };
 
   const loadProject = async (projectId: string) => {
+    captureRequestEpochRef.current += 1;
     const project = await StorageService.loadProjectLocal(projectId);
     if (project) onLoadProject(normalizeProjectState(project));
     setProjectPickerOpen(false);
   };
 
   const deleteCapture = async (capture: SiteCapturePhoto) => {
-    if (!window.confirm(`Delete ${capture.label} and its locally stored photographs?`)) return;
-    await StorageService.deleteSiteCapture(state.user?.uid ?? 'guest_unknown', state.projectId, capture.id);
+    if (!window.confirm(`Delete ${capture.label} and all of its photographs?`)) return;
     onUpdate({ siteCaptures: captures.filter(item => item.id !== capture.id), lastSaved: Date.now() });
     if (activeCaptureId === capture.id) setActiveCaptureId(captures.find(item => item.id !== capture.id)?.id ?? null);
   };
@@ -271,24 +416,14 @@ const MobileSiteCapture: React.FC<MobileSiteCaptureProps> = ({ state, syncStatus
   const appendProjectNote = (text: string) => onUpdate({ notes: state.notes ? `${state.notes} ${text}` : text, lastSaved: Date.now() });
   const appendCaptureNote = (text: string) => activeCapture && patchCapture(activeCapture.id, { notes: activeCapture.notes ? `${activeCapture.notes} ${text}` : text });
 
-  const MeasurementField = ({ label, field }: { label: string; field: 'widthMm' | 'heightMm' | 'planeDepthMm' }) => (
-    <label className="block rounded-2xl border border-slate-800 bg-[#111821] p-3">
-      <span className="mb-2 block text-[10px] font-bold uppercase tracking-[0.16em] text-slate-500">{label}</span>
-      <span className="flex items-center gap-2">
-        <input inputMode="decimal" type="number" min="0" step="any" value={displayMeasurement(activeCapture?.referenceWall[field], measurementUnit)} onChange={event => patchReferenceWall({ [field]: event.target.value === '' ? undefined : parseSpokenMeasurementMm(event.target.value, measurementUnit) ?? undefined })} className="h-12 min-w-0 flex-1 rounded-xl border border-slate-700 bg-[#090d12] px-3 font-mono text-lg text-white outline-none focus:border-orange-400" aria-label={`${label} in ${measurementUnit}`} />
-        <span className="w-7 text-xs font-bold text-orange-300">{measurementUnit}</span>
-        <DictationButton label={`Dictate ${label.toLowerCase()}`} onTranscript={text => {
-          const mm = parseSpokenMeasurementMm(text, measurementUnit);
-          if (mm === null) notify(`I could not find a measurement in “${text}”.`, 'warning'); else patchReferenceWall({ [field]: mm });
-        }} />
-      </span>
-    </label>
-  );
-
   const syncLabel = !state.isOnline ? 'Offline — saved on phone' : state.isSyncing ? 'Uploading project' : syncStatus === 'synced' ? 'Cloud saved' : syncStatus === 'error' ? 'Sync needs attention' : 'Saved on phone';
 
   return (
     <div className="fixed inset-0 z-[100] flex flex-col overflow-hidden bg-[#080c11] text-slate-100" data-testid="mobile-site-capture">
+      <input ref={fileInputRef} type="file" accept="image/*" capture="environment" className="hidden" onChange={event => {
+        captureChooserOpenRef.current = false;
+        if (event.target.files?.[0]) void capturePhoto(event.target.files[0], captureRequestRef.current);
+      }} />
       <header className="shrink-0 border-b border-white/10 bg-[#0c1219]/95 px-4 pb-3 pt-[max(0.75rem,env(safe-area-inset-top))] backdrop-blur-xl">
         <div className="flex items-center justify-between gap-3">
           <button onClick={openProjectPicker} className="flex min-w-0 flex-1 items-center gap-2 text-left" aria-label="Choose project">
@@ -309,8 +444,7 @@ const MobileSiteCapture: React.FC<MobileSiteCaptureProps> = ({ state, syncStatus
               <div className="relative aspect-[4/5] max-h-[58vh] bg-[radial-gradient(circle_at_50%_35%,#243140_0,#111821_42%,#080c11_100%)]">
                 {captures.length ? <CaptureImage assetRef={captures[captures.length - 1].thumbnailRef} alt="Latest site capture" className="h-full w-full object-cover opacity-55" /> : <div className="absolute inset-0 grid place-items-center text-center"><div><Camera className="mx-auto h-12 w-12 text-slate-600" /><p className="mt-3 text-sm font-medium text-slate-400">Capture the first elevation</p><p className="mt-1 text-xs text-slate-600">The original file remains untouched</p></div></div>}
                 <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/90 via-black/45 to-transparent px-5 pb-5 pt-16">
-                  <input ref={fileInputRef} type="file" accept="image/*" capture="environment" className="hidden" onChange={event => event.target.files?.[0] && void capturePhoto(event.target.files[0])} />
-                  <button onClick={() => fileInputRef.current?.click()} disabled={isProcessing} className="flex min-h-16 w-full items-center justify-center gap-3 rounded-2xl bg-orange-500 px-5 text-sm font-black uppercase tracking-[0.12em] text-black shadow-[0_14px_38px_rgba(249,115,22,0.3)] transition active:scale-[0.98] disabled:opacity-60" aria-label="Take high-resolution site photo">
+                  <button onClick={() => choosePhoto('new-elevation')} disabled={isProcessing} className="flex min-h-16 w-full items-center justify-center gap-3 rounded-2xl bg-orange-500 px-5 text-sm font-black uppercase tracking-[0.12em] text-black shadow-[0_14px_38px_rgba(249,115,22,0.3)] transition active:scale-[0.98] disabled:opacity-60" aria-label="Take high-resolution site photo">
                     {isProcessing ? <><Loader2 className="h-6 w-6 animate-spin" /> Preserving original…</> : <><Camera className="h-6 w-6" /> Take site photo</>}
                   </button>
                 </div>
@@ -320,6 +454,10 @@ const MobileSiteCapture: React.FC<MobileSiteCaptureProps> = ({ state, syncStatus
               <button onClick={() => setTab('views')} className="min-h-20 rounded-2xl border border-slate-800 bg-[#111821] p-4 text-left"><Images className="h-5 w-5 text-cyan-300" /><span className="mt-2 block text-sm font-semibold">{captures.length} captured</span></button>
               <button onClick={() => setTab('measure')} disabled={!activeCapture} className="min-h-20 rounded-2xl border border-slate-800 bg-[#111821] p-4 text-left disabled:opacity-40"><Ruler className="h-5 w-5 text-orange-300" /><span className="mt-2 block text-sm font-semibold">Field dimensions</span></button>
             </div>
+            {captures.length > 0 && <div className="grid grid-cols-2 gap-3">
+              <button onClick={() => choosePhoto('same-elevation')} disabled={isProcessing || !activeCapture} className="min-h-14 rounded-2xl border border-cyan-400/30 bg-cyan-400/[0.07] px-3 text-xs font-bold text-cyan-200 disabled:opacity-40"><Plus className="mx-auto mb-1 h-4 w-4" />Add to this elevation</button>
+              <button onClick={() => choosePhoto('new-elevation')} disabled={isProcessing} className="min-h-14 rounded-2xl border border-orange-400/30 bg-orange-400/[0.07] px-3 text-xs font-bold text-orange-200 disabled:opacity-40"><Camera className="mx-auto mb-1 h-4 w-4" />Add another elevation</button>
+            </div>}
           </div>
         )}
 
@@ -329,8 +467,10 @@ const MobileSiteCapture: React.FC<MobileSiteCaptureProps> = ({ state, syncStatus
             {!captures.length && <button onClick={() => setTab('capture')} className="min-h-32 w-full rounded-2xl border border-dashed border-slate-700 text-sm text-slate-400">Capture your first elevation</button>}
             {captures.map(capture => (
               <article key={capture.id} onClick={() => setActiveCaptureId(capture.id)} className={`overflow-hidden rounded-2xl border bg-[#111821] ${activeCaptureId === capture.id ? 'border-orange-400/60' : 'border-slate-800'}`}>
-                <div className="flex gap-3 p-3"><CaptureImage assetRef={capture.thumbnailRef} alt={capture.label} className="h-24 w-24 shrink-0 rounded-xl object-cover" /><div className="min-w-0 flex-1"><input value={capture.label} onChange={event => patchCapture(capture.id, { label: event.target.value })} onClick={event => event.stopPropagation()} className="w-full bg-transparent text-sm font-semibold outline-none focus:text-orange-200" aria-label="Elevation label" /><p className="mt-1 font-mono text-[10px] text-slate-500">{capture.pixelWidth} × {capture.pixelHeight} · {(capture.byteSize / 1048576).toFixed(1)} MB</p>{capture.location?.address && <p className="mt-2 line-clamp-2 flex gap-1 text-[10px] leading-relaxed text-slate-400"><MapPin className="mt-0.5 h-3 w-3 shrink-0 text-orange-300" />{capture.location.address}</p>}</div></div>
+                <div className="flex gap-3 p-3"><CaptureImage assetRef={capture.thumbnailRef} alt={capture.label} className="h-24 w-24 shrink-0 rounded-xl object-cover" /><div className="min-w-0 flex-1"><input value={capture.label} onChange={event => patchCapture(capture.id, { label: event.target.value })} onClick={event => event.stopPropagation()} className="w-full bg-transparent text-sm font-semibold outline-none focus:text-orange-200" aria-label="Elevation label" /><p className="mt-1 font-mono text-[10px] text-slate-500">{1 + (capture.supportingPhotos?.length ?? 0)} photo{capture.supportingPhotos?.length ? 's' : ''} · {capture.pixelWidth} × {capture.pixelHeight}</p>{capture.location?.address && <p className="mt-2 line-clamp-2 flex gap-1 text-[10px] leading-relaxed text-slate-400"><MapPin className="mt-0.5 h-3 w-3 shrink-0 text-orange-300" />{capture.location.address}</p>}</div></div>
+                {!!capture.supportingPhotos?.length && <div className="flex gap-2 overflow-x-auto border-t border-white/5 px-3 py-2">{capture.supportingPhotos.map((photo, index) => <CaptureImage key={photo.id} assetRef={photo.thumbnailRef} alt={`${capture.label} supporting photo ${index + 2}`} className="h-16 w-16 shrink-0 rounded-lg object-cover" />)}</div>}
                 <div className="flex border-t border-white/5">
+                  <button onClick={() => { setActiveCaptureId(capture.id); choosePhoto('same-elevation', capture.id); }} className="grid min-h-12 w-12 place-items-center text-cyan-300" aria-label={`Add photo to ${capture.label}`}><Plus className="h-4 w-4" /></button>
                   <button onClick={() => { setActiveCaptureId(capture.id); setTab('measure'); }} className="min-h-12 flex-1 text-xs font-semibold text-slate-300">Measurements</button>
                   <button disabled={!!capture.promotedCanvasId || capture.referenceWall.widthMm === undefined || capture.referenceWall.heightMm === undefined || capture.referenceWall.planeDepthMm === undefined} onClick={() => void onPromoteCapture(capture)} className="flex min-h-12 flex-1 items-center justify-center gap-1 border-l border-white/5 px-2 text-xs font-semibold text-cyan-300 disabled:text-slate-600">{capture.promotedCanvasId ? <><Check className="h-3.5 w-3.5" /> Editor ready</> : capture.referenceWall.widthMm === undefined || capture.referenceWall.heightMm === undefined || capture.referenceWall.planeDepthMm === undefined ? 'Measurements required' : <>Create editor view<ArrowUpRight className="h-3.5 w-3.5" /></>}</button>
                   <button onClick={() => void deleteCapture(capture)} className="grid min-h-12 w-12 place-items-center border-l border-white/5 text-slate-500" aria-label={`Delete ${capture.label}`}><Trash2 className="h-4 w-4" /></button>
@@ -347,11 +487,11 @@ const MobileSiteCapture: React.FC<MobileSiteCaptureProps> = ({ state, syncStatus
               <select value={activeCapture.id} onChange={event => setActiveCaptureId(event.target.value)} className="h-13 w-full rounded-2xl border border-slate-700 bg-[#111821] px-4 text-sm text-white" aria-label="Measurement elevation">{captures.map(capture => <option key={capture.id} value={capture.id}>{capture.label}</option>)}</select>
               <div className="flex rounded-xl border border-slate-800 bg-[#111821] p-1">{(['mm', 'cm', 'm'] as MeasureUnit[]).map(unit => <button key={unit} onClick={() => setMeasurementUnit(unit)} className={`min-h-10 flex-1 rounded-lg text-xs font-bold ${measurementUnit === unit ? 'bg-orange-500 text-black' : 'text-slate-500'}`}>{unit}</button>)}</div>
               <label className="block"><span className="mb-1.5 block text-[10px] font-bold uppercase tracking-[0.16em] text-slate-500">Wall name</span><input value={activeCapture.referenceWall.wallName} onChange={event => patchReferenceWall({ wallName: event.target.value })} className="h-12 w-full rounded-xl border border-slate-700 bg-[#111821] px-3 text-base outline-none focus:border-orange-400" /></label>
-              <MeasurementField label="Known wall width" field="widthMm" />
-              <MeasurementField label="Known wall height" field="heightMm" />
+              <MeasurementField label="Known wall width" valueMm={activeCapture.referenceWall.widthMm} unit={measurementUnit} onChange={valueMm => patchReferenceWall({ widthMm: valueMm })} />
+              <MeasurementField label="Known wall height" valueMm={activeCapture.referenceWall.heightMm} unit={measurementUnit} onChange={valueMm => patchReferenceWall({ heightMm: valueMm })} />
               <section className="rounded-2xl border border-cyan-400/20 bg-cyan-400/[0.06] p-3">
                 <div className="mb-3"><h2 className="text-sm font-semibold text-cyan-100">Plane depth</h2><p className="mt-1 text-[10px] leading-relaxed text-cyan-100/55">Distance from the confirmed reference plane to this wall plane.</p></div>
-                <MeasurementField label="Plane depth / offset" field="planeDepthMm" />
+                <MeasurementField label="Plane depth / offset" valueMm={activeCapture.referenceWall.planeDepthMm} unit={measurementUnit} onChange={valueMm => patchReferenceWall({ planeDepthMm: valueMm })} />
                 <div className="mt-3 grid grid-cols-2 gap-2"><button onClick={() => patchReferenceWall({ planeDepthDirection: 'behind' })} className={`min-h-12 rounded-xl border text-xs font-semibold ${activeCapture.referenceWall.planeDepthDirection === 'behind' ? 'border-cyan-300 bg-cyan-400/15 text-cyan-100' : 'border-slate-700 text-slate-500'}`}>Further back</button><button onClick={() => patchReferenceWall({ planeDepthDirection: 'forward' })} className={`min-h-12 rounded-xl border text-xs font-semibold ${activeCapture.referenceWall.planeDepthDirection === 'forward' ? 'border-cyan-300 bg-cyan-400/15 text-cyan-100' : 'border-slate-700 text-slate-500'}`}>Closer to camera</button></div>
                 <label className="mt-3 block text-[10px] font-bold uppercase tracking-[0.14em] text-slate-500">Confirmed reference plane<input value={activeCapture.referenceWall.referencePlaneName} onChange={event => patchReferenceWall({ referencePlaneName: event.target.value })} className="mt-1.5 h-12 w-full rounded-xl border border-slate-700 bg-[#090d12] px-3 text-base normal-case tracking-normal text-white outline-none focus:border-cyan-400" /></label>
               </section>
@@ -382,7 +522,10 @@ const MobileSiteCapture: React.FC<MobileSiteCaptureProps> = ({ state, syncStatus
             <div className="mx-auto mb-4 h-1 w-12 rounded-full bg-slate-700" />
             <div className="mb-4 flex items-center justify-between gap-3">
               <div><p className="text-[9px] font-bold uppercase tracking-[0.2em] text-orange-300">Project storage</p><h2 className="mt-1 text-lg font-semibold">Saved projects</h2></div>
-              <button onClick={() => void onNewProject().then(() => setProjectPickerOpen(false))} className="flex min-h-11 items-center gap-2 rounded-xl bg-orange-500 px-3 text-xs font-bold text-black"><Plus className="h-4 w-4" />New project</button>
+              <button onClick={() => {
+                captureRequestEpochRef.current += 1;
+                void onNewProject().then(() => setProjectPickerOpen(false));
+              }} className="flex min-h-11 items-center gap-2 rounded-xl bg-orange-500 px-3 text-xs font-bold text-black"><Plus className="h-4 w-4" />New project</button>
             </div>
             <div className="mb-5 rounded-2xl border border-orange-400/25 bg-orange-400/[0.06] p-3">
               <label className="block text-[10px] font-bold uppercase tracking-[0.14em] text-slate-400">

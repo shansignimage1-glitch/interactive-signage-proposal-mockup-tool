@@ -1,7 +1,7 @@
 
 import React, { useState, useCallback, useRef, useEffect, Suspense } from 'react';
 import { auth, googleProvider } from './firebase';
-import { getIdTokenResult, getRedirectResult, onAuthStateChanged, signInWithPopup, signInWithRedirect, signOut } from 'firebase/auth';
+import { getIdTokenResult, getRedirectResult, onAuthStateChanged, signInWithPopup, signOut } from 'firebase/auth';
 
 import ControlsPanel from './components/ControlsPanel';
 import MockupCanvas from './components/MockupCanvas';
@@ -17,6 +17,7 @@ const MobileSiteCapture = React.lazy(() => import('./components/MobileSiteCaptur
 import { MockupState, AppImages, Point, Sign, Dimension, TitleBlock, TitleBlockField, Canvas, Calibration, SignElement, Size, ConnectorStatus, CloudProvider, UserProfile, SiteCapturePhoto } from './types';
 import { getActiveConnector, getPreferredProvider, setConnectorUid, connectors, getConnectorForRef } from './services/driveConnectors';
 import { distance } from './utils/math';
+import { isMissingRedirectStateError } from './utils/authErrors';
 import { measureLine, measureBox, getMmPerPx } from './utils/measure';
 import { normalizeProjectState } from './utils/projectMigration';
 import CalibrationWizard, { CalibrationDraft } from './components/CalibrationWizard';
@@ -268,18 +269,15 @@ const App: React.FC = () => {
       setIsAuthLoading(false);
   }, [startSession]);
 
-  const prefersRedirectSignIn = () => {
-    const ua = navigator.userAgent || '';
-    const iOS = /iPad|iPhone|iPod/.test(ua) ||
-      (navigator.maxTouchPoints > 1 && /Macintosh/.test(ua));
-    const safari = /Safari/.test(ua) && !/Chrome|CriOS|FxiOS|Edg/.test(ua);
-    return iOS || safari;
-  };
-
-  // Complete the same-origin redirect started on Safari/iPad. In production,
-  // Vercel transparently proxies the Firebase helper under /__/auth/*.
+  // Complete redirects created by older app versions. Missing redirect state is
+  // recoverable: Safari may partition or clear the temporary session storage.
   useEffect(() => {
     getRedirectResult(auth).catch((err: any) => {
+      if (isMissingRedirectStateError(err)) {
+        reportWarning('auth-redirect', 'Discarded stale redirect result because browser state was unavailable');
+        setIsAuthLoading(false);
+        return;
+      }
       setAuthError(err?.message ?? 'Sign-in failed after returning from Google.');
       setIsAuthLoading(false);
     });
@@ -429,15 +427,6 @@ const App: React.FC = () => {
 
   const handleLogin = async () => {
     setAuthError(null);
-    if (prefersRedirectSignIn()) {
-      try {
-        await signInWithRedirect(auth, googleProvider);
-      } catch (err: any) {
-        setAuthError(err?.message ?? 'Sign-in failed. Please try again.');
-      }
-      return;
-    }
-
     try {
       await signInWithPopup(auth, googleProvider);
       // onAuthStateChanged above handles the rest
@@ -445,11 +434,7 @@ const App: React.FC = () => {
       const code = err?.code ?? '';
       if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') return;
       if (code === 'auth/popup-blocked' || code === 'auth/operation-not-supported-in-this-environment') {
-        try {
-          await signInWithRedirect(auth, googleProvider);
-        } catch (redirectError: any) {
-          setAuthError(redirectError?.message ?? 'Sign-in failed. Please try again.');
-        }
+        setAuthError('Google sign-in was blocked. Allow pop-ups for this site, then tap Sign in with Google again.');
       } else {
         setAuthError(err?.message ?? 'Sign-in failed. Please try again.');
       }
@@ -1274,12 +1259,12 @@ const App: React.FC = () => {
           <img src={state.user.photoURL || DEFAULT_AVATAR} className="h-9 w-9 rounded-full border border-gray-600 lg:h-8 lg:w-8" alt="User" />
           <span className="text-xs font-medium text-gray-300 hidden md:block">{state.user.displayName}</span>
           {!state.user.uid.startsWith('guest_') && (
-              <button onClick={() => setShowDriveSettings(true)} className={`grid h-10 w-10 place-items-center rounded-full transition-colors ${driveStatus === 'connected' ? 'text-green-400 hover:bg-green-500/20' : driveStatus === 'expired' ? 'text-amber-400 hover:bg-amber-500/20' : 'text-gray-400 hover:bg-blue-500/20 hover:text-blue-400'}`} title={driveStatus === 'connected' ? 'Cloud drive connected' : 'Connect your cloud drive'} aria-label={driveStatus === 'connected' ? 'Cloud drive connected' : 'Connect your cloud drive'}>
+              <button onClick={() => setShowDriveSettings(true)} className={`grid h-11 w-11 place-items-center rounded-full transition-colors ${driveStatus === 'connected' ? 'text-green-400 hover:bg-green-500/20' : driveStatus === 'expired' ? 'text-amber-400 hover:bg-amber-500/20' : 'text-gray-400 hover:bg-blue-500/20 hover:text-blue-400'}`} title={driveStatus === 'connected' ? 'Cloud drive connected' : 'Connect your cloud drive'} aria-label={driveStatus === 'connected' ? 'Cloud drive connected' : 'Connect your cloud drive'}>
                   <HardDrive className="w-4 h-4" />
               </button>
           )}
-          {!state.user.uid.startsWith('guest_') && <button onClick={() => setShowAccountSettings(true)} className="grid h-10 w-10 place-items-center rounded-full text-gray-400 hover:bg-gray-700 hover:text-white" title="Account and data" aria-label="Account and data"><Settings className="w-4 h-4" /></button>}
-          <button onClick={handleLogout} className="grid h-10 w-10 place-items-center rounded-full text-gray-400 transition-colors hover:bg-red-500/20 hover:text-red-400" title="Sign Out" aria-label="Sign Out">
+          {!state.user.uid.startsWith('guest_') && <button onClick={() => setShowAccountSettings(true)} className="grid h-11 w-11 place-items-center rounded-full text-gray-400 hover:bg-gray-700 hover:text-white" title="Account and data" aria-label="Account and data"><Settings className="w-4 h-4" /></button>}
+          <button onClick={handleLogout} className="grid h-11 w-11 place-items-center rounded-full text-gray-400 transition-colors hover:bg-red-500/20 hover:text-red-400" title="Sign Out" aria-label="Sign Out">
               <LogOut className="w-4 h-4" />
           </button>
       </div>
@@ -1395,7 +1380,7 @@ const App: React.FC = () => {
          <button
            type="button"
            onClick={() => setShowProposal3D(true)}
-           className="absolute left-3 top-[max(4.5rem,calc(env(safe-area-inset-top)+4.5rem))] z-40 flex h-10 items-center gap-2 rounded-xl border border-cyan-400/25 bg-gray-950/85 px-3 text-[11px] font-bold uppercase tracking-[0.12em] text-cyan-200 shadow-xl backdrop-blur transition hover:border-cyan-300/50 hover:bg-cyan-400/10 lg:left-4 lg:top-4"
+           className="absolute left-3 top-[max(4.5rem,calc(env(safe-area-inset-top)+4.5rem))] z-40 flex h-11 items-center gap-2 rounded-xl border border-cyan-400/25 bg-gray-950/85 px-3 text-[11px] font-bold uppercase tracking-[0.12em] text-cyan-200 shadow-xl backdrop-blur transition hover:border-cyan-300/50 hover:bg-cyan-400/10 lg:left-4 lg:top-4"
            aria-label="Open 3D proposal viewer"
            title="Open rotatable 3D proposal"
          >

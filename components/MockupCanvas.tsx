@@ -1761,7 +1761,6 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
       }
       context.setTransform(1, 0, 0, 1, 0, 0);
       context.clearRect(0, 0, target.width, target.height);
-      context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
       context.imageSmoothingEnabled = true;
       context.imageSmoothingQuality = 'high';
 
@@ -1776,6 +1775,17 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
       const clippedHeight = clippedBottom - clippedTop;
       if (clippedWidth <= 0 || clippedHeight <= 0) return;
 
+      // The loupe is circular, but its backing canvas is rectangular. Clip the
+      // rendered sign layer as well so pixels outside the visible lens cannot
+      // leak into the transparent corner samples or create a square halo.
+      context.save();
+      context.beginPath();
+      // Leave a small transparent margin around the lens. The outer HTML
+      // element supplies the visible white/cyan rim, while the canvas contains
+      // only the magnified sign pixels.
+      context.arc(loupeCenter * pixelRatio, loupeCenter * pixelRatio, (loupeCenter - 6) * pixelRatio, 0, Math.PI * 2);
+      context.clip();
+
       const backingScaleX = source.width / Math.max(1, images.backgroundSize.width);
       const backingScaleY = source.height / Math.max(1, images.backgroundSize.height);
 
@@ -1785,11 +1795,12 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
         clippedTop * backingScaleY,
         clippedWidth * backingScaleX,
         clippedHeight * backingScaleY,
-        (clippedLeft - sourceLeft) * loupeScale,
-        (clippedTop - sourceTop) * loupeScale,
-        clippedWidth * loupeScale,
-        clippedHeight * loupeScale,
+        (clippedLeft - sourceLeft) * loupeScale * pixelRatio,
+        (clippedTop - sourceTop) * loupeScale * pixelRatio,
+        clippedWidth * loupeScale * pixelRatio,
+        clippedHeight * loupeScale * pixelRatio,
       );
+      context.restore();
     });
 
     return () => window.cancelAnimationFrame(frame);
@@ -1819,9 +1830,9 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
     >
       {/* Zoom Controls — offset below the user profile pill rendered by App at top-right */}
       <div data-canvas-ui className="absolute top-20 right-4 flex flex-col gap-2 z-40">
-        <button disabled={viewLocked} aria-label="Zoom in" title={viewLocked ? 'Unlock the view to zoom' : 'Zoom in'} onClick={() => zoomFromCenter(1.2)} className="p-3 md:p-2 bg-gray-800 enabled:hover:bg-gray-700 text-white rounded shadow border border-gray-600 disabled:cursor-not-allowed disabled:opacity-35"><ZoomIn className="w-5 h-5" /></button>
-        <button disabled={viewLocked} aria-label="Zoom out" title={viewLocked ? 'Unlock the view to zoom' : 'Zoom out'} onClick={() => zoomFromCenter(1 / 1.2)} className="p-3 md:p-2 bg-gray-800 enabled:hover:bg-gray-700 text-white rounded shadow border border-gray-600 disabled:cursor-not-allowed disabled:opacity-35"><ZoomOut className="w-5 h-5" /></button>
-        <button disabled={viewLocked} aria-label="Fit canvas to screen" title={viewLocked ? 'Unlock the view to fit the canvas' : 'Fit canvas to screen'} onClick={fitToContainer} className="p-3 md:p-2 bg-gray-800 enabled:hover:bg-gray-700 text-white rounded shadow border border-gray-600 disabled:cursor-not-allowed disabled:opacity-35"><Maximize className="w-5 h-5" /></button>
+        <button disabled={viewLocked} aria-label="Zoom in" title={viewLocked ? 'Unlock the view to zoom' : 'Zoom in'} onClick={() => zoomFromCenter(1.2)} className="grid h-11 w-11 place-items-center rounded border border-gray-600 bg-gray-800 text-white shadow enabled:hover:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-35"><ZoomIn className="w-5 h-5" /></button>
+        <button disabled={viewLocked} aria-label="Zoom out" title={viewLocked ? 'Unlock the view to zoom' : 'Zoom out'} onClick={() => zoomFromCenter(1 / 1.2)} className="grid h-11 w-11 place-items-center rounded border border-gray-600 bg-gray-800 text-white shadow enabled:hover:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-35"><ZoomOut className="w-5 h-5" /></button>
+        <button disabled={viewLocked} aria-label="Fit canvas to screen" title={viewLocked ? 'Unlock the view to fit the canvas' : 'Fit canvas to screen'} onClick={fitToContainer} className="grid h-11 w-11 place-items-center rounded border border-gray-600 bg-gray-800 text-white shadow enabled:hover:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-35"><Maximize className="w-5 h-5" /></button>
         <button
           type="button"
           data-testid="view-lock-toggle"
@@ -1829,7 +1840,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
           aria-pressed={viewLocked}
           title={viewLocked ? 'Unlock pan and zoom' : 'Lock pan and zoom'}
           onClick={() => onViewLockedChange(!viewLocked)}
-          className={`p-3 md:p-2 rounded shadow border transition-colors ${viewLocked ? 'border-amber-300 bg-amber-500 text-gray-950 hover:bg-amber-400' : 'border-gray-600 bg-gray-800 text-white hover:bg-gray-700'}`}
+          className={`grid h-11 w-11 place-items-center rounded border shadow transition-colors ${viewLocked ? 'border-amber-300 bg-amber-500 text-gray-950 hover:bg-amber-400' : 'border-gray-600 bg-gray-800 text-white hover:bg-gray-700'}`}
         >
           {viewLocked ? <Lock className="h-5 w-5" /> : <Unlock className="h-5 w-5" />}
         </button>

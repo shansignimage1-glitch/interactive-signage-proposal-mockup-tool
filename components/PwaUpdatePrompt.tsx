@@ -31,7 +31,7 @@ export default function PwaUpdatePrompt() {
   return (
     <aside
       aria-live="polite"
-      className="fixed inset-x-3 bottom-3 z-[400] mx-auto max-w-xl rounded-xl border border-blue-400/60 bg-slate-950 p-4 text-white shadow-2xl sm:bottom-5"
+      className="pointer-events-none fixed inset-x-3 bottom-3 z-[400] mx-auto max-w-xl rounded-xl border border-blue-400/60 bg-slate-950 p-4 text-white shadow-2xl sm:bottom-5"
     >
       {needRefresh ? (
         <>
@@ -45,7 +45,7 @@ export default function PwaUpdatePrompt() {
               type="button"
               onClick={() => setNeedRefresh(false)}
               disabled={isUpdating}
-              className="min-h-11 rounded-lg border border-slate-600 px-4 text-sm font-medium hover:bg-slate-800 disabled:opacity-50"
+              className="pointer-events-auto min-h-11 rounded-lg border border-slate-600 px-4 text-sm font-medium hover:bg-slate-800 disabled:opacity-50"
             >
               Later
             </button>
@@ -53,7 +53,7 @@ export default function PwaUpdatePrompt() {
               type="button"
               onClick={applyUpdate}
               disabled={isUpdating}
-              className="min-h-11 rounded-lg bg-blue-600 px-4 text-sm font-semibold hover:bg-blue-500 disabled:opacity-60"
+              className="pointer-events-auto min-h-11 rounded-lg bg-blue-600 px-4 text-sm font-semibold hover:bg-blue-500 disabled:opacity-60"
             >
               {isUpdating ? 'Updating…' : 'Update now'}
             </button>
@@ -65,7 +65,7 @@ export default function PwaUpdatePrompt() {
           <button
             type="button"
             onClick={() => setOfflineReady(false)}
-            className="min-h-11 rounded-lg border border-slate-600 px-4 text-sm font-medium hover:bg-slate-800"
+            className="pointer-events-auto min-h-11 rounded-lg border border-slate-600 px-4 text-sm font-medium hover:bg-slate-800"
           >
             Dismiss
           </button>

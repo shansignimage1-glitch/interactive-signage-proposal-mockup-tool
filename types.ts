@@ -264,6 +264,21 @@ export interface ReferenceWallFieldMeasurement {
   notes: string;
 }
 
+export interface SiteCaptureSupportingPhoto {
+  id: string;
+  originalRef: string;
+  workingRef: string;
+  thumbnailRef: string;
+  fileName: string;
+  mimeType: string;
+  byteSize: number;
+  pixelWidth: number;
+  pixelHeight: number;
+  workingPixelWidth: number;
+  workingPixelHeight: number;
+  capturedAt: number;
+}
+
 export interface SiteCapturePhoto {
   id: string;
   label: string;
@@ -285,6 +300,7 @@ export interface SiteCapturePhoto {
     accuracy?: number;
     address?: string;
   };
+  supportingPhotos?: SiteCaptureSupportingPhoto[];
   referenceWall: ReferenceWallFieldMeasurement;
   promotedCanvasId?: string;
 }

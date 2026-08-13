@@ -877,7 +877,7 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
                              type="text" 
                              value={activeCanvas.name} 
                              onChange={(e) => updateActiveCanvas({ name: e.target.value })}
-                             className="w-full bg-transparent border-b border-gray-700 text-xs text-gray-400 focus:text-white focus:border-blue-500 outline-none pb-1"
+                             className="view-name-input w-full rounded-sm border-b border-gray-700 bg-transparent pb-1 text-xs text-gray-400 outline-none focus:border-blue-400 focus:text-white"
                              placeholder="View Name"
                         />
                    </div>
@@ -1604,7 +1604,7 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
           )}
         </div>
 
-        <div className={`${mobilePanelExpanded ? 'block' : 'hidden'} flex-shrink-0 border-t border-gray-700 bg-gray-800 px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-3 lg:block lg:px-3 lg:py-3`}>
+        <div className={`${mobilePanelExpanded ? 'block' : 'hidden'} flex-shrink-0 border-t border-gray-700 bg-gray-800 px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-3 lg:block lg:px-3 lg:pb-8 lg:pt-3`}>
           <div className="grid grid-cols-2 gap-2">
           <button
             onClick={() => onDownload('device')}

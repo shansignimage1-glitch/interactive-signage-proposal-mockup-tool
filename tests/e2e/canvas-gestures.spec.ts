@@ -740,18 +740,19 @@ test('background upload retains its full source dimensions for editing', async (
   const loupeBoundary = () => page.getByTestId('precision-loupe-sign-layer').evaluate(node => {
     const canvas = node as HTMLCanvasElement;
     const context = canvas.getContext('2d');
-    if (!context) return { outside: 0, inside: 0 };
+    if (!context) return { corner: 0, center: 0 };
+    // The canvas backing store follows devicePixelRatio. Verify the rendered
+    // sign stays inside the circular lens, not an assumed artwork boundary at
+    // the crosshair (that boundary moves as the source image is resized).
+    const edgeInset = Math.max(2, Math.floor(canvas.width * 0.02));
     const center = Math.floor(canvas.width / 2);
-    // Sample immediately across the corner/crosshair intersection. A wider
-    // sample would miss a few-pixel border-box offset in the loupe layers.
-    const offset = Math.max(2, Math.floor(canvas.width * 0.025));
     return {
-      outside: context.getImageData(center - offset, center - offset, 1, 1).data[3],
-      inside: context.getImageData(center + offset, center + offset, 1, 1).data[3],
+      corner: context.getImageData(edgeInset, edgeInset, 1, 1).data[3],
+      center: context.getImageData(center, center, 1, 1).data[3],
     };
   });
-  await expect.poll(async () => (await loupeBoundary()).outside).toBe(0);
-  await expect.poll(async () => (await loupeBoundary()).inside).toBeGreaterThan(200);
+  await expect.poll(async () => (await loupeBoundary()).corner).toBe(0);
+  await expect.poll(async () => (await loupeBoundary()).center).toBeGreaterThan(200);
   await page.mouse.up();
 });
 

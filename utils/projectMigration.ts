@@ -66,6 +66,7 @@ export const normalizeProjectState = (input: MockupState): MockupState => {
   const siteCaptures = Array.isArray(input.siteCaptures) ? input.siteCaptures.map(capture => ({
     ...capture,
     notes: capture.notes ?? '',
+    supportingPhotos: Array.isArray(capture.supportingPhotos) ? capture.supportingPhotos : [],
     workingPixelWidth: capture.workingPixelWidth ?? capture.pixelWidth,
     workingPixelHeight: capture.workingPixelHeight ?? capture.pixelHeight,
     referenceWall: {
