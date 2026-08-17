@@ -16,6 +16,8 @@ const mocks = vi.hoisted(() => {
   return {
     transactionSet, getDownloadURL, uploadBytes, listAll, deleteObject, uploadImage, ensureReady, connector,
     remoteExists: false, remoteRevision: 0,
+    cloudDocs: [] as Array<{ data: () => any }>,
+    cloudProject: null as any,
   };
 });
 
@@ -26,8 +28,8 @@ vi.mock('firebase/firestore', () => ({
   query: vi.fn((...args) => args[0]),
   limit: vi.fn((value) => value),
   doc: vi.fn((_db, collectionName, id) => ({ collectionName, id })),
-  getDoc: vi.fn(),
-  getDocs: vi.fn(async () => ({ docs: [], empty: true })),
+  getDoc: vi.fn(async () => ({ exists: () => !!mocks.cloudProject, data: () => mocks.cloudProject })),
+  getDocs: vi.fn(async () => ({ docs: mocks.cloudDocs, empty: mocks.cloudDocs.length === 0 })),
   deleteDoc: vi.fn(),
   setDoc: vi.fn(),
   runTransaction: vi.fn(async (_db, callback) => callback({
@@ -69,6 +71,8 @@ describe('StorageService save/load', () => {
     mocks.ensureReady.mockResolvedValue(true);
     mocks.remoteExists = false;
     mocks.remoteRevision = 0;
+    mocks.cloudDocs = [];
+    mocks.cloudProject = null;
     Object.defineProperty(navigator, 'onLine', { configurable: true, value: true });
   });
 
@@ -126,6 +130,29 @@ describe('StorageService save/load', () => {
     expect(mocks.transactionSet).not.toHaveBeenCalled();
     expect(mocks.uploadImage).not.toHaveBeenCalled();
     await StorageService.deleteProjectLocal(project.projectId);
+  });
+
+  it('merges cloud projects into the cross-device project list', async () => {
+    const local = makeProject({ projectId: `local-list-${Date.now()}`, projectName: 'Desktop Draft', lastSaved: 100 });
+    await StorageService.saveProjectLocal(local);
+    mocks.cloudDocs = [{ data: () => ({ projectId: 'phone-project', projectName: 'Phone Survey', updatedAt: 200, canvases: [{}] }) }];
+
+    const projects = await StorageService.listProjects('user-1');
+
+    expect(projects.map(project => project.name)).toEqual(['Phone Survey', 'Desktop Draft']);
+    await StorageService.deleteProjectLocal(local.projectId);
+  });
+
+  it('downloads a cloud-only phone project and caches it on desktop', async () => {
+    const phoneProject = makeProject({ projectId: `phone-${Date.now()}`, projectName: 'Phone Survey', lastSaved: 100 });
+    mocks.cloudProject = { ...phoneProject, userId: 'user-1', updatedAt: 250 };
+
+    const loaded = await StorageService.loadProject('user-1', phoneProject.projectId);
+
+    expect(loaded?.projectName).toBe('Phone Survey');
+    expect(loaded?.lastSaved).toBe(250);
+    expect((await StorageService.loadProjectLocal(phoneProject.projectId))?.projectName).toBe('Phone Survey');
+    await StorageService.deleteProjectLocal(phoneProject.projectId);
   });
 
   it('uploads primary and supporting site-capture photos and stores only cloud references in Firestore', async () => {

@@ -542,11 +542,11 @@ const App: React.FC = () => {
 
   // Trigger Sync
   const triggerBackendSync = useCallback((currentState: MockupState) => {
-      if (!currentState.user) return;
+      if (!currentState.user) return Promise.resolve<'error'>('error');
 
       updateState({ isSyncing: true });
       
-      StorageService.saveProject(currentState.user.uid, currentState).then((result) => {
+      return StorageService.saveProject(currentState.user.uid, currentState).then((result) => {
           updateState({ isSyncing: false, lastSaved: Date.now() });
           
           if (result === 'local') {
@@ -565,10 +565,12 @@ const App: React.FC = () => {
               setSyncStatus('error');
               reportWarning('sync', 'Project save returned an error', { projectId: currentState.projectId });
           }
+          return result;
       }).catch(error => {
           updateState({ isSyncing: false });
           setSyncStatus('error');
           reportError('sync', error, { projectId: currentState.projectId });
+          return 'error' as const;
       });
   }, [updateState]);
 
@@ -1173,7 +1175,7 @@ const App: React.FC = () => {
 
       await StorageService.saveProjectLocal(newState, thumbnail);
       // Also trigger cloud sync if needed
-      triggerBackendSync(newState);
+      await triggerBackendSync(newState);
   };
 
   const handleProjectRename = async (projectId: string, name: string) => {

@@ -510,7 +510,7 @@ const MobileSiteCapture: React.FC<MobileSiteCaptureProps> = ({ state, syncStatus
   const openProjectPicker = async () => {
     setProjectNameDraft(state.projectName);
     setSelectedProjectId(state.projectId);
-    setProjects((await StorageService.listProjectsLocal()).sort((a, b) => b.lastModified - a.lastModified));
+    setProjects(await StorageService.listProjects(state.user?.uid ?? 'guest_unknown'));
     setProjectPickerOpen(true);
   };
 
@@ -525,7 +525,7 @@ const MobileSiteCapture: React.FC<MobileSiteCaptureProps> = ({ state, syncStatus
       await onSaveProject(name);
       (document.activeElement as HTMLElement | null)?.blur();
       setSelectedProjectId(state.projectId);
-      setProjects((await StorageService.listProjectsLocal()).sort((a, b) => b.lastModified - a.lastModified));
+      setProjects(await StorageService.listProjects(state.user?.uid ?? 'guest_unknown'));
       notify(`${name} saved.`, 'success');
     } catch (error) {
       notify(error instanceof Error ? error.message : 'The project could not be saved.', 'error');
@@ -536,7 +536,7 @@ const MobileSiteCapture: React.FC<MobileSiteCaptureProps> = ({ state, syncStatus
 
   const loadProject = async (projectId: string) => {
     captureRequestEpochRef.current += 1;
-    const project = await StorageService.loadProjectLocal(projectId);
+    const project = await StorageService.loadProject(state.user?.uid ?? 'guest_unknown', projectId);
     if (project) onLoadProject(normalizeProjectState(project));
     setProjectPickerOpen(false);
   };
@@ -705,7 +705,7 @@ const MobileSiteCapture: React.FC<MobileSiteCaptureProps> = ({ state, syncStatus
                 {isSavingProject ? <><Loader2 className="h-5 w-5 animate-spin" />Saving project…</> : <><Save className="h-5 w-5" />Save project</>}
               </button>
             </div>
-            <div className="mb-2 flex items-center justify-between"><h3 className="text-[10px] font-bold uppercase tracking-[0.16em] text-slate-500">Projects on this device</h3><span className="font-mono text-[10px] text-slate-600">{projects.length}</span></div>
+            <div className="mb-2 flex items-center justify-between"><h3 className="text-[10px] font-bold uppercase tracking-[0.16em] text-slate-500">{state.user?.uid.startsWith('guest_') ? 'Projects on this device' : 'Projects on your account'}</h3><span className="font-mono text-[10px] text-slate-600">{projects.length}</span></div>
             <div className="space-y-2">
               {projects.map(project => (
                 <button key={project.id} onClick={() => void loadProject(project.id)} aria-current={project.id === selectedProjectId ? 'true' : undefined} data-testid={project.id === selectedProjectId ? 'current-saved-project' : undefined} className={`flex min-h-16 w-full items-center justify-between rounded-2xl border p-3 text-left ${project.id === selectedProjectId ? 'border-orange-400/60 bg-orange-400/10' : 'border-slate-800 bg-[#0b1016]'}`}>

@@ -39,7 +39,7 @@ const ProjectManager: React.FC<ProjectManagerProps> = ({ isOpen, onClose, curren
     const loadProjects = async () => {
         setIsLoading(true);
         try {
-            const list = await StorageService.listProjectsLocal();
+            const list = await StorageService.listProjects(currentState.user?.uid ?? 'guest_unknown');
             // Sort by newest first
             setProjects(list.sort((a, b) => b.lastModified - a.lastModified));
         } catch (e) {
@@ -69,7 +69,7 @@ const ProjectManager: React.FC<ProjectManagerProps> = ({ isOpen, onClose, curren
     const handleLoad = async (id: string) => {
         setIsLoading(true);
         try {
-            const project = await StorageService.loadProjectLocal(id);
+            const project = await StorageService.loadProject(currentState.user?.uid ?? 'guest_unknown', id);
             if (project) {
                 onLoadProject(project);
                 onClose();

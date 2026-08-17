@@ -293,6 +293,30 @@ export const StorageService = {
       return await idbOperation<ProjectMetadata[]>(STORE_METADATA, 'readonly', (store) => store.getAll());
   },
 
+  /** Returns one cross-device project list, keeping the newest metadata per id. */
+  listProjects: async (userId: string): Promise<ProjectMetadata[]> => {
+      const local = await StorageService.listProjectsLocal();
+      if (userId.startsWith('guest_')) return local.sort((a, b) => b.lastModified - a.lastModified);
+      const cloud = await StorageService.listProjectsCloud(userId);
+      const byId = new Map<string, ProjectMetadata>();
+      for (const project of [...local, ...cloud]) {
+          const existing = byId.get(project.id);
+          if (!existing || project.lastModified > existing.lastModified) byId.set(project.id, project);
+      }
+      return [...byId.values()].sort((a, b) => b.lastModified - a.lastModified);
+  },
+
+  /** Loads the newest available copy and caches cloud-only projects on this device. */
+  loadProject: async (userId: string, projectId: string): Promise<MockupState | null> => {
+      const local = await StorageService.loadProjectLocal(projectId);
+      if (userId.startsWith('guest_')) return local;
+      const cloud = await StorageService.loadProjectCloud(userId, projectId);
+      if (!cloud) return local;
+      if (local && local.lastSaved > cloud.lastSaved) return local;
+      await StorageService.saveProjectLocal(cloud);
+      return cloud;
+  },
+
   deleteProjectLocal: async (projectId: string): Promise<void> => {
       await idbOperation(STORE_PROJECTS, 'readwrite', (store) => store.delete(projectId));
       await idbOperation(STORE_METADATA, 'readwrite', (store) => store.delete(projectId));
@@ -573,6 +597,7 @@ export const StorageService = {
           const data = snapshot.data() as MockupState & { userId: string; updatedAt: number };
           // Remove Firestore-only fields before returning
           const { userId: _u, updatedAt: _t, ...projectState } = data;
+          projectState.lastSaved = Math.max(projectState.lastSaved ?? 0, _t ?? 0);
           knownCloudRevisions.set(revisionKey(userId, projectId), projectState.cloudRevision ?? 0);
 
           // Materialize any cloud-drive refs into displayable data URIs
