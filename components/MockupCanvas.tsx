@@ -1,6 +1,6 @@
 
 import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react';
-import { AppImages, MockupState, Point, Sign, Dimension, TitleBlock, Revision, PaperSize, Orientation, Calibration } from '../types';
+import { AppImages, MockupState, Point, Sign, Dimension, TitleBlock, Revision, PaperSize, Orientation, Calibration, CanvasAnnotation } from '../types';
 import { hexToRgb, isPointInPolygon, distance, computeHomography } from '../utils/math';
 import { formatLength, measureLine, measureBox, measureSignSizeMm, moveSignOnPlane, scaleSignOnPlane } from '../utils/measure';
 import { buildElementMask } from '../utils/elementDetection';
@@ -23,6 +23,7 @@ interface MockupCanvasProps {
   activeSignId: string | null;
   dimensions: Dimension[];
   activeDimensionId: string | null;
+  annotations: CanvasAnnotation[];
   
   state: MockupState; // Kept for global settings like showDimensions, isNightMode, etc.
   titleBlock: TitleBlock; // Passed explicitly to allow injection of sheet data
@@ -31,6 +32,7 @@ interface MockupCanvasProps {
   viewLocked: boolean;
   onViewLockedChange: (locked: boolean) => void;
   onDrawComplete: (start: Point, end: Point, variant: 'linear' | 'box') => void;
+  onAnnotationComplete: (points: Point[]) => void;
   calibration: Calibration | null;
   calibrationDraft: { method: 'line' | 'plane'; points: Point[]; editable: boolean } | null;
   onCalibrationDraftPointsChange: (points: Point[]) => void;
@@ -141,12 +143,14 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
     activeSignId,
     dimensions,
     activeDimensionId,
+    annotations,
     state,
     titleBlock,
     toolMode,
     viewLocked,
     onViewLockedChange,
     onDrawComplete,
+    onAnnotationComplete,
     calibration,
     calibrationDraft,
     onCalibrationDraftPointsChange,
@@ -204,6 +208,8 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
     startClient: Point;
     completesOnUp: boolean;
   } | null>(null);
+  const annotationPointerRef = useRef<number | null>(null);
+  const annotationPointsRef = useRef<Point[]>([]);
   const [calibrationDragIndex, setCalibrationDragIndex] = useState<number | null>(null);
   const precisionPointerRef = useRef<{ pointerId: number; kind: PrecisionLoupeKind } | null>(null);
   const [precisionLoupe, setPrecisionLoupe] = useState<PrecisionLoupeState | null>(null);
@@ -442,6 +448,8 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
      drawingStart.current = null;
      drawingCurrent.current = null;
      drawingTouchRef.current = null;
+     annotationPointerRef.current = null;
+     annotationPointsRef.current = [];
      clearPrecisionLoupe();
   }, [clearPrecisionLoupe, toolMode]);
 
@@ -514,6 +522,8 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
       drawingCurrent.current = null;
     }
     drawingTouchRef.current = null;
+    annotationPointerRef.current = null;
+    annotationPointsRef.current = [];
     setCalibrationDragIndex(null);
     clearPrecisionLoupe();
     setIsNavigating(true);
@@ -1295,6 +1305,15 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
         }
       }
       const pos = getMousePos(e);
+      if (toolMode === 'annotate' && e.button === 0) {
+        e.preventDefault(); e.stopPropagation();
+        try { e.currentTarget.setPointerCapture(e.pointerId); } catch { /* best effort */ }
+        annotationPointerRef.current = e.pointerId;
+        annotationPointsRef.current = [pos];
+        setTick(value => value + 1);
+        setActiveSign(null); setActiveDimension('');
+        return;
+      }
       if (toolMode === 'calibrate' || toolMode === 'calibrate_plane') {
         e.preventDefault(); e.stopPropagation();
         const expectedMethod = toolMode === 'calibrate_plane' ? 'plane' : 'line';
@@ -1478,6 +1497,15 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
     }
 
     const pos = getMousePos(e);
+    if (annotationPointerRef.current === e.pointerId && toolMode === 'annotate') {
+        const points = annotationPointsRef.current;
+        const previous = points[points.length - 1];
+        if (!previous || distance(previous, pos) >= 1.5 / Math.max(baseScaleRef.current * viewRef.current.scale, 0.01)) {
+            annotationPointsRef.current = [...points, pos];
+            setTick(t => t + 1);
+        }
+        return;
+    }
     if (isDrawing && drawingStart.current) {
         drawingCurrent.current = pos;
         setTick(t => t + 1);
@@ -1487,6 +1515,16 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
   };
 
   const handlePointerUp = (e: React.PointerEvent) => {
+    if (annotationPointerRef.current === e.pointerId) {
+        const points = annotationPointsRef.current;
+        if (points.length > 1) onAnnotationComplete(points);
+        annotationPointerRef.current = null;
+        annotationPointsRef.current = [];
+        setTick(t => t + 1);
+        if (e.currentTarget.hasPointerCapture(e.pointerId)) e.currentTarget.releasePointerCapture(e.pointerId);
+        e.stopPropagation();
+        return;
+    }
     if (activeHandleRef.current !== null && activeEditPointerRef.current !== null && activeEditPointerRef.current !== e.pointerId) return;
 
     // Capture release and cleanup
@@ -1533,6 +1571,11 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
   };
 
   const handleCanvasPointerCancel = (e: React.PointerEvent) => {
+    if (annotationPointerRef.current === e.pointerId) {
+        annotationPointerRef.current = null;
+        annotationPointsRef.current = [];
+        setTick(t => t + 1);
+    }
     if (dragSignIdRef.current) {
         onSignPlacementEnd(signPlacementChangedRef.current);
         signPlacementChangedRef.current = false;
@@ -1826,7 +1869,7 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
       onPointerUp={handleContainerPointerUp}
       onPointerCancel={handleContainerPointerUp}
       onContextMenu={(e) => e.preventDefault()}
-      style={{ touchAction: 'none', cursor: isNavigating ? 'grabbing' : toolMode === 'pan' ? 'grab' : (toolMode === 'draw_line' || toolMode === 'draw_box' || toolMode === 'calibrate' || toolMode === 'calibrate_plane') ? 'crosshair' : 'default', backgroundColor: isSheetView ? '#333' : '#0a0a0a' }}
+      style={{ touchAction: 'none', cursor: isNavigating ? 'grabbing' : toolMode === 'pan' ? 'grab' : (toolMode === 'draw_line' || toolMode === 'draw_box' || toolMode === 'annotate' || toolMode === 'calibrate' || toolMode === 'calibrate_plane') ? 'crosshair' : 'default', backgroundColor: isSheetView ? '#333' : '#0a0a0a' }}
     >
       {/* Zoom Controls — offset below the user profile pill rendered by App at top-right */}
       <div data-canvas-ui className="absolute top-20 right-4 flex flex-col gap-2 z-40">
@@ -2203,6 +2246,10 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
             {!isCropping && (
             <>
                 <svg className="absolute inset-0 z-20 w-full h-full overflow-visible pointer-events-none" viewBox={`0 0 ${images.backgroundSize.width} ${images.backgroundSize.height}`}>
+                    <g aria-label="Canvas annotations">
+                        {annotations.map(annotation => <polyline key={annotation.id} points={annotation.points.map(point => `${point.x},${point.y}`).join(' ')} fill="none" stroke={annotation.color} strokeWidth={annotation.width * handleScale} strokeLinecap="round" strokeLinejoin="round" />)}
+                        {annotationPointsRef.current.length > 1 && <polyline points={annotationPointsRef.current.map(point => `${point.x},${point.y}`).join(' ')} fill="none" stroke="#f97316" strokeWidth={5 * handleScale} strokeLinecap="round" strokeLinejoin="round" />}
+                    </g>
                     {placement?.showVanishingGuides && calibratedPlanes.map(plane => {
                         const vanishing = getVanishingPoints(plane);
                         const selected = plane.id === activePlane?.id;

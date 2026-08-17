@@ -2,7 +2,7 @@
 import React, { useRef, useState, useEffect } from 'react';
 import { BLEND_MODES, MockupState, Sign, Point, Dimension, SignTemplate, ReferenceImage, TitleBlockField, Canvas, PaperSize, Orientation, SIGN_TYPES, SignType, UnitSystem, PlacementAnchor, PlacementSettings } from '../types';
 import { getMmPerPx, formatLength, toMm, measureLine, measureBox, measureSignSizeMm, resizeSignToRealSize } from '../utils/measure';
-import { Upload, Download, Sun, Moon, Move3d, Palette, Image as ImageIcon, Plus, Trash2, Layers, Eye, Copy, Box, Minus, Maximize, Ruler, ArrowRight, ArrowDown, ArrowLeft, ArrowUp, Scissors, Check, X, Eraser, Loader2, Square, PenTool, MousePointer2, Hand, Mic, EyeOff, Undo2, Redo2, Layout, FileText, Settings, Briefcase, User, Calendar, MapPin, Notebook, Camera, Library, Sparkles, PencilLine, Grid, Save, ChevronDown, ChevronRight, Monitor, Printer, FolderOpen, HardDrive, Lock, Unlock } from 'lucide-react';
+import { Upload, Download, Sun, Moon, Move3d, Palette, Image as ImageIcon, Plus, Trash2, Layers, Eye, Copy, Box, Minus, Maximize, Ruler, ArrowRight, ArrowDown, ArrowLeft, ArrowUp, Scissors, Check, X, Eraser, Loader2, Square, PenTool, MousePointer2, Hand, Mic, EyeOff, Undo2, Redo2, Layout, FileText, Settings, Briefcase, User, Calendar, MapPin, Notebook, Camera, Library, Sparkles, PencilLine, Grid, Save, ChevronDown, ChevronRight, Monitor, Printer, FolderOpen, HardDrive, Lock, Unlock, MessageSquareText } from 'lucide-react';
 import ImageUploader from './ImageUploader';
 import SignLibrary from './SignLibrary';
 import { ToolMode } from '../App';
@@ -750,7 +750,7 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
                 onClick={activatePan}
                 icon={viewLocked ? <Lock className="h-5 w-5" /> : <Hand className="h-5 w-5" />}
               />
-              <MobileDockButton label="Measure" ariaLabel="Measure line" active={toolMode === 'draw_line'} onClick={startLineMeasurement} icon={<PenTool className="h-5 w-5" />} />
+              <MobileDockButton label="Draw" ariaLabel="Draw and take a note" active={toolMode === 'annotate'} onClick={() => activateTool('annotate')} icon={<PencilLine className="h-5 w-5" />} />
               <MobileDockButton label={calibration ? 'Calibrated' : 'Scale'} ariaLabel={calibration ? 'Edit calibration' : 'Set real-world scale'} active={toolMode === 'calibrate' || toolMode === 'calibrate_plane'} accent onClick={startCalibration} icon={<Ruler className="h-5 w-5" />} />
               <MobileDockButton label="More" ariaLabel="Open all controls" onClick={() => setMobilePanelExpanded(true)} icon={<Settings className="h-5 w-5" />} />
             </div>
@@ -1052,6 +1052,18 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
                         ))}
                     </div>
                 )}
+                <div className="rounded-xl border border-orange-500/30 bg-orange-500/5 p-3">
+                    <div className="flex items-center justify-between gap-3">
+                        <div><p className="text-xs font-semibold text-orange-100">Draw & note</p><p className="mt-0.5 text-[10px] text-gray-500">Use a pen, finger, or mouse on the image.</p></div>
+                        <button type="button" onClick={() => activateTool('annotate')} className={`flex min-h-10 items-center gap-2 rounded-lg border px-3 text-xs transition-colors ${toolMode === 'annotate' ? 'border-orange-400 bg-orange-500 text-gray-950' : 'border-orange-500/40 bg-gray-800 text-orange-200 hover:border-orange-400'}`}><PencilLine className="h-4 w-4" /> {toolMode === 'annotate' ? 'Drawing' : 'Draw'}</button>
+                    </div>
+                    {(activeCanvas.annotations ?? []).length > 0 && <div className="mt-3 space-y-2">
+                        {(activeCanvas.annotations ?? []).map((annotation, index) => <div key={annotation.id} className="rounded-lg border border-gray-700 bg-gray-900 p-2">
+                            <div className="mb-1.5 flex items-center gap-2"><MessageSquareText className="h-3.5 w-3.5 text-orange-400" /><span className="text-[10px] font-bold uppercase tracking-wider text-gray-400">Note {index + 1}</span><button type="button" aria-label={`Delete note ${index + 1}`} onClick={() => updateActiveCanvasWithHistory({ annotations: (activeCanvas.annotations ?? []).filter(item => item.id !== annotation.id) })} className="ml-auto rounded p-1 text-gray-500 hover:bg-red-950 hover:text-red-300"><Trash2 className="h-3.5 w-3.5" /></button></div>
+                            <textarea aria-label={`Annotation note ${index + 1}`} value={annotation.note} placeholder="Type a note about this mark…" onChange={event => updateActiveCanvas({ annotations: (activeCanvas.annotations ?? []).map(item => item.id === annotation.id ? { ...item, note: event.target.value } : item) })} rows={2} className="w-full resize-none rounded-md border border-gray-700 bg-gray-800 px-2.5 py-2 text-xs text-white outline-none placeholder:text-gray-600 focus:border-orange-400" />
+                        </div>)}
+                    </div>}
+                </div>
               </div>
 
               {/* Signs List */}

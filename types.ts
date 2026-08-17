@@ -211,6 +211,15 @@ export interface ReferenceImage {
   note: string;
 }
 
+export interface CanvasAnnotation {
+  id: string;
+  points: Point[];
+  color: string;
+  width: number;
+  note: string;
+  createdAt: number;
+}
+
 export interface Canvas {
   id: string;
   name: string; // Internal name e.g. "Front Facade"
@@ -224,6 +233,7 @@ export interface Canvas {
   activeSignId: string | null;
   dimensions: Dimension[];
   activeDimensionId: string | null;
+  annotations?: CanvasAnnotation[];
 
   // Real-world scale reference for this view's photo (null/undefined = not calibrated)
   calibration?: Calibration | null;

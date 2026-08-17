@@ -95,7 +95,7 @@ const renumberDefaultCanvases = (canvases: Canvas[]): Canvas[] => canvases.map((
     sheetNumber: /^A-\d+$/.test(canvas.sheetNumber) ? `A-${101 + index}` : canvas.sheetNumber,
 }));
 
-export type ToolMode = 'select' | 'pan' | 'draw_line' | 'draw_box' | 'calibrate' | 'calibrate_plane';
+export type ToolMode = 'select' | 'pan' | 'draw_line' | 'draw_box' | 'annotate' | 'calibrate' | 'calibrate_plane';
 
 const DEFAULT_FIELDS: TitleBlockField[] = [
     { id: '1', label: 'PROJECT TITLE', value: '', section: 'project' },
@@ -837,6 +837,21 @@ const App: React.FC = () => {
       setToolMode('select');
   };
 
+  const handleAnnotationComplete = useCallback((points: Point[]) => {
+      if (!activeCanvas || points.length < 2) return;
+      const createdAt = Date.now();
+      updateActiveCanvasWithHistory({
+          annotations: [...(activeCanvas.annotations ?? []), {
+              id: `annotation-${createdAt}`,
+              points,
+              color: '#f97316',
+              width: 5,
+              note: '',
+              createdAt,
+          }]
+      });
+  }, [activeCanvas, updateActiveCanvasWithHistory]);
+
   // --- Guided calibration workflow ---
   const openCalibration = (options?: { addPlane?: boolean }) => {
       const existing = activeCanvas?.calibration ?? null;
@@ -1027,6 +1042,10 @@ const App: React.FC = () => {
         start: { x: dim.start.x - cropOffset.x, y: dim.start.y - cropOffset.y },
         end: { x: dim.end.x - cropOffset.x, y: dim.end.y - cropOffset.y }
     }));
+    const newAnnotations = (activeCanvas.annotations ?? []).map(annotation => ({
+        ...annotation,
+        points: annotation.points.map(point => ({ x: point.x - cropOffset.x, y: point.y - cropOffset.y }))
+    }));
     // Crop cuts pixels without resampling, so the calibration scale stays valid —
     // its line just shifts by the crop offset like everything else
     const newCalibration = activeCanvas.calibration ? {
@@ -1041,6 +1060,7 @@ const App: React.FC = () => {
         backgroundSize: newSize,
         signs: newSigns,
         dimensions: newDims,
+        annotations: newAnnotations,
         calibration: newCalibration,
         placement: activeCanvas.placement?.camera.principalPoint ? {
             ...activeCanvas.placement,
@@ -1434,6 +1454,7 @@ const App: React.FC = () => {
            activeSignId={activeCanvas.activeSignId}
            dimensions={activeCanvas.dimensions}
            activeDimensionId={activeCanvas.activeDimensionId}
+           annotations={activeCanvas.annotations ?? []}
            
            state={state}
            titleBlock={{ ...state.titleBlock, fields: state.titleBlock.fields.map(f => {
@@ -1446,6 +1467,7 @@ const App: React.FC = () => {
            viewLocked={viewLocked}
            onViewLockedChange={handleViewLockedChange}
            onDrawComplete={handleDrawComplete}
+           onAnnotationComplete={handleAnnotationComplete}
            calibration={activeCanvas.calibration ?? null}
            calibrationDraft={calibrationDraft && calibrationDraft.method ? {
              method: calibrationDraft.method,
