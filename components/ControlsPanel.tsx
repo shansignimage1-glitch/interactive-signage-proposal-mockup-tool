@@ -13,6 +13,7 @@ import { materializeTemplateDataUri } from '../services/LibraryService';
 import { calibrationForPlane, getCalibrationPlanes } from '../utils/cameraGeometry';
 import { detectSignArtwork } from '../utils/elementDetection';
 import { defaultExtrusionModeForType, getBackingDepth, getSignExtrusionMode, VISUAL_EXTRUSION_REFERENCE_WIDTH_PX } from '../utils/signExtrusion';
+import { transcribeAudio } from '../services/GeminiService';
 
 interface ControlsPanelProps {
   state: MockupState;
@@ -85,6 +86,97 @@ export const readImageAspectRatio = (src: string): Promise<number | null> => new
   image.onerror = () => finish(null);
   image.src = src;
 });
+
+type NoteRecordingState = 'idle' | 'recording' | 'transcribing';
+
+const NoteRecorder: React.FC<{ label: string; onTranscript: (text: string) => void }> = ({ label, onTranscript }) => {
+  const [status, setStatus] = useState<NoteRecordingState>('idle');
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const chunksRef = useRef<Blob[]>([]);
+  const timeoutRef = useRef<number | null>(null);
+  const mountedRef = useRef(true);
+
+  const releaseMicrophone = () => {
+    if (timeoutRef.current) window.clearTimeout(timeoutRef.current);
+    timeoutRef.current = null;
+    streamRef.current?.getTracks().forEach(track => track.stop());
+    streamRef.current = null;
+  };
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      const recorder = recorderRef.current;
+      recorderRef.current = null;
+      if (recorder) {
+        recorder.ondataavailable = null;
+        recorder.onstop = null;
+        if (recorder.state === 'recording') recorder.stop();
+      }
+      releaseMicrophone();
+    };
+  }, []);
+
+  const transcribe = async (blob: Blob) => {
+    setStatus('transcribing');
+    try {
+      const transcript = await transcribeAudio(blob);
+      if (mountedRef.current && transcript.trim()) onTranscript(transcript.trim());
+    } catch (error) {
+      if (mountedRef.current) notify(error instanceof Error ? error.message : 'Recording could not be transcribed.', 'error');
+    } finally {
+      if (mountedRef.current) setStatus('idle');
+    }
+  };
+
+  const toggleRecording = async () => {
+    if (status === 'recording') {
+      recorderRef.current?.stop();
+      return;
+    }
+    if (status !== 'idle') return;
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
+      notify('Audio recording is not supported in this browser.', 'warning');
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      if (!mountedRef.current) {
+        stream.getTracks().forEach(track => track.stop());
+        return;
+      }
+      streamRef.current = stream;
+      const candidates = ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm', 'audio/ogg'];
+      const mimeType = candidates.find(type => MediaRecorder.isTypeSupported(type));
+      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      recorderRef.current = recorder;
+      chunksRef.current = [];
+      recorder.ondataavailable = event => { if (event.data.size) chunksRef.current.push(event.data); };
+      recorder.onstop = () => {
+        releaseMicrophone();
+        recorderRef.current = null;
+        const blob = new Blob(chunksRef.current, { type: recorder.mimeType || mimeType || 'audio/webm' });
+        chunksRef.current = [];
+        if (mountedRef.current && blob.size > 0) void transcribe(blob);
+        else if (mountedRef.current) setStatus('idle');
+      };
+      recorder.start(500);
+      setStatus('recording');
+      timeoutRef.current = window.setTimeout(() => recorder.state === 'recording' && recorder.stop(), 55_000);
+    } catch {
+      releaseMicrophone();
+      if (mountedRef.current) setStatus('idle');
+      notify('Microphone permission was not granted.', 'warning');
+    }
+  };
+
+  return <button type="button" onClick={toggleRecording} disabled={status === 'transcribing'} aria-label={`${label}${status === 'recording' ? ' — stop recording' : ''}`} className={`flex min-h-9 items-center justify-center gap-1.5 rounded-md border px-2.5 text-[10px] font-semibold transition ${status === 'recording' ? 'animate-pulse border-red-400 bg-red-500/15 text-red-300' : status === 'transcribing' ? 'border-orange-400/50 bg-orange-500/10 text-orange-200' : 'border-gray-700 bg-gray-800 text-gray-300 hover:border-orange-400 hover:text-orange-200'}`}>
+    {status === 'transcribing' ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : status === 'recording' ? <Square className="h-3 w-3 fill-current" /> : <Mic className="h-3.5 w-3.5" />}
+    {status === 'transcribing' ? 'Transcribing…' : status === 'recording' ? 'Stop' : 'Record'}
+  </button>;
+};
 
 const ControlsPanel: React.FC<ControlsPanelProps> = ({
   state,
@@ -1061,6 +1153,10 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
                         {(activeCanvas.annotations ?? []).map((annotation, index) => <div key={annotation.id} className="rounded-lg border border-gray-700 bg-gray-900 p-2">
                             <div className="mb-1.5 flex items-center gap-2"><MessageSquareText className="h-3.5 w-3.5 text-orange-400" /><span className="text-[10px] font-bold uppercase tracking-wider text-gray-400">Note {index + 1}</span><button type="button" aria-label={`Delete note ${index + 1}`} onClick={() => updateActiveCanvasWithHistory({ annotations: (activeCanvas.annotations ?? []).filter(item => item.id !== annotation.id) })} className="ml-auto rounded p-1 text-gray-500 hover:bg-red-950 hover:text-red-300"><Trash2 className="h-3.5 w-3.5" /></button></div>
                             <textarea aria-label={`Annotation note ${index + 1}`} value={annotation.note} placeholder="Type a note about this mark…" onChange={event => updateActiveCanvas({ annotations: (activeCanvas.annotations ?? []).map(item => item.id === annotation.id ? { ...item, note: event.target.value } : item) })} rows={2} className="w-full resize-none rounded-md border border-gray-700 bg-gray-800 px-2.5 py-2 text-xs text-white outline-none placeholder:text-gray-600 focus:border-orange-400" />
+                            <div className="mt-2 flex items-center justify-between gap-2">
+                                <span className="text-[9px] text-gray-600">Up to 55 seconds</span>
+                                <NoteRecorder label={`Record note ${index + 1}`} onTranscript={transcript => updateActiveCanvasWithHistory({ annotations: (activeCanvas.annotations ?? []).map(item => item.id === annotation.id ? { ...item, note: item.note ? `${item.note} ${transcript}` : transcript } : item) })} />
+                            </div>
                         </div>)}
                     </div>}
                 </div>
