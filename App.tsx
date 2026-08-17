@@ -1,7 +1,7 @@
 
 import React, { useState, useCallback, useRef, useEffect, Suspense } from 'react';
 import { auth, googleProvider } from './firebase';
-import { getIdTokenResult, getRedirectResult, onAuthStateChanged, signInWithPopup, signOut, type User as FirebaseUser } from 'firebase/auth';
+import { getIdTokenResult, getRedirectResult, onAuthStateChanged, signInWithPopup, signInWithRedirect, signOut, type User as FirebaseUser } from 'firebase/auth';
 
 import ControlsPanel from './components/ControlsPanel';
 import MockupCanvas from './components/MockupCanvas';
@@ -19,6 +19,7 @@ import { getActiveConnector, getPreferredProvider, setConnectorUid, connectors, 
 import { distance } from './utils/math';
 import { isPhoneSizedTouchDevice, readDeviceModeEnvironment, shouldUsePhoneCapture, type DeviceModeEnvironment } from './utils/deviceMode';
 import { isMissingRedirectStateError } from './utils/authErrors';
+import { prefersRedirectSignIn } from './utils/authSignIn';
 import { measureLine, measureBox, getMmPerPx } from './utils/measure';
 import { normalizeProjectState } from './utils/projectMigration';
 import CalibrationWizard, { CalibrationDraft } from './components/CalibrationWizard';
@@ -508,6 +509,10 @@ const App: React.FC = () => {
     authAttemptInProgressRef.current = true;
     setIsLoginPending(true);
     try {
+      if (prefersRedirectSignIn(window)) {
+        await signInWithRedirect(auth, googleProvider);
+        return;
+      }
       const credential = await signInWithPopup(auth, googleProvider);
       await bootstrapFirebaseUser(credential.user);
     } catch (err: any) {
