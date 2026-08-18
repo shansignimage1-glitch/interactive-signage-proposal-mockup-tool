@@ -77,7 +77,11 @@ export const optimizeImageFile = async (file: File, maxDimension = DEFAULT_MAX_D
   blobToDataUri(await optimizeImageBlob(file, maxDimension));
 
 export const optimizeDataUri = async (dataUri: string, maxDimension = DEFAULT_MAX_DIMENSION): Promise<string> => {
-  const optimized = await optimizeImageBlob(dataUriToBlob(dataUri), maxDimension);
+  const source = dataUriToBlob(dataUri);
+  // Vector artwork is already compact and resolution-independent. Rasterizing
+  // it adds no benefit and is unreliable in iOS Safari's Blob/image decoder.
+  if (source.type.toLowerCase() === 'image/svg+xml') return dataUri;
+  const optimized = await optimizeImageBlob(source, maxDimension);
   return blobToDataUri(optimized);
 };
 

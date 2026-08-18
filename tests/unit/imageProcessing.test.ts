@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { optimizeImageBlob } from '../../services/imageProcessing';
+import { optimizeDataUri, optimizeImageBlob } from '../../services/imageProcessing';
 
 const installImageMocks = (output: Blob) => {
   const close = vi.fn();
@@ -44,5 +44,14 @@ describe('mobile image processing', () => {
     expect(mocks.drawImage).toHaveBeenCalledOnce();
     expect(mocks.toBlob).toHaveBeenCalledWith(expect.any(Function), 'image/jpeg', 0.86);
     expect(mocks.close).toHaveBeenCalledOnce();
+  });
+
+  it('uploads URL-encoded SVG artwork without rasterizing it', async () => {
+    const decode = vi.fn();
+    vi.stubGlobal('createImageBitmap', decode);
+    const svg = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg'%3E%3Ctext%3ESIGN IMAGE%3C/text%3E%3C/svg%3E";
+
+    expect(await optimizeDataUri(svg)).toBe(svg);
+    expect(decode).not.toHaveBeenCalled();
   });
 });
