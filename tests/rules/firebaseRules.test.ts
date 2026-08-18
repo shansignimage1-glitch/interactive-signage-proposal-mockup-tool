@@ -4,6 +4,8 @@ import { afterAll, beforeAll, beforeEach, describe, it } from 'vitest';
 import { assertFails, assertSucceeds, initializeTestEnvironment, RulesTestEnvironment } from '@firebase/rules-unit-testing';
 import { doc, getDoc, setDoc, deleteDoc } from 'firebase/firestore';
 import { getBytes, listAll, ref, uploadBytes } from 'firebase/storage';
+import { encodeProjectForFirestore } from '../../utils/firestorePayload';
+import { makeProject } from '../fixtures/project';
 
 let env: RulesTestEnvironment;
 
@@ -34,6 +36,23 @@ describe('Firestore project rules', () => {
     const publicDb = env.unauthenticatedContext().firestore();
     await assertFails(setDoc(doc(userDb, 'projects/forged'), { userId: 'user-b' }));
     await assertFails(getDoc(doc(publicDb, 'projects/anything')));
+  });
+
+  it('accepts encoded sign contours that Firestore otherwise rejects as nested arrays', async () => {
+    const ownerDb = env.authenticatedContext('owner').firestore();
+    const project = makeProject({ user: { uid: 'owner', displayName: null, email: null, photoURL: null } });
+    project.canvases[0].signs = [{
+      id: 'sign-1', name: 'Letters', image: '',
+      corners: [{ x: 0, y: 0 }, { x: 10, y: 0 }, { x: 10, y: 10 }, { x: 0, y: 10 }],
+      signType: 'channel_face', extrusionEnabled: true, extrusionDepth: 15,
+      extrusionAngle: 45, opacity: 1, blendMode: 'normal', sideColor: '#000000',
+      elements: [{ id: 'a', name: 'A', enabled: true, depth: 10, contours: [[{ x: 1, y: 2 }]] }],
+    }];
+
+    await assertSucceeds(setDoc(doc(ownerDb, 'projects/owner_contours'), {
+      ...encodeProjectForFirestore(project),
+      userId: 'owner',
+    }));
   });
 
   it('limits shared-library writes to the configured administrator', async () => {

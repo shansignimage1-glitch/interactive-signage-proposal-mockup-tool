@@ -8,7 +8,7 @@ import { connectors, getActiveConnector, getConnectorForRef } from './driveConne
 import { getKnownRef, recordKnownRef, resolveProjectImages, ResolveResult, isDriveRef } from './AssetResolver';
 import { reportError, reportWarning } from './monitoring';
 import { assertStorageCapacity, optimizeDataUri } from './imageProcessing';
-import { withoutUndefined } from '../utils/firestorePayload';
+import { decodeProjectFromFirestore, encodeProjectForFirestore, withoutUndefined } from '../utils/firestorePayload';
 
 export type ProjectSaveResult = 'cloud' | 'local' | 'queued' | 'conflict' | 'error';
 
@@ -543,7 +543,12 @@ export const StorageService = {
               const remoteRevision = remote.exists() ? (remote.data().cloudRevision ?? 0) : 0;
               if (!force && remote.exists() && remoteRevision > baseRevision) return null;
               const revision = remoteRevision + 1;
-              transaction.set(projectRef, withoutUndefined({ ...cloudState, userId, updatedAt: Date.now(), cloudRevision: revision }));
+              transaction.set(projectRef, withoutUndefined({
+                  ...encodeProjectForFirestore(cloudState),
+                  userId,
+                  updatedAt: Date.now(),
+                  cloudRevision: revision,
+              }));
               return revision;
           });
           if (nextRevision === null) return 'conflict';
@@ -600,11 +605,12 @@ export const StorageService = {
           const data = snapshot.data() as MockupState & { userId: string; updatedAt: number };
           // Remove Firestore-only fields before returning
           const { userId: _u, updatedAt: _t, ...projectState } = data;
-          projectState.lastSaved = Math.max(projectState.lastSaved ?? 0, _t ?? 0);
-          knownCloudRevisions.set(revisionKey(userId, projectId), projectState.cloudRevision ?? 0);
+          const decodedState = decodeProjectFromFirestore(projectState);
+          decodedState.lastSaved = Math.max(decodedState.lastSaved ?? 0, _t ?? 0);
+          knownCloudRevisions.set(revisionKey(userId, projectId), decodedState.cloudRevision ?? 0);
 
           // Materialize any cloud-drive refs into displayable data URIs
-          const resolved = await resolveProjectImages(projectState as MockupState);
+          const resolved = await resolveProjectImages(decodedState);
           if (resolved.failedRefs.length > 0) {
               onResolveIssues?.({ failedRefs: resolved.failedRefs, needsReconnect: resolved.needsReconnect });
           }
