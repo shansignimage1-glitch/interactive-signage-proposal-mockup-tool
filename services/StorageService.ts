@@ -8,6 +8,9 @@ import { connectors, getActiveConnector, getConnectorForRef } from './driveConne
 import { getKnownRef, recordKnownRef, resolveProjectImages, ResolveResult, isDriveRef } from './AssetResolver';
 import { reportError, reportWarning } from './monitoring';
 import { assertStorageCapacity, optimizeDataUri } from './imageProcessing';
+import { withoutUndefined } from '../utils/firestorePayload';
+
+export type ProjectSaveResult = 'cloud' | 'local' | 'queued' | 'conflict' | 'error';
 
 const FIRESTORE_COLLECTION = 'projects';
 const DB_NAME = 'SignageProDB';
@@ -434,7 +437,7 @@ export const StorageService = {
       }
   },
 
-  saveProject: async (userId: string, state: MockupState, fromQueue = false, force = false): Promise<'cloud' | 'local' | 'queued' | 'conflict' | 'error'> => {
+  saveProject: async (userId: string, state: MockupState, fromQueue = false, force = false): Promise<ProjectSaveResult> => {
       // Always save to local first
       try {
           await StorageService.saveProjectLocal(state);
@@ -540,7 +543,7 @@ export const StorageService = {
               const remoteRevision = remote.exists() ? (remote.data().cloudRevision ?? 0) : 0;
               if (!force && remote.exists() && remoteRevision > baseRevision) return null;
               const revision = remoteRevision + 1;
-              transaction.set(projectRef, { ...cloudState, userId, updatedAt: Date.now(), cloudRevision: revision });
+              transaction.set(projectRef, withoutUndefined({ ...cloudState, userId, updatedAt: Date.now(), cloudRevision: revision }));
               return revision;
           });
           if (nextRevision === null) return 'conflict';

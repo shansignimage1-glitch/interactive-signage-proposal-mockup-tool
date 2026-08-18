@@ -7,7 +7,7 @@ import { MeasureUnit, MockupState, ProjectMetadata, ReferenceWallFieldMeasuremen
 import { currentCoordinates, reverseGeocode } from '../services/PhotoLocationService';
 import { optimizeImageBlob, readImageDimensions } from '../services/imageProcessing';
 import {
-  deleteSiteCaptureAssets, getSiteCaptureAsset, makeSiteCaptureAssetRef, putSiteCaptureAsset, StorageService,
+  deleteSiteCaptureAssets, getSiteCaptureAsset, makeSiteCaptureAssetRef, putSiteCaptureAsset, StorageService, type ProjectSaveResult,
 } from '../services/StorageService';
 import { transcribeAudio } from '../services/GeminiService';
 import { notify } from '../services/toast';
@@ -27,7 +27,7 @@ interface MobileSiteCaptureProps {
   onUpdate: (updates: Partial<MockupState>) => void;
   onLoadProject: (state: MockupState) => void;
   onNewProject: () => Promise<void>;
-  onSaveProject: (name: string) => Promise<void>;
+  onSaveProject: (name: string) => Promise<ProjectSaveResult>;
   onPromoteCapture: (capture: SiteCapturePhoto) => Promise<void>;
   onLogout: () => Promise<void>;
 }
@@ -522,11 +522,17 @@ const MobileSiteCapture: React.FC<MobileSiteCaptureProps> = ({ state, syncStatus
     }
     setIsSavingProject(true);
     try {
-      await onSaveProject(name);
+      const result = await onSaveProject(name);
+      const isGuest = state.user?.uid.startsWith('guest_') ?? true;
+      if (!isGuest && result !== 'cloud') {
+        if (result === 'queued') throw new Error('Saved on this phone, but the cloud is offline. Keep the app open and try Save project again when connected.');
+        if (result === 'conflict') throw new Error('This project changed on another device. Resolve the sync conflict before saving again.');
+        throw new Error('Saved on this phone, but cloud sync failed. Please try Save project again.');
+      }
       (document.activeElement as HTMLElement | null)?.blur();
       setSelectedProjectId(state.projectId);
       setProjects(await StorageService.listProjects(state.user?.uid ?? 'guest_unknown'));
-      notify(`${name} saved.`, 'success');
+      notify(isGuest ? `${name} saved on this phone.` : `${name} saved to the cloud.`, 'success');
     } catch (error) {
       notify(error instanceof Error ? error.message : 'The project could not be saved.', 'error');
     } finally {

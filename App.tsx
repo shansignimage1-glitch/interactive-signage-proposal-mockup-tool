@@ -24,7 +24,7 @@ import { measureLine, measureBox, getMmPerPx } from './utils/measure';
 import { normalizeProjectState } from './utils/projectMigration';
 import CalibrationWizard, { CalibrationDraft } from './components/CalibrationWizard';
 import { TITLE_BLOCK_TEMPLATES } from './data/titleBlockTemplates';
-import { getSiteCaptureAsset, StorageService } from './services/StorageService';
+import { getSiteCaptureAsset, StorageService, type ProjectSaveResult } from './services/StorageService';
 import { Wifi, WifiOff, RefreshCw, LogIn, LogOut, Loader2, AlertTriangle, User as UserIcon, HardDrive, Database, Settings, Building2 } from 'lucide-react';
 import { notify } from './services/toast';
 import { reportError, reportWarning } from './services/monitoring';
@@ -1159,7 +1159,7 @@ const App: React.FC = () => {
       setHistoryIndex(0);
   };
 
-  const handleProjectSave = async (name: string) => {
+  const handleProjectSave = async (name: string): Promise<ProjectSaveResult> => {
       const newState = { 
           ...state, 
           projectName: name, 
@@ -1180,7 +1180,7 @@ const App: React.FC = () => {
 
       await StorageService.saveProjectLocal(newState, thumbnail);
       // Also trigger cloud sync if needed
-      await triggerBackendSync(newState);
+      return await triggerBackendSync(newState);
   };
 
   const handleProjectRename = async (projectId: string, name: string) => {
