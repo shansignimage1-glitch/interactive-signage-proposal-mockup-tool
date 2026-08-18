@@ -17,4 +17,12 @@ describe('image hashing', () => {
     expect(await blob.text()).toBe('hello');
     expect(await blobToDataUri(blob)).toBe(png);
   });
+
+  it('decodes URL-encoded SVG data URIs used by the built-in sign artwork', async () => {
+    const svg = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg'%3E%3Ctext%3ESIGN IMAGE%3C/text%3E%3C/svg%3E";
+    const blob = dataUriToBlob(svg);
+
+    expect(blob.type).toBe('image/svg+xml');
+    expect(await blob.text()).toBe("<svg xmlns='http://www.w3.org/2000/svg'><text>SIGN IMAGE</text></svg>");
+  });
 });

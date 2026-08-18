@@ -8,9 +8,18 @@ export const hashDataUri = async (dataUri: string): Promise<string> => {
 };
 
 export const dataUriToBlob = (dataUri: string): Blob => {
-    const [header, base64] = dataUri.split(',');
-    const mime = /data:(.*?);base64/.exec(header)?.[1] || 'application/octet-stream';
-    const binary = atob(base64);
+    const separator = dataUri.indexOf(',');
+    if (!dataUri.startsWith('data:') || separator < 0) throw new Error('Invalid data URI');
+
+    const header = dataUri.slice(5, separator);
+    const payload = dataUri.slice(separator + 1);
+    const mime = header.split(';')[0] || 'text/plain';
+
+    if (!/(?:^|;)base64(?:;|$)/i.test(header)) {
+        return new Blob([decodeURIComponent(payload)], { type: mime });
+    }
+
+    const binary = atob(payload);
     const bytes = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
     return new Blob([bytes], { type: mime });

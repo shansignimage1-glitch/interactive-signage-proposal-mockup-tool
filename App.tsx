@@ -185,7 +185,9 @@ const App: React.FC = () => {
   const [authError, setAuthError] = useState<string | null>(null);
   
   // Track sync status beyond just boolean
-  const [syncStatus, setSyncStatus] = useState<'synced' | 'local_only' | 'error'>('synced');
+  // Cloud status is only confirmed after a real cloud read or write. Starting
+  // as synced made sign-in look successful until the first autosave ran.
+  const [syncStatus, setSyncStatus] = useState<'synced' | 'local_only' | 'error'>('local_only');
   const [lastCloudSavedAt, setLastCloudSavedAt] = useState<number | null>(null);
   const [syncConflict, setSyncConflict] = useState(false);
   
@@ -337,6 +339,8 @@ const App: React.FC = () => {
                   if (!isCurrentSession()) return;
                   if (loaded) {
                       startSession({ ...loaded, user, isOnline: navigator.onLine, isSyncing: false });
+                      setSyncStatus('synced');
+                      setLastCloudSavedAt(Date.now());
                       completedAuthUidRef.current = uid;
                       return;
                   }
