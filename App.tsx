@@ -18,7 +18,7 @@ import { MockupState, AppImages, Point, Sign, Dimension, TitleBlock, TitleBlockF
 import { getActiveConnector, getPreferredProvider, setConnectorUid, connectors, getConnectorForRef } from './services/driveConnectors';
 import { distance } from './utils/math';
 import { isPhoneSizedTouchDevice, readDeviceModeEnvironment, shouldUsePhoneCapture, type DeviceModeEnvironment } from './utils/deviceMode';
-import { isMissingRedirectStateError } from './utils/authErrors';
+import { isAuthCancellationError, isMissingRedirectStateError } from './utils/authErrors';
 import { prefersRedirectSignIn } from './utils/authSignIn';
 import { measureLine, measureBox, getMmPerPx } from './utils/measure';
 import { normalizeProjectState } from './utils/projectMigration';
@@ -416,6 +416,11 @@ const App: React.FC = () => {
       }
       authAttemptInProgressRef.current = false;
       setIsLoginPending(false);
+      if (isAuthCancellationError(err)) {
+        notify('Google sign-in was cancelled. Tap Sign in with Google again and choose Continue.', 'info');
+        setIsAuthLoading(false);
+        return;
+      }
       if (isMissingRedirectStateError(err)) {
         reportWarning('auth-redirect', 'Discarded stale redirect result because browser state was unavailable');
         setIsAuthLoading(false);
@@ -520,7 +525,10 @@ const App: React.FC = () => {
       setIsLoginPending(false);
       setIsAuthLoading(false);
       const code = err?.code ?? '';
-      if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') return;
+      if (isAuthCancellationError(err)) {
+        notify('Google sign-in was cancelled. Tap Sign in with Google again and choose Continue.', 'info');
+        return;
+      }
       if (code === 'auth/popup-blocked' || code === 'auth/operation-not-supported-in-this-environment') {
         setAuthError('Google sign-in was blocked. Allow pop-ups for this site, then tap Sign in with Google again.');
       } else {

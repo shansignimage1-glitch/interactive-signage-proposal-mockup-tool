@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { isMissingRedirectStateError } from '../../utils/authErrors';
+import { isAuthCancellationError, isMissingRedirectStateError } from '../../utils/authErrors';
 import { prefersRedirectSignIn } from '../../utils/authSignIn';
 
 describe('Firebase redirect error recovery', () => {
@@ -39,6 +39,13 @@ describe('Firebase redirect error recovery', () => {
     expect(prefersRedirectSignIn(environment(
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140.0 Safari/537.36',
     ))).toBe(false);
+  });
+
+  it('treats Google permission cancellation as a recoverable login attempt', () => {
+    expect(isAuthCancellationError({ code: 'auth/user-cancelled' })).toBe(true);
+    expect(isAuthCancellationError({ code: 'auth/popup-closed-by-user' })).toBe(true);
+    expect(isAuthCancellationError({ code: 'auth/cancelled-popup-request' })).toBe(true);
+    expect(isAuthCancellationError({ code: 'auth/network-request-failed' })).toBe(false);
   });
 
   it('bootstraps directly from successful popup and legacy redirect credentials', () => {
