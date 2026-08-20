@@ -298,10 +298,13 @@ test('view lock freezes pan and zoom while sign editing stays interactive', asyn
   await dispatchTouch(page, 'pointerdown', 1, center.x, center.y, viewport);
   await dispatchTouch(page, 'pointermove', 1, center.x + 55, center.y + 35, viewport);
   await dispatchTouch(page, 'pointerup', 1, center.x + 55, center.y + 35, viewport);
-  await page.waitForTimeout(50);
-  const afterUnlockedPan = await transform(page);
-  expect(afterUnlockedPan.x - beforeUnlockedPan.x).toBeCloseTo(55, 0);
-  expect(afterUnlockedPan.y - beforeUnlockedPan.y).toBeCloseTo(35, 0);
+  await expect.poll(async () => {
+    const afterUnlockedPan = await transform(page);
+    return {
+      x: Math.round(afterUnlockedPan.x - beforeUnlockedPan.x),
+      y: Math.round(afterUnlockedPan.y - beforeUnlockedPan.y),
+    };
+  }).toEqual({ x: 55, y: 35 });
 });
 
 test('canvas undo and redo restore a completed sign placement gesture', async ({ page }) => {

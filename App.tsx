@@ -33,7 +33,10 @@ import { optimizeImageFile } from './services/imageProcessing';
 import { blobToDataUri } from './services/imageHash';
 
 const GUEST_PROJECT_ID_KEY = 'signagepro_guest_project_id';
-const AUTH_BOOT_TIMEOUT_MS = 20_000;
+// Large Storage-backed projects (dense sign contours plus site captures) can
+// take substantially longer to download/decompress in iOS/Desktop WebKit.
+// Falling back to Untitled too early makes a valid phone project look missing.
+const AUTH_BOOT_TIMEOUT_MS = 90_000;
 const AUTH_OBSERVER_BOOT_TIMEOUT_MS = 12_000;
 const TABLET_SIDE_PANEL_MIN_VIEWPORT_WIDTH = 640;
 
@@ -218,6 +221,8 @@ const App: React.FC = () => {
   
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const stateRef = useRef(state);
+  const syncAttemptRef = useRef(0);
+  const suppressNextAutosaveRef = useRef(false);
   const authObserverCalledRef = useRef(false);
   const authAttemptInProgressRef = useRef(false);
   const authSessionRef = useRef<{ uid: string | null; epoch: number }>({ uid: null, epoch: 0 });
@@ -256,8 +261,10 @@ const App: React.FC = () => {
 
   // Start a fresh session: replace state AND the undo history so undo can
   // never step back into a pre-login (user: null) state
-  const startSession = useCallback((state: MockupState) => {
+  const startSession = useCallback((state: MockupState, suppressAutosave = true) => {
       const newState = normalizeProjectState(state);
+      syncAttemptRef.current += 1;
+      suppressNextAutosaveRef.current = suppressAutosave;
       stateRef.current = newState;
       setState(newState);
       setHistory([newState]);
@@ -318,16 +325,57 @@ const App: React.FC = () => {
               setConnectorUid(uid);
               setDriveStatus(getActiveConnector() ? 'connected' : 'disconnected');
 
-              const projects = await withTimeout(
-                  StorageService.listProjectsCloud(uid),
-                  10_000,
-                  'Cloud project list',
+              // A queued phone edit is the newest durable copy. Retry it before
+              // reading cloud state so a fresh Safari bootstrap can never cache
+              // an older cloud revision over that newer IndexedDB snapshot.
+              try {
+                  if (await StorageService.hasQueuedProjectSync(uid)) {
+                      await withTimeout(StorageService.flushSyncQueue(uid), 10_000, 'Pending cloud sync');
+                  }
+              } catch (error) {
+                  reportWarning('auth-bootstrap', 'Pending phone changes will retry after the app opens', {
+                      error: String(error),
+                  });
+              }
+              if (!isCurrentSession()) return;
+
+              // Always load local metadata first. Cloud listing is best-effort:
+              // a slow Firebase channel must not hide or replace a saved phone
+              // project during sign-in.
+              const localProjectCandidates = await withTimeout(
+                  StorageService.listProjectsLocal(),
+                  8_000,
+                  'Local project list',
               );
+              const localOwnership = await Promise.all(localProjectCandidates.map(async project => {
+                  const localState = await StorageService.loadProjectLocal(project.id);
+                  const ownerUid = localState?.user?.uid;
+                  return !ownerUid || ownerUid.startsWith('guest_') || ownerUid === uid;
+              }));
+              const localProjects = localProjectCandidates.filter((_, index) => localOwnership[index]);
+              let cloudProjects: typeof localProjects = [];
+              try {
+                  cloudProjects = await withTimeout(
+                      StorageService.listProjectsCloud(uid),
+                      10_000,
+                      'Cloud project list',
+                  );
+              } catch (error) {
+                  reportWarning('auth-bootstrap', 'Cloud project list is not ready; opening the newest phone copy', {
+                      error: String(error),
+                  });
+              }
+              const projectsById = new Map(localProjects.map(project => [project.id, project]));
+              for (const project of cloudProjects) {
+                  const local = projectsById.get(project.id);
+                  if (!local || project.lastModified > local.lastModified) projectsById.set(project.id, project);
+              }
+              const projects = [...projectsById.values()];
               if (!isCurrentSession()) return;
               if (projects.length > 0) {
                   const latest = projects.sort((a, b) => (b.lastModified ?? 0) - (a.lastModified ?? 0))[0];
                   const loaded = await withTimeout(
-                      StorageService.loadProjectCloud(uid, latest.id, ({ needsReconnect, failedRefs }) => {
+                      StorageService.loadProject(uid, latest.id, ({ needsReconnect, failedRefs }) => {
                           if (!isCurrentSession() || !needsReconnect) return;
                           setDriveNeedsReconnect(true);
                           setDriveReconnectProvider(failedRefs[0] ? getConnectorForRef(failedRefs[0])?.id ?? null : null);
@@ -338,15 +386,38 @@ const App: React.FC = () => {
                   );
                   if (!isCurrentSession()) return;
                   if (loaded) {
-                      startSession({ ...loaded, user, isOnline: navigator.onLine, isSyncing: false });
-                      setSyncStatus('synced');
-                      setLastCloudSavedAt(Date.now());
+                      const cloudMetadata = cloudProjects.find(project => project.id === loaded.projectId);
+                      let hasPendingSync = await StorageService.hasQueuedProjectSync(uid, loaded.projectId);
+                      const cloudCopyConfirmed = Boolean(
+                          cloudMetadata
+                          && (loaded.cloudRevision ?? 0) > 0
+                          && cloudMetadata.lastModified >= loaded.lastSaved,
+                      );
+                      if (!cloudCopyConfirmed && !hasPendingSync && (loaded.cloudRevision ?? 0) === 0) {
+                          await StorageService.queueProjectSync(uid, loaded.projectId);
+                          hasPendingSync = true;
+                      }
+                      const sessionState = { ...loaded, user, isOnline: navigator.onLine, isSyncing: false };
+                      if (loaded.user?.uid !== uid) {
+                          await StorageService.saveProjectLocal(sessionState).catch(error => {
+                              reportWarning('auth-bootstrap', 'The adopted phone project could not be recached locally', {
+                                  projectId: loaded.projectId,
+                                  error: String(error),
+                              });
+                          });
+                      }
+                      startSession(sessionState);
+                      const cloudSynced = cloudCopyConfirmed && !hasPendingSync;
+                      setSyncStatus(cloudSynced ? 'synced' : 'local_only');
+                      setLastCloudSavedAt(cloudSynced ? Date.now() : null);
                       completedAuthUidRef.current = uid;
                       return;
                   }
               }
 
               startSession({ ...getInitialState(), user, isOnline: navigator.onLine });
+              setSyncStatus('local_only');
+              setLastCloudSavedAt(null);
               completedAuthUidRef.current = uid;
           } catch (error) {
               reportError('auth-bootstrap', error, { uid });
@@ -398,6 +469,10 @@ const App: React.FC = () => {
         : { ...getInitialState(), user: guestUser, isOnline: false };
 
       localStorage.setItem(GUEST_PROJECT_ID_KEY, newState.projectId);
+      // Session loads are intentionally read-only, but a brand-new guest
+      // workspace still needs an immediate durable record so reload can resume
+      // the same project even before the first edit.
+      await StorageService.saveProjectLocal(newState);
 
       startSession(newState);
       setIsAuthLoading(false);
@@ -552,25 +627,57 @@ const App: React.FC = () => {
   };
 
   const updateState = useCallback((updates: Partial<MockupState>) => {
-    setState(prev => ({ ...prev, ...updates }));
+    setState(prev => {
+      const next = { ...prev, ...updates };
+      stateRef.current = next;
+      return next;
+    });
   }, []);
 
   // --- Connectivity & Persistence Logic ---
 
   // Trigger Sync
-  const triggerBackendSync = useCallback((currentState: MockupState) => {
+  const triggerBackendSync = useCallback((currentState: MockupState, silentQueuedNotice = false) => {
       if (!currentState.user) return Promise.resolve<'error'>('error');
 
+      const syncAttempt = ++syncAttemptRef.current;
       updateState({ isSyncing: true });
       
-      return StorageService.saveProject(currentState.user.uid, currentState).then((result) => {
-          updateState({ isSyncing: false, lastSaved: Date.now() });
+      return StorageService.saveProject(currentState.user.uid, currentState).then(async (result) => {
+          // A save started for the previous project may finish after the user
+          // opens another one. Never let that stale result change the active
+          // project's spinner, timestamp, or Cloud saved status.
+          const active = stateRef.current;
+          if (syncAttempt !== syncAttemptRef.current
+              || active.projectId !== currentState.projectId
+              || active.user?.uid !== currentState.user?.uid) {
+              return result;
+          }
+          let persistedCloudState: MockupState | null = null;
+          if (result === 'cloud') {
+              persistedCloudState = await StorageService.loadProjectLocal(currentState.projectId);
+              const latest = stateRef.current;
+              if (syncAttempt !== syncAttemptRef.current
+                  || latest.projectId !== currentState.projectId
+                  || latest.user?.uid !== currentState.user?.uid) {
+                  return result;
+              }
+          }
+          updateState({
+              isSyncing: false,
+              lastSaved: persistedCloudState?.lastSaved ?? Date.now(),
+              ...(persistedCloudState?.cloudRevision !== undefined
+                  ? { cloudRevision: persistedCloudState.cloudRevision }
+                  : {}),
+          });
           
           if (result === 'local') {
               setSyncStatus('local_only');
           } else if (result === 'queued') {
               setSyncStatus('local_only');
-              notify('Saved offline. Cloud sync will resume when a connection is available.', 'info');
+              if (!silentQueuedNotice) {
+                  notify('Saved on this device. Cloud sync will retry automatically.', 'info');
+              }
           } else if (result === 'conflict') {
               setSyncStatus('error');
               setSyncConflict(true);
@@ -584,6 +691,13 @@ const App: React.FC = () => {
           }
           return result;
       }).catch(error => {
+          const active = stateRef.current;
+          if (syncAttempt !== syncAttemptRef.current
+              || active.projectId !== currentState.projectId
+              || active.user?.uid !== currentState.user?.uid) {
+              reportError('sync-stale', error, { projectId: currentState.projectId });
+              return 'error' as const;
+          }
           updateState({ isSyncing: false });
           setSyncStatus('error');
           reportError('sync', error, { projectId: currentState.projectId });
@@ -602,20 +716,90 @@ const App: React.FC = () => {
 
   const loadCloudConflictCopy = async () => {
       if (!state.user) return;
-      const remote = await StorageService.loadProjectCloud(state.user.uid, state.projectId);
+      const remote = await StorageService.loadProjectCloud(state.user.uid, state.projectId, undefined, true);
       if (remote) {
+          await StorageService.saveProjectLocal(remote);
+          await StorageService.discardQueuedProjectSync(state.user.uid, state.projectId);
           startSession({ ...remote, user: state.user, isOnline: navigator.onLine, isSyncing: false });
           setSyncConflict(false); setSyncStatus('synced');
           notify('Loaded the newer cloud version.', 'success');
       }
   };
 
+  const retryPendingCloudSync = useCallback(async (uid: string) => {
+      const initial = stateRef.current;
+      if (initial.user?.uid !== uid || !initial.isOnline) return;
+      const projectId = initial.projectId;
+      const hadQueuedChanges = await StorageService.hasQueuedProjectSync(uid, projectId);
+      if (hadQueuedChanges) await StorageService.flushSyncQueue(uid);
+
+      const active = stateRef.current;
+      if (active.user?.uid !== uid || active.projectId !== projectId || !active.isOnline) return;
+      if (await StorageService.hasQueuedProjectSync(uid, projectId)) {
+          if (StorageService.hasProjectSyncConflict(uid, projectId)) {
+              setSyncConflict(true);
+              setSyncStatus('error');
+          }
+          return;
+      }
+
+      if (hadQueuedChanges) {
+          const persisted = await StorageService.loadProjectLocal(projectId);
+          if (!persisted || (persisted.cloudRevision ?? 0) === 0) return;
+          const liveStateChangedDuringRetry = active !== initial;
+          const rebasedActive = {
+              ...active,
+              isSyncing: false,
+              cloudRevision: persisted.cloudRevision,
+              lastSaved: liveStateChangedDuringRetry
+                  ? Math.max(active.lastSaved, persisted.lastSaved)
+                  : persisted.lastSaved,
+          };
+          updateState({
+              isSyncing: false,
+              cloudRevision: rebasedActive.cloudRevision,
+              lastSaved: rebasedActive.lastSaved,
+          });
+          if (liveStateChangedDuringRetry) {
+              setSyncStatus('local_only');
+              setLastCloudSavedAt(null);
+              await triggerBackendSync(rebasedActive, true);
+              return;
+          }
+          setSyncConflict(false);
+          setSyncStatus('synced');
+          setLastCloudSavedAt(Date.now());
+          return;
+      }
+
+      // A clean cloud-backed project opened from cache has nothing to upload.
+      // Confirm its revision with a read so reconnect cannot turn that read into
+      // a stale write merely to restore the Cloud saved indicator.
+      const localRevision = active.cloudRevision ?? 0;
+      if (localRevision === 0) return;
+      const remote = await StorageService.loadProjectCloud(uid, projectId, undefined, true);
+      const latest = stateRef.current;
+      if (!remote || latest.user?.uid !== uid || latest.projectId !== projectId) return;
+      const remoteRevision = remote.cloudRevision ?? 0;
+      if (remoteRevision > localRevision) {
+          setSyncConflict(true);
+          setSyncStatus('error');
+          return;
+      }
+      if (remoteRevision === localRevision) {
+          setSyncConflict(false);
+          setSyncStatus('synced');
+          setLastCloudSavedAt(Date.now());
+      }
+  }, [triggerBackendSync, updateState]);
+
   // Online/Offline Listeners
   useEffect(() => {
       const handleOnline = () => {
           updateState({ isOnline: true });
           if (stateRef.current.user && !stateRef.current.user.uid.startsWith('guest_')) {
-             void StorageService.flushSyncQueue(stateRef.current.user.uid).finally(() => triggerBackendSync(stateRef.current));
+             void retryPendingCloudSync(stateRef.current.user.uid)
+                 .catch(error => reportWarning('sync-retry', 'Online cloud sync retry failed', { error: String(error) }));
           }
       };
       const handleOffline = () => updateState({ isOnline: false });
@@ -627,11 +811,15 @@ const App: React.FC = () => {
           window.removeEventListener('online', handleOnline);
           window.removeEventListener('offline', handleOffline);
       };
-  }, [triggerBackendSync, updateState]);
+  }, [retryPendingCloudSync, updateState]);
 
   // Auto-save debounce
   const syncTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
+      if (suppressNextAutosaveRef.current) {
+          suppressNextAutosaveRef.current = false;
+          return;
+      }
       if (state.user) {
           if (syncTimeoutRef.current) clearTimeout(syncTimeoutRef.current);
           syncTimeoutRef.current = setTimeout(() => {
@@ -642,6 +830,33 @@ const App: React.FC = () => {
           if (syncTimeoutRef.current) clearTimeout(syncTimeoutRef.current);
       };
   }, [state.canvases, state.titleBlock, state.notes, state.referenceImages, state.siteCaptures, triggerBackendSync, state.user, state.projectName]);
+
+  // `navigator.onLine` only reports network attachment, not whether Firebase
+  // was temporarily reachable. Keep retrying queued authenticated saves while
+  // the UI is local-only, including after a fresh app launch where no new
+  // browser `online` event will fire.
+  useEffect(() => {
+      const uid = state.user?.uid;
+      if (syncStatus !== 'local_only' || !state.isOnline || !uid || uid.startsWith('guest_')) return;
+      let running = false;
+      const retry = async () => {
+          if (running) return;
+          running = true;
+          try {
+              await retryPendingCloudSync(uid);
+          } catch (error) {
+              reportWarning('sync-retry', 'Queued cloud sync retry failed', { error: String(error) });
+          } finally {
+              running = false;
+          }
+      };
+      const initialRetry = window.setTimeout(() => void retry(), 10_000);
+      const retryInterval = window.setInterval(() => void retry(), 30_000);
+      return () => {
+          window.clearTimeout(initialRetry);
+          window.clearInterval(retryInterval);
+      };
+  }, [state.isOnline, state.user?.uid, syncStatus, retryPendingCloudSync]);
 
 
   const activeCanvas = state.canvases.find(c => c.id === state.activeCanvasId) || state.canvases[0];
@@ -1159,16 +1374,28 @@ const App: React.FC = () => {
     }
   };
 
-  const handleProjectLoad = (loadedState: MockupState) => {
-      // Ensure user context is preserved if needed, though loaded state should have data
-      // We might want to keep the current session user info if the loaded project was anonymous
+  const handleProjectLoad = async (loadedState: MockupState) => {
+      // Treat project switching as a full session boundary. Updating React
+      // state alone left stateRef/history on the previous Untitled project,
+      // allowing an in-flight autosave to switch the phone back immediately.
+      const current = stateRef.current;
       const mergedState = {
           ...normalizeProjectState(loadedState),
-          user: state.user // Keep current user
+          user: current.user,
+          isOnline: navigator.onLine,
+          isSyncing: false,
       };
-      setState(mergedState);
-      setHistory([mergedState]);
-      setHistoryIndex(0);
+      const hasPendingSync = Boolean(
+          current.user
+          && !current.user.uid.startsWith('guest_')
+          && await StorageService.hasQueuedProjectSync(current.user.uid, loadedState.projectId),
+      );
+      const loadedFromCloud = (loadedState.cloudRevision ?? 0) > 0 && !hasPendingSync;
+      setSyncStatus(loadedFromCloud ? 'synced' : 'local_only');
+      setLastCloudSavedAt(loadedFromCloud ? Date.now() : null);
+      // Opening an unchanged cloud revision is read-only. A legacy phone-only
+      // revision still needs its first cloud save after the user selects it.
+      startSession(mergedState, loadedFromCloud);
   };
 
   const handleProjectSave = async (name: string): Promise<ProjectSaveResult> => {
@@ -1207,17 +1434,27 @@ const App: React.FC = () => {
   };
 
   const handleProjectDelete = async (projectId: string) => {
-      await StorageService.deleteProjectLocal(projectId);
+      if (projectId === stateRef.current.projectId) {
+          if (syncTimeoutRef.current) clearTimeout(syncTimeoutRef.current);
+          syncAttemptRef.current += 1;
+      }
       if (state.user && !state.user.uid.startsWith('guest_')) {
           await StorageService.deleteProjectCloud(state.user.uid, projectId);
       }
+      // Keep the recoverable local copy until the authoritative cloud pointer
+      // has definitely been removed.
+      await StorageService.deleteProjectLocal(projectId);
       if (projectId !== state.projectId) return;
 
-      if (syncTimeoutRef.current) clearTimeout(syncTimeoutRef.current);
       const replacement = { ...getInitialState(), user: state.user, isOnline: state.isOnline, isSyncing: false };
       if (state.user?.uid.startsWith('guest_')) localStorage.setItem(GUEST_PROJECT_ID_KEY, replacement.projectId);
       startSession(replacement);
       await StorageService.saveProjectLocal(replacement);
+      setSyncStatus('local_only');
+      setLastCloudSavedAt(null);
+      if (replacement.user && !replacement.user.uid.startsWith('guest_')) {
+          await triggerBackendSync(replacement);
+      }
   };
 
   const handleNewProject = async () => {
@@ -1229,6 +1466,11 @@ const App: React.FC = () => {
       if (state.user?.uid.startsWith('guest_')) localStorage.setItem(GUEST_PROJECT_ID_KEY, cleanState.projectId);
       startSession(cleanState);
       await StorageService.saveProjectLocal(cleanState);
+      setSyncStatus('local_only');
+      setLastCloudSavedAt(null);
+      if (cleanState.user && !cleanState.user.uid.startsWith('guest_')) {
+          await triggerBackendSync(cleanState);
+      }
       notify('New clean project started.', 'success');
   };
 

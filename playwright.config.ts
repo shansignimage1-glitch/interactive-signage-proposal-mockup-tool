@@ -2,6 +2,9 @@ import { defineConfig, devices } from '@playwright/test';
 
 export default defineConfig({
   testDir: './tests/e2e',
+  // Firebase-backed sync runs through its dedicated config so Auth,
+  // Firestore, and Storage emulators are always present.
+  testIgnore: /firebase-cloud-sync\.spec\.ts/,
   timeout: 45_000,
   fullyParallel: false,
   retries: process.env.CI ? 2 : 0,

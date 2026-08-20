@@ -1,7 +1,7 @@
 import { getApps, initializeApp } from 'firebase/app';
-import { getAuth, GoogleAuthProvider } from 'firebase/auth';
-import { getFirestore } from 'firebase/firestore';
-import { getStorage } from 'firebase/storage';
+import { connectAuthEmulator, getAuth, GoogleAuthProvider } from 'firebase/auth';
+import { connectFirestoreEmulator, getFirestore } from 'firebase/firestore';
+import { connectStorageEmulator, getStorage } from 'firebase/storage';
 
 // Dedicated project for this app only. Never point this configuration at the
 // shared signimage-cc project used by unrelated business applications.
@@ -25,4 +25,23 @@ export const auth = getAuth(app);
 export const googleProvider = new GoogleAuthProvider();
 export const db = getFirestore(app);
 export const storage = getStorage(app);
+
+const useFirebaseEmulators = import.meta.env.VITE_FIREBASE_EMULATORS === 'true';
+if (useFirebaseEmulators) {
+  connectAuthEmulator(auth, 'http://127.0.0.1:9099', { disableWarnings: true });
+  connectFirestoreEmulator(db, '127.0.0.1', 8080);
+  connectStorageEmulator(storage, '127.0.0.1', 9199);
+}
+
+/** Test-only sign-in entry point. The production build always rejects it. */
+export const signInForFirebaseE2E = async (email: string, password: string) => {
+  if (!useFirebaseEmulators) throw new Error('Firebase E2E sign-in is disabled outside the emulator build.');
+  const { createUserWithEmailAndPassword, signInWithEmailAndPassword } = await import('firebase/auth');
+  try {
+    return await createUserWithEmailAndPassword(auth, email, password);
+  } catch (error: any) {
+    if (error?.code !== 'auth/email-already-in-use') throw error;
+    return signInWithEmailAndPassword(auth, email, password);
+  }
+};
 export default app;

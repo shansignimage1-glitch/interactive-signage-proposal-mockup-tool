@@ -8,12 +8,28 @@ service cloud.firestore {
     // listProjectsCloud queries `where('userId','==',uid)` — Firestore can
     // only prove a list query against rules that reference the same field.
     match /projects/{projectId} {
-      allow read, update, delete: if request.auth != null
-                                  && request.auth.uid == resource.data.userId;
+      // A get for a project that has not reached cloud yet has no resource
+      // data to inspect. Authorize single-document reads from the UID-prefixed
+      // path so they return "not found" immediately instead of permission
+      // denied/retrying for ~30 seconds. List queries remain data-owner scoped.
+      allow get: if request.auth != null
+                 && projectId.matches('^' + request.auth.uid + '_.*')
+                 && (!exists(/databases/$(database)/documents/projects/$(projectId))
+                     || request.auth.uid == resource.data.userId);
+      allow list: if request.auth != null
+                  && request.auth.uid == resource.data.userId;
+      allow update: if request.auth != null
+                    && projectId.matches('^' + request.auth.uid + '_.*')
+                    && request.auth.uid == resource.data.userId
+                    && request.resource.data.userId == resource.data.userId;
+      allow delete: if request.auth != null
+                    && projectId.matches('^' + request.auth.uid + '_.*')
+                    && request.auth.uid == resource.data.userId;
 
       // Allow creating a new project owned by the authenticated user
       allow create: if request.auth != null
-                    && request.auth.uid == request.resource.data.userId;
+                    && request.auth.uid == request.resource.data.userId
+                    && projectId.matches('^' + request.auth.uid + '_.*');
     }
 
     // Shared sign library: any signed-in user can browse; administrators are

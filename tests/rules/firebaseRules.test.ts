@@ -31,11 +31,32 @@ describe('Firestore project rules', () => {
     await assertFails(deleteDoc(doc(strangerDb, 'projects/owner_project')));
   });
 
+  it('lets an owner check an unsynced project path without exposing another user path', async () => {
+    const ownerDb = env.authenticatedContext('owner').firestore();
+    const strangerDb = env.authenticatedContext('stranger').firestore();
+    await assertSucceeds(getDoc(doc(ownerDb, 'projects/owner_not-yet-synced')));
+    await assertFails(getDoc(doc(strangerDb, 'projects/owner_not-yet-synced')));
+  });
+
   it('rejects forged ownership and unauthenticated access', async () => {
     const userDb = env.authenticatedContext('user-a').firestore();
     const publicDb = env.unauthenticatedContext().firestore();
     await assertFails(setDoc(doc(userDb, 'projects/forged'), { userId: 'user-b' }));
     await assertFails(getDoc(doc(publicDb, 'projects/anything')));
+  });
+
+  it('does not let a project owner transfer ownership or read a mismatched prefixed document', async () => {
+    const ownerDb = env.authenticatedContext('owner').firestore();
+    const project = doc(ownerDb, 'projects/owner_project');
+    await assertSucceeds(setDoc(project, { userId: 'owner', projectId: 'project' }));
+    await assertFails(setDoc(project, { userId: 'stranger', projectId: 'project' }));
+
+    await env.withSecurityRulesDisabled(async context => {
+      await setDoc(doc(context.firestore(), 'projects/owner_mismatched'), {
+        userId: 'stranger', projectId: 'mismatched',
+      });
+    });
+    await assertFails(getDoc(doc(ownerDb, 'projects/owner_mismatched')));
   });
 
   it('accepts encoded sign contours that Firestore otherwise rejects as nested arrays', async () => {

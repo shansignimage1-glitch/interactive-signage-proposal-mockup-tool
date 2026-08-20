@@ -12,9 +12,10 @@
     "test:watch": "vitest",
     "test:rules": "firebase emulators:exec --only firestore,storage \"vitest run --config vitest.rules.config.ts\"",
     "test:e2e": "playwright test",
+    "test:e2e:firebase": "firebase emulators:exec --only auth,firestore,storage \"playwright test --config=playwright.firebase.config.ts\"",
     "test:e2e:ipad": "playwright test --project=ipad",
     "test:e2e:install": "playwright install chromium webkit",
-    "test:all": "npm run test:unit && npm run test:rules && npm run test:e2e",
+    "test:all": "npm run test:unit && npm run test:rules && npm run test:e2e && npm run test:e2e:firebase",
     "admin:claim": "node scripts/set-admin-claim.mjs"
   },
   "dependencies": {
@@ -22,6 +23,7 @@
     "@google/genai": "^1.30.0",
     "@sentry/react": "^10.69.0",
     "exifr": "^7.1.3",
+    "fflate": "^0.8.3",
     "firebase": "^12.6.0",
     "html2canvas": "^1.4.1",
     "jose": "^6.2.8",
