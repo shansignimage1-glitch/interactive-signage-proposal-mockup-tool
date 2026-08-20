@@ -4,14 +4,14 @@ import {
   ImagePlus, Loader2, LogOut, MapPin, Mic, NotebookPen, Plus, Ruler, Save, Square, Trash2, WifiOff, X,
 } from 'lucide-react';
 import { MeasureUnit, MockupState, ProjectMetadata, ReferenceWallFieldMeasurement, SiteCapturePhoto, SiteCaptureSupportingPhoto } from '../types';
-import { currentCoordinates, reverseGeocode } from '../services/PhotoLocationService';
+import { coordinatesFromPhoto, currentCoordinates, reverseGeocode } from '../services/PhotoLocationService';
 import { optimizeImageBlob, readImageDimensions } from '../services/imageProcessing';
 import {
   deleteSiteCaptureAssets, getSiteCaptureAsset, makeSiteCaptureAssetRef, putSiteCaptureAsset, StorageService, type ProjectSaveResult,
 } from '../services/StorageService';
 import { transcribeAudio } from '../services/GeminiService';
 import { notify } from '../services/toast';
-import { displayMeasurement, parseSpokenMeasurementMm } from '../utils/fieldMeasurements';
+import { displayMeasurement, isValidSurveyPlaneSize, parseSpokenMeasurementMm } from '../utils/fieldMeasurements';
 import { normalizeProjectState } from '../utils/projectMigration';
 
 type MobileTab = 'capture' | 'views' | 'measure' | 'notes';
@@ -211,19 +211,27 @@ const MeasurementField: React.FC<{
   valueMm: number | undefined;
   unit: MeasureUnit;
   onChange: (valueMm: number | undefined) => void;
-}> = ({ label, valueMm, unit, onChange }) => (
+  requirePositive?: boolean;
+}> = ({ label, valueMm, unit, onChange, requirePositive = false }) => {
+  const invalid = valueMm !== undefined && (!Number.isFinite(valueMm) || (requirePositive && valueMm <= 0));
+  return (
   <label className="block rounded-2xl border border-slate-800 bg-[#111821] p-3">
     <span className="mb-2 block text-[10px] font-bold uppercase tracking-[0.16em] text-slate-500">{label}</span>
     <span className="flex items-center gap-2">
-      <input inputMode="decimal" type="number" min="0" step="any" value={displayMeasurement(valueMm, unit)} onChange={event => onChange(event.target.value === '' ? undefined : parseSpokenMeasurementMm(event.target.value, unit) ?? undefined)} className="h-12 min-w-0 flex-1 rounded-xl border border-slate-700 bg-[#090d12] px-3 font-mono text-lg text-white outline-none focus:border-orange-400" aria-label={`${label} in ${unit}`} />
+      <input inputMode="decimal" type="number" min={requirePositive ? '0.001' : '0'} step="any" value={displayMeasurement(valueMm, unit)} onChange={event => onChange(event.target.value === '' ? undefined : parseSpokenMeasurementMm(event.target.value, unit) ?? undefined)} className={`h-12 min-w-0 flex-1 rounded-xl border bg-[#090d12] px-3 font-mono text-lg text-white outline-none ${invalid ? 'border-red-400 focus:border-red-300' : 'border-slate-700 focus:border-orange-400'}`} aria-label={`${label} in ${unit}`} aria-invalid={invalid} />
       <span className="w-7 text-xs font-bold text-orange-300">{unit}</span>
       <DictationButton label={`Dictate ${label.toLowerCase()}`} onTranscript={text => {
         const mm = parseSpokenMeasurementMm(text, unit);
         if (mm === null) notify(`I could not find a measurement in “${text}”.`, 'warning'); else onChange(mm);
       }} />
     </span>
+    {invalid && <span className="mt-2 block text-[10px] font-semibold text-red-300">Enter a value greater than zero.</span>}
   </label>
-);
+  );
+};
+
+const hasValidReferenceWallSize = (capture: SiteCapturePhoto): boolean =>
+  isValidSurveyPlaneSize(capture.referenceWall.widthMm, capture.referenceWall.heightMm);
 
 const MobileSiteCapture: React.FC<MobileSiteCaptureProps> = ({ state, syncStatus, onUpdate, onLoadProject, onNewProject, onSaveProject, onPromoteCapture, onLogout }) => {
   const captures = state.siteCaptures ?? [];
@@ -469,9 +477,15 @@ const MobileSiteCapture: React.FC<MobileSiteCaptureProps> = ({ state, syncStatus
 
       let location: SiteCapturePhoto['location'];
       try {
-        const coordinates = await currentCoordinates();
+        // The browser geolocation request is the explicit location consent
+        // gate. Only inspect embedded EXIF GPS after that permission succeeds,
+        // so a denied choice can never be bypassed by photo metadata.
+        const deviceCoordinates = await currentCoordinates();
+        const photoCoordinates = await coordinatesFromPhoto(file);
+        const coordinates = photoCoordinates ?? deviceCoordinates;
+        const locationSource = photoCoordinates ? 'photo' : 'device';
         location = { ...coordinates };
-        try { location.address = (await reverseGeocode(coordinates, 'device')).address; } catch { /* coordinates remain useful */ }
+        try { location.address = (await reverseGeocode(coordinates, locationSource)).address; } catch { /* coordinates remain useful */ }
       } catch { /* location is optional */ }
       assertCurrentRequest();
       const commitCaptures = capturesRef.current;
@@ -629,6 +643,7 @@ const MobileSiteCapture: React.FC<MobileSiteCaptureProps> = ({ state, syncStatus
               <button onClick={() => setTab('views')} className="min-h-20 rounded-2xl border border-slate-800 bg-[#111821] p-4 text-left"><Images className="h-5 w-5 text-cyan-300" /><span className="mt-2 block text-sm font-semibold">{captures.length} captured</span></button>
               <button onClick={() => setTab('measure')} disabled={!activeCapture} className="min-h-20 rounded-2xl border border-slate-800 bg-[#111821] p-4 text-left disabled:opacity-40"><Ruler className="h-5 w-5 text-orange-300" /><span className="mt-2 block text-sm font-semibold">Field dimensions</span></button>
             </div>
+            <p className="flex items-start gap-2 px-1 text-[10px] leading-relaxed text-slate-500"><MapPin className="mt-0.5 h-3.5 w-3.5 shrink-0" />GPS is attached to a new elevation only after you allow location access. Embedded photo GPS is used for accuracy when available.</p>
             {captures.length > 0 && <div className="grid grid-cols-2 gap-3">
               <button onClick={() => choosePhoto('same-elevation')} disabled={isProcessing || !activeCapture} className="min-h-14 rounded-2xl border border-cyan-400/30 bg-cyan-400/[0.07] px-3 text-xs font-bold text-cyan-200 disabled:opacity-40"><Plus className="mx-auto mb-1 h-4 w-4" />Add to this elevation</button>
               <button onClick={() => choosePhoto('new-elevation')} disabled={isProcessing} className="min-h-14 rounded-2xl border border-orange-400/30 bg-orange-400/[0.07] px-3 text-xs font-bold text-orange-200 disabled:opacity-40"><Camera className="mx-auto mb-1 h-4 w-4" />Add another elevation</button>
@@ -647,7 +662,7 @@ const MobileSiteCapture: React.FC<MobileSiteCaptureProps> = ({ state, syncStatus
                 <div className="flex border-t border-white/5">
                   <button onClick={() => { setActiveCaptureId(capture.id); choosePhoto('same-elevation', capture.id); }} className="grid min-h-12 w-12 place-items-center text-cyan-300" aria-label={`Add photo to ${capture.label}`}><Plus className="h-4 w-4" /></button>
                   <button onClick={() => { setActiveCaptureId(capture.id); setTab('measure'); }} className="min-h-12 flex-1 text-xs font-semibold text-slate-300">Measurements</button>
-                  <button disabled={!!capture.promotedCanvasId || capture.referenceWall.widthMm === undefined || capture.referenceWall.heightMm === undefined || capture.referenceWall.planeDepthMm === undefined} onClick={() => void onPromoteCapture(capture)} className="flex min-h-12 flex-1 items-center justify-center gap-1 border-l border-white/5 px-2 text-xs font-semibold text-cyan-300 disabled:text-slate-600">{capture.promotedCanvasId ? <><Check className="h-3.5 w-3.5" /> Editor ready</> : capture.referenceWall.widthMm === undefined || capture.referenceWall.heightMm === undefined || capture.referenceWall.planeDepthMm === undefined ? 'Measurements required' : <>Create editor view<ArrowUpRight className="h-3.5 w-3.5" /></>}</button>
+                  <button disabled={!!capture.promotedCanvasId || !hasValidReferenceWallSize(capture) || !Number.isFinite(capture.referenceWall.planeDepthMm)} onClick={() => void onPromoteCapture(capture)} className="flex min-h-12 flex-1 items-center justify-center gap-1 border-l border-white/5 px-2 text-xs font-semibold text-cyan-300 disabled:text-slate-600">{capture.promotedCanvasId ? <><Check className="h-3.5 w-3.5" /> Editor ready</> : !hasValidReferenceWallSize(capture) || !Number.isFinite(capture.referenceWall.planeDepthMm) ? 'Measurements required' : <>Create editor view<ArrowUpRight className="h-3.5 w-3.5" /></>}</button>
                   <button onClick={() => void deleteCapture(capture)} className="grid min-h-12 w-12 place-items-center border-l border-white/5 text-slate-500" aria-label={`Delete ${capture.label}`}><Trash2 className="h-4 w-4" /></button>
                 </div>
               </article>
@@ -662,8 +677,8 @@ const MobileSiteCapture: React.FC<MobileSiteCaptureProps> = ({ state, syncStatus
               <select value={activeCapture.id} onChange={event => setActiveCaptureId(event.target.value)} className="h-13 w-full rounded-2xl border border-slate-700 bg-[#111821] px-4 text-sm text-white" aria-label="Measurement elevation">{captures.map(capture => <option key={capture.id} value={capture.id}>{capture.label}</option>)}</select>
               <div className="flex rounded-xl border border-slate-800 bg-[#111821] p-1">{(['mm', 'cm', 'm'] as MeasureUnit[]).map(unit => <button key={unit} onClick={() => setMeasurementUnit(unit)} className={`min-h-10 flex-1 rounded-lg text-xs font-bold ${measurementUnit === unit ? 'bg-orange-500 text-black' : 'text-slate-500'}`}>{unit}</button>)}</div>
               <label className="block"><span className="mb-1.5 block text-[10px] font-bold uppercase tracking-[0.16em] text-slate-500">Wall name</span><input value={activeCapture.referenceWall.wallName} onChange={event => patchReferenceWall({ wallName: event.target.value })} className="h-12 w-full rounded-xl border border-slate-700 bg-[#111821] px-3 text-base outline-none focus:border-orange-400" /></label>
-              <MeasurementField label="Known wall width" valueMm={activeCapture.referenceWall.widthMm} unit={measurementUnit} onChange={valueMm => patchReferenceWall({ widthMm: valueMm })} />
-              <MeasurementField label="Known wall height" valueMm={activeCapture.referenceWall.heightMm} unit={measurementUnit} onChange={valueMm => patchReferenceWall({ heightMm: valueMm })} />
+              <MeasurementField label="Known wall width" valueMm={activeCapture.referenceWall.widthMm} unit={measurementUnit} requirePositive onChange={valueMm => patchReferenceWall({ widthMm: valueMm })} />
+              <MeasurementField label="Known wall height" valueMm={activeCapture.referenceWall.heightMm} unit={measurementUnit} requirePositive onChange={valueMm => patchReferenceWall({ heightMm: valueMm })} />
               <section className="rounded-2xl border border-cyan-400/20 bg-cyan-400/[0.06] p-3">
                 <div className="mb-3"><h2 className="text-sm font-semibold text-cyan-100">Plane depth</h2><p className="mt-1 text-[10px] leading-relaxed text-cyan-100/55">Distance from the confirmed reference plane to this wall plane.</p></div>
                 <MeasurementField label="Plane depth / offset" valueMm={activeCapture.referenceWall.planeDepthMm} unit={measurementUnit} onChange={valueMm => patchReferenceWall({ planeDepthMm: valueMm })} />

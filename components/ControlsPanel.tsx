@@ -1,6 +1,6 @@
 
 import React, { useRef, useState, useEffect } from 'react';
-import { BLEND_MODES, MockupState, Sign, Point, Dimension, SignTemplate, ReferenceImage, TitleBlockField, Canvas, PaperSize, Orientation, SIGN_TYPES, SignType, UnitSystem, PlacementAnchor, PlacementSettings } from '../types';
+import { BLEND_MODES, MockupState, Sign, Point, Dimension, SignTemplate, ReferenceImage, TitleBlockField, Canvas, PaperSize, Orientation, SIGN_TYPES, SignType, UnitSystem, PlacementAnchor, PlacementSettings, SiteCapturePhoto } from '../types';
 import { getMmPerPx, formatLength, toMm, measureLine, measureBox, measureSignSizeMm, resizeSignToRealSize } from '../utils/measure';
 import { Upload, Download, Sun, Moon, Move3d, Palette, Image as ImageIcon, Plus, Trash2, Layers, Eye, Copy, Box, Minus, Maximize, Ruler, ArrowRight, ArrowDown, ArrowLeft, ArrowUp, Scissors, Check, X, Eraser, Loader2, Square, PenTool, MousePointer2, Hand, Mic, EyeOff, Undo2, Redo2, Layout, FileText, Settings, Briefcase, User, Calendar, MapPin, Notebook, Camera, Library, Sparkles, PencilLine, Grid, Save, ChevronDown, ChevronRight, Monitor, Printer, FolderOpen, HardDrive, Lock, Unlock, MessageSquareText } from 'lucide-react';
 import ImageUploader from './ImageUploader';
@@ -13,6 +13,7 @@ import { materializeTemplateDataUri } from '../services/LibraryService';
 import { calibrationForPlane, getCalibrationPlanes } from '../utils/cameraGeometry';
 import { detectSignArtwork } from '../utils/elementDetection';
 import { defaultExtrusionModeForType, getBackingDepth, getSignExtrusionMode, VISUAL_EXTRUSION_REFERENCE_WIDTH_PX } from '../utils/signExtrusion';
+import { isValidSurveyPlaneSize } from '../utils/fieldMeasurements';
 import { transcribeAudio } from '../services/GeminiService';
 
 interface ControlsPanelProps {
@@ -38,7 +39,8 @@ interface ControlsPanelProps {
   setToolMode: (mode: ToolMode) => void;
   viewLocked: boolean;
   onViewLockedChange: (locked: boolean) => void;
-  onOpenCalibration: (options?: { addPlane?: boolean }) => void;
+  onOpenCalibration: (options?: { addPlane?: boolean; widthMm?: number; heightMm?: number; planeName?: string }) => void;
+  onPromoteCapture: (capture: SiteCapturePhoto) => Promise<void>;
   showCalibrationReference: boolean;
   setShowCalibrationReference: (show: boolean) => void;
   updateDimension: (id: string, updates: Partial<Dimension>) => void;
@@ -201,6 +203,7 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
   viewLocked,
   onViewLockedChange,
   onOpenCalibration,
+  onPromoteCapture,
   showCalibrationReference,
   setShowCalibrationReference,
   updateDimension,
@@ -241,8 +244,10 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
   const [isTemplateModalOpen, setIsTemplateModalOpen] = useState(false);
   const [isViewMenuOpen, setIsViewMenuOpen] = useState(false);
   
-  const [activeTab, setActiveTab] = useState<'editor' | 'page' | 'notes'>('editor');
+  const [activeTab, setActiveTab] = useState<'editor' | 'page' | 'notes' | 'survey'>('editor');
   const [mobilePanelExpanded, setMobilePanelExpanded] = useState(false);
+  const [selectedSiteCaptureId, setSelectedSiteCaptureId] = useState<string | null>(null);
+  const [promotingSiteCaptureId, setPromotingSiteCaptureId] = useState<string | null>(null);
 
   // Target real-world dimensions for calibrated sign placement.
   const [targetWidth, setTargetWidth] = useState('');
@@ -276,6 +281,49 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
   };
 
   const activeDimension = activeCanvas.dimensions.find(d => d.id === activeCanvas.activeDimensionId);
+  const siteCaptures = state.siteCaptures ?? [];
+  const linkedSiteCapture = siteCaptures.find(capture => capture.promotedCanvasId === activeCanvas.id);
+  const selectedSiteCapture = siteCaptures.find(capture => capture.id === selectedSiteCaptureId)
+      ?? linkedSiteCapture
+      ?? siteCaptures[0];
+  const siteCaptureIds = siteCaptures.map(capture => capture.id).join('|');
+
+  useEffect(() => {
+      const linked = siteCaptures.find(capture => capture.promotedCanvasId === activeCanvas.id);
+      setSelectedSiteCaptureId(linked?.id ?? siteCaptures[0]?.id ?? null);
+  }, [state.projectId, activeCanvas.id, siteCaptureIds]);
+
+  const updateSelectedSiteCapture = (updates: Partial<SiteCapturePhoto>) => {
+      if (!selectedSiteCapture) return;
+      updateState({
+          siteCaptures: siteCaptures.map(capture => capture.id === selectedSiteCapture.id ? { ...capture, ...updates } : capture),
+      });
+  };
+
+  const createEditorViewForSurvey = async () => {
+      if (!selectedSiteCapture || selectedSiteCapture.promotedCanvasId) return;
+      setPromotingSiteCaptureId(selectedSiteCapture.id);
+      try {
+          await onPromoteCapture(selectedSiteCapture);
+      } catch (error) {
+          notify(error instanceof Error ? error.message : 'The editor view could not be created.', 'error');
+      } finally {
+          setPromotingSiteCaptureId(null);
+      }
+  };
+  const selectedSurveyLocation = selectedSiteCapture?.location;
+  const selectedSurveyHasGps = Number.isFinite(selectedSurveyLocation?.latitude)
+      && Number.isFinite(selectedSurveyLocation?.longitude);
+  const selectedSurveyHasValidWallSize = isValidSurveyPlaneSize(
+      selectedSiteCapture?.referenceWall.widthMm,
+      selectedSiteCapture?.referenceWall.heightMm,
+  );
+  const selectedSurveyCoordinates = selectedSurveyHasGps
+      ? `${selectedSurveyLocation!.latitude.toFixed(6)}, ${selectedSurveyLocation!.longitude.toFixed(6)}`
+      : '';
+  const selectedSurveyMapUrl = selectedSurveyHasGps
+      ? `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`${selectedSurveyLocation!.latitude},${selectedSurveyLocation!.longitude}`)}`
+      : '';
 
   useEffect(() => {
     if (listeningTarget === 'dimension') {
@@ -917,6 +965,12 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
               className={`flex-1 py-3 text-sm font-medium flex items-center justify-center gap-2 transition-colors border-b-2 min-w-[80px] ${activeTab === 'notes' ? 'text-blue-400 border-blue-400 bg-gray-800' : 'text-gray-400 border-transparent hover:text-gray-200 hover:bg-gray-800/50'}`}
            >
               <Notebook className="w-4 h-4" /> Notes
+           </button>
+           <button
+              onClick={() => setActiveTab('survey')}
+              className={`flex-1 py-3 text-sm font-medium flex items-center justify-center gap-2 transition-colors border-b-2 min-w-[80px] ${activeTab === 'survey' ? 'text-cyan-300 border-cyan-300 bg-gray-800' : 'text-gray-400 border-transparent hover:text-gray-200 hover:bg-gray-800/50'}`}
+           >
+              <MapPin className="w-4 h-4" /> Survey
            </button>
         </div>
 
@@ -1614,6 +1668,84 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
                 </div>
 
              </div>
+          )}
+
+          {/* SITE SURVEY TAB CONTENT */}
+          {activeTab === 'survey' && (
+              <div data-testid="site-survey-panel" className="space-y-5 animate-in fade-in duration-300 pb-20">
+                  <div>
+                      <h2 className="flex items-center gap-2 text-sm font-semibold uppercase tracking-wider text-cyan-200"><MapPin className="h-4 w-4" /> Site capture survey</h2>
+                      <p className="mt-1 text-[11px] leading-relaxed text-gray-500">Phone measurements, GPS and elevation notes stay attached to the project and are available on every signed-in device.</p>
+                  </div>
+
+                  {!selectedSiteCapture ? (
+                      <div className="rounded-xl border border-dashed border-gray-700 bg-gray-800/50 p-5 text-center">
+                          <Camera className="mx-auto h-7 w-7 text-gray-600" />
+                          <p className="mt-2 text-xs text-gray-400">No phone site captures are saved in this project.</p>
+                      </div>
+                  ) : (
+                      <>
+                          <div className="space-y-2 rounded-xl border border-gray-700 bg-gray-800 p-3">
+                              <label className="block text-[10px] font-bold uppercase tracking-wider text-gray-500">Survey elevation
+                                  <select aria-label="Survey elevation" value={selectedSiteCapture.id} onChange={event => setSelectedSiteCaptureId(event.target.value)} className="mt-1.5 min-h-11 w-full rounded-lg border border-gray-600 bg-gray-900 px-2 text-sm normal-case tracking-normal text-white">
+                                      {siteCaptures.map(capture => <option key={capture.id} value={capture.id}>{capture.label}</option>)}
+                                  </select>
+                              </label>
+                              <div className="flex items-center justify-between gap-2 text-[10px] text-gray-500">
+                                  <span>{new Date(selectedSiteCapture.capturedAt).toLocaleString()}</span>
+                                  <span className={`rounded-full px-2 py-1 font-semibold ${selectedSiteCapture.promotedCanvasId === activeCanvas.id ? 'bg-emerald-500/15 text-emerald-300' : 'bg-gray-700 text-gray-400'}`}>{selectedSiteCapture.promotedCanvasId === activeCanvas.id ? 'Current editor view' : selectedSiteCapture.promotedCanvasId ? 'Editor view ready' : 'Capture only'}</span>
+                              </div>
+                          </div>
+
+                          <section className="space-y-3 rounded-xl border border-orange-500/25 bg-orange-500/5 p-3">
+                              <div className="flex items-center gap-2"><Ruler className="h-4 w-4 text-orange-300" /><h3 className="text-xs font-semibold uppercase tracking-wider text-orange-100">Field dimensions</h3></div>
+                              <div className="grid grid-cols-2 gap-2">
+                                  <div className="rounded-lg bg-gray-900/80 p-2"><p className="text-[9px] uppercase tracking-wider text-gray-500">Wall width</p><p data-testid="survey-wall-width" className="mt-1 font-mono text-sm text-white">{selectedSiteCapture.referenceWall.widthMm === undefined ? 'Not recorded' : formatLength(selectedSiteCapture.referenceWall.widthMm, state.unitSystem)}</p></div>
+                                  <div className="rounded-lg bg-gray-900/80 p-2"><p className="text-[9px] uppercase tracking-wider text-gray-500">Wall height</p><p data-testid="survey-wall-height" className="mt-1 font-mono text-sm text-white">{selectedSiteCapture.referenceWall.heightMm === undefined ? 'Not recorded' : formatLength(selectedSiteCapture.referenceWall.heightMm, state.unitSystem)}</p></div>
+                              </div>
+                              <div className="rounded-lg bg-gray-900/80 p-2">
+                                  <p className="text-[9px] uppercase tracking-wider text-gray-500">Plane depth from {selectedSiteCapture.referenceWall.referencePlaneName || 'reference plane'}</p>
+                                  <p data-testid="survey-plane-depth" className="mt-1 font-mono text-sm text-white">{selectedSiteCapture.referenceWall.planeDepthMm === undefined ? 'Not recorded' : `${formatLength(selectedSiteCapture.referenceWall.planeDepthMm, state.unitSystem)} ${selectedSiteCapture.referenceWall.planeDepthDirection === 'forward' ? 'closer to camera' : 'further back'}`}</p>
+                              </div>
+                              <p className="text-[10px] text-gray-500">{selectedSiteCapture.referenceWall.wallName} · {selectedSiteCapture.referenceWall.method}</p>
+                          </section>
+
+                          <section className="space-y-3 rounded-xl border border-cyan-500/25 bg-cyan-500/5 p-3">
+                              <div className="flex items-center gap-2"><MapPin className="h-4 w-4 text-cyan-300" /><h3 className="text-xs font-semibold uppercase tracking-wider text-cyan-100">GPS location</h3></div>
+                              <p data-testid="survey-address" className="text-sm leading-relaxed text-white">{selectedSurveyLocation?.address || 'No street address recorded'}</p>
+                              {selectedSurveyHasGps ? (
+                                  <div className="space-y-2">
+                                      <p data-testid="survey-gps-coordinates" className="font-mono text-xs text-cyan-200">{selectedSurveyCoordinates}</p>
+                                      <div className="flex items-center justify-between gap-2">
+                                          <p data-testid="survey-gps-accuracy" className="text-[10px] text-gray-400">{Number.isFinite(selectedSurveyLocation?.accuracy) ? `Accuracy ±${Math.round(selectedSurveyLocation!.accuracy!)}m` : 'GPS accuracy not supplied'}</p>
+                                          <a href={selectedSurveyMapUrl} target="_blank" rel="noreferrer" className="rounded-lg border border-cyan-500/30 bg-cyan-500/10 px-2.5 py-1.5 text-[10px] font-semibold text-cyan-200 hover:bg-cyan-500/20">Open map</a>
+                                      </div>
+                                  </div>
+                              ) : <p data-testid="survey-gps-coordinates" className="text-xs text-gray-500">No GPS coordinates recorded</p>}
+                          </section>
+
+                          <section className="space-y-3 rounded-xl border border-blue-500/20 bg-blue-500/5 p-3">
+                              <div className="flex items-center gap-2"><Notebook className="h-4 w-4 text-blue-300" /><h3 className="text-xs font-semibold uppercase tracking-wider text-blue-100">Site notes</h3></div>
+                              <label className="block text-[10px] font-bold uppercase tracking-wider text-gray-500">Elevation notes
+                                  <textarea data-testid="survey-elevation-notes" aria-label={`${selectedSiteCapture.label} notes`} value={selectedSiteCapture.notes} onChange={event => updateSelectedSiteCapture({ notes: event.target.value })} rows={4} placeholder="No elevation notes recorded" className="mt-1.5 w-full rounded-lg border border-gray-700 bg-gray-900 p-2.5 text-sm font-normal normal-case tracking-normal text-white outline-none focus:border-blue-400" />
+                              </label>
+                              <label className="block text-[10px] font-bold uppercase tracking-wider text-gray-500">Measurement notes
+                                  <textarea data-testid="survey-measurement-notes" aria-label="Measurement notes" value={selectedSiteCapture.referenceWall.notes} onChange={event => updateSelectedSiteCapture({ referenceWall: { ...selectedSiteCapture.referenceWall, notes: event.target.value } })} rows={4} placeholder="No measurement notes recorded" className="mt-1.5 w-full rounded-lg border border-gray-700 bg-gray-900 p-2.5 text-sm font-normal normal-case tracking-normal text-white outline-none focus:border-blue-400" />
+                              </label>
+                          </section>
+
+                          {!selectedSiteCapture.promotedCanvasId ? (
+                              <button type="button" onClick={() => void createEditorViewForSurvey()} disabled={promotingSiteCaptureId === selectedSiteCapture.id || !selectedSurveyHasValidWallSize || !Number.isFinite(selectedSiteCapture.referenceWall.planeDepthMm)} className="flex min-h-12 w-full items-center justify-center gap-2 rounded-xl bg-cyan-500 px-3 text-sm font-semibold text-gray-950 disabled:cursor-not-allowed disabled:bg-gray-700 disabled:text-gray-500">
+                                  {promotingSiteCaptureId === selectedSiteCapture.id ? <><Loader2 className="h-4 w-4 animate-spin" /> Creating editor view</> : <><ArrowUp className="h-4 w-4" /> Create editor view</>}
+                              </button>
+                          ) : selectedSiteCapture.promotedCanvasId !== activeCanvas.id ? (
+                              <button type="button" onClick={() => updateState({ activeCanvasId: selectedSiteCapture.promotedCanvasId! })} className="flex min-h-12 w-full items-center justify-center gap-2 rounded-xl border border-cyan-500/40 bg-cyan-500/10 px-3 text-sm font-semibold text-cyan-200 hover:bg-cyan-500/20"><ArrowRight className="h-4 w-4" /> Open editor view</button>
+                          ) : (
+                              <button data-testid="calibrate-from-survey" type="button" onClick={() => onOpenCalibration({ widthMm: selectedSiteCapture.referenceWall.widthMm, heightMm: selectedSiteCapture.referenceWall.heightMm, planeName: selectedSiteCapture.referenceWall.wallName })} disabled={!selectedSurveyHasValidWallSize} className="flex min-h-12 w-full items-center justify-center gap-2 rounded-xl border border-orange-400/50 bg-orange-500/10 px-3 text-sm font-semibold text-orange-100 hover:bg-orange-500/20 disabled:cursor-not-allowed disabled:border-gray-700 disabled:bg-gray-800 disabled:text-gray-500"><Ruler className="h-4 w-4" /> Calibrate from survey</button>
+                          )}
+                      </>
+                  )}
+              </div>
           )}
 
           {/* NOTES TAB CONTENT */}

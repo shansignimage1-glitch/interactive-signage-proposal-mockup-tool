@@ -177,6 +177,164 @@ test('phone mode captures an original, records wall geometry, dictates notes, an
   await expect(page.getByTestId('mobile-site-capture')).toBeVisible();
 });
 
+test('zero wall dimensions show validation and keep editor-view promotion disabled', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'iphone', 'Wall-size validation is platform-independent and runs once on the iPhone profile.');
+
+  await page.goto('/?mobileCapture=1');
+  await page.getByRole('button', { name: 'Continue as Guest' }).click();
+  const mobile = page.getByTestId('mobile-site-capture');
+  await mobile.locator('input[type=file]').setInputFiles({ name: 'zero-wall.png', mimeType: 'image/png', buffer: PNG_1X1 });
+  await expect(mobile.getByRole('heading', { name: 'Reference wall' })).toBeVisible();
+
+  const width = mobile.getByLabel('Known wall width in m');
+  await width.fill('0');
+  await mobile.getByLabel('Known wall height in m').fill('6.2');
+
+  await expect(width).toHaveAttribute('aria-invalid', 'true');
+  await expect(mobile.getByText('Enter a value greater than zero.')).toBeVisible();
+
+  await mobile.getByRole('button', { name: 'Views' }).click();
+  const promotion = mobile.getByRole('button', { name: 'Measurements required' });
+  await expect(promotion).toBeVisible();
+  await expect(promotion).toBeDisabled();
+});
+
+test('guest resume never opens a project that is now owned by an account', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'iphone', 'Guest ownership isolation is platform-independent and runs once on the iPhone profile.');
+
+  await page.goto('/?mobileCapture=1');
+  await page.getByRole('button', { name: 'Continue as Guest' }).click();
+  const mobile = page.getByTestId('mobile-site-capture');
+  await mobile.getByRole('button', { name: 'Choose project' }).click();
+  const savedProjects = page.getByLabel('Saved projects');
+  await savedProjects.getByLabel('Current project name').fill('Private account project');
+  await savedProjects.getByRole('button', { name: 'Save current project' }).click();
+
+  const privateProjectId = await page.evaluate(async () => {
+    const { StorageService } = await import(/* @vite-ignore */ ('/services/StorageService.ts' as string));
+    const projectId = localStorage.getItem('signagepro_guest_project_id');
+    if (!projectId) throw new Error('Guest project marker is missing.');
+    const project = await StorageService.loadProjectLocal(projectId);
+    if (!project) throw new Error('Guest project is missing.');
+    await StorageService.saveProjectLocal({
+      ...project,
+      user: { uid: 'authenticated_owner', displayName: 'Account owner', email: null, photoURL: null },
+    });
+    return projectId;
+  });
+
+  await savedProjects.getByRole('button', { name: /Private account project/ }).click();
+  await mobile.getByRole('button', { name: 'Sign out' }).click();
+  await page.getByRole('button', { name: 'Continue as Guest' }).click();
+
+  await expect(mobile.getByRole('button', { name: 'Choose project' })).toContainText('Untitled Project');
+  const resumedProjectId = await page.evaluate(() => localStorage.getItem('signagepro_guest_project_id'));
+  expect(resumedProjectId).toBeTruthy();
+  expect(resumedProjectId).not.toBe(privateProjectId);
+});
+
+test('in-flight editor-view promotion cannot write into a different project', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'iphone', 'The promotion project-switch race is platform-independent and runs once on the iPhone profile.');
+
+  await page.goto('/?mobileCapture=1');
+  await page.getByRole('button', { name: 'Continue as Guest' }).click();
+  const mobile = page.getByTestId('mobile-site-capture');
+  await mobile.locator('input[type=file]').setInputFiles({ name: 'promotion-source.png', mimeType: 'image/png', buffer: PNG_1X1 });
+  await expect(mobile.getByRole('heading', { name: 'Reference wall' })).toBeVisible();
+  await mobile.getByLabel('Known wall width in m').fill('12');
+  await mobile.getByLabel('Known wall height in m').fill('6');
+
+  await mobile.getByRole('button', { name: 'Choose project' }).click();
+  const savedProjects = page.getByLabel('Saved projects');
+  await savedProjects.getByLabel('Current project name').fill('Promotion Source');
+  await savedProjects.getByRole('button', { name: 'Save current project' }).click();
+  await savedProjects.getByRole('button', { name: 'New project' }).click();
+  await mobile.getByRole('button', { name: 'Choose project' }).click();
+  await savedProjects.getByLabel('Current project name').fill('Promotion Target');
+  await savedProjects.getByRole('button', { name: 'Save current project' }).click();
+  await savedProjects.getByRole('button', { name: /Promotion Source/ }).click();
+
+  await page.evaluate(() => {
+    const readAsDataUrl = FileReader.prototype.readAsDataURL;
+    (window as any).__promotionReadReleases = [];
+    FileReader.prototype.readAsDataURL = function(this: FileReader, blob: Blob) {
+      (window as any).__promotionReadReleases.push(() => readAsDataUrl.call(this, blob));
+    };
+  });
+
+  await mobile.getByRole('button', { name: 'Views' }).click();
+  await mobile.getByRole('button', { name: 'Create editor view' }).click();
+  await expect.poll(() => page.evaluate(() => (window as any).__promotionReadReleases.length)).toBe(1);
+
+  await mobile.getByRole('button', { name: 'Choose project' }).click();
+  await savedProjects.getByRole('button', { name: /Promotion Target/ }).click();
+  await page.evaluate(() => (window as any).__promotionReadReleases.shift()());
+  await page.waitForTimeout(250);
+
+  await mobile.getByRole('button', { name: 'Choose project' }).click();
+  await savedProjects.getByRole('button', { name: 'Save current project' }).click();
+  const target = await page.evaluate(async () => {
+    const { StorageService } = await import(/* @vite-ignore */ ('/services/StorageService.ts' as string));
+    const metadata = (await StorageService.listProjectsLocal()).find(project => project.name === 'Promotion Target');
+    const project = metadata ? await StorageService.loadProjectLocal(metadata.id) : null;
+    return project ? {
+      canvasCount: project.canvases.length,
+      backgroundImage: project.canvases[0]?.backgroundImage ?? '',
+      captureCount: project.siteCaptures?.length ?? 0,
+    } : null;
+  });
+  expect(target).toEqual({ canvasCount: 1, backgroundImage: '', captureCount: 0 });
+});
+
+test('concurrent editor-view promotion creates exactly one canvas', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'iphone', 'The duplicate-promotion race is platform-independent and runs once on the iPhone profile.');
+
+  await page.goto('/?mobileCapture=1');
+  await page.getByRole('button', { name: 'Continue as Guest' }).click();
+  const mobile = page.getByTestId('mobile-site-capture');
+  await mobile.locator('input[type=file]').setInputFiles({ name: 'double-promotion.png', mimeType: 'image/png', buffer: PNG_1X1 });
+  await expect(mobile.getByRole('heading', { name: 'Reference wall' })).toBeVisible();
+  await mobile.getByLabel('Known wall width in m').fill('12');
+  await mobile.getByLabel('Known wall height in m').fill('6');
+  await mobile.getByRole('button', { name: 'Views' }).click();
+
+  await page.evaluate(() => {
+    const readAsDataUrl = FileReader.prototype.readAsDataURL;
+    (window as any).__promotionReadReleases = [];
+    FileReader.prototype.readAsDataURL = function(this: FileReader, blob: Blob) {
+      (window as any).__promotionReadReleases.push(() => readAsDataUrl.call(this, blob));
+    };
+  });
+
+  const promotion = mobile.getByRole('button', { name: 'Create editor view' });
+  await promotion.evaluate(element => {
+    (element as HTMLButtonElement).click();
+    (element as HTMLButtonElement).click();
+  });
+  await expect.poll(() => page.evaluate(() => (window as any).__promotionReadReleases.length)).toBe(2);
+  await page.evaluate(() => {
+    const releases = (window as any).__promotionReadReleases.splice(0);
+    releases.forEach((release: () => void) => release());
+  });
+  await expect(mobile.getByText('Editor ready')).toBeVisible();
+  await page.waitForTimeout(250);
+
+  await mobile.getByRole('button', { name: 'Choose project' }).click();
+  await page.getByLabel('Saved projects').getByRole('button', { name: 'Save current project' }).click();
+  const promoted = await page.evaluate(async () => {
+    const { StorageService } = await import(/* @vite-ignore */ ('/services/StorageService.ts' as string));
+    const projectId = localStorage.getItem('signagepro_guest_project_id');
+    const project = projectId ? await StorageService.loadProjectLocal(projectId) : null;
+    const capture = project?.siteCaptures?.[0];
+    return project && capture ? {
+      canvasIds: project.canvases.map(canvas => canvas.id),
+      promotedCanvasId: capture.promotedCanvasId,
+    } : null;
+  });
+  expect(promoted?.canvasIds).toHaveLength(1);
+  expect(promoted?.promotedCanvasId).toBe(promoted?.canvasIds[0]);
+});
+
 test('phone capture falls back when the bitmap decoder rejects a camera blob', async ({ page }, testInfo) => {
   test.skip(!PHONE_PROJECTS.includes(testInfo.project.name), 'Camera blob compatibility is verified on phone profiles.');
 

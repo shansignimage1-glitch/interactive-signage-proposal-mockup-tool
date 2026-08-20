@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { displayMeasurement, parseSpokenMeasurementMm } from '../../utils/fieldMeasurements';
+import { displayMeasurement, isValidSurveyPlaneSize, parseSpokenMeasurementMm } from '../../utils/fieldMeasurements';
 
 describe('mobile field measurements', () => {
   it('normalizes typed and dictated metric measurements to millimetres', () => {
@@ -18,5 +18,12 @@ describe('mobile field measurements', () => {
   it('rejects transcripts without a usable measurement', () => {
     expect(parseSpokenMeasurementMm('the back wall')).toBeNull();
   });
-});
 
+  it('requires two finite, positive survey dimensions', () => {
+    expect(isValidSurveyPlaneSize(12_000, 6_200)).toBe(true);
+    expect(isValidSurveyPlaneSize(0, 6_200)).toBe(false);
+    expect(isValidSurveyPlaneSize(12_000, 0)).toBe(false);
+    expect(isValidSurveyPlaneSize(Number.NaN, 6_200)).toBe(false);
+    expect(isValidSurveyPlaneSize(undefined, 6_200)).toBe(false);
+  });
+});

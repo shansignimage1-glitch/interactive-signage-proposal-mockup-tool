@@ -1,6 +1,6 @@
 
 import { db, storage } from '../firebase';
-import { collection, deleteDoc, doc, getDoc, getDocs, limit, query, runTransaction, setDoc, where } from 'firebase/firestore';
+import { collection, deleteDoc, doc, getDoc, getDocFromServer, getDocs, getDocsFromServer, limit, query, runTransaction, setDoc, where } from 'firebase/firestore';
 import { deleteObject, getBytes, getDownloadURL, listAll, ref as storageRef, uploadBytes, type StorageReference } from 'firebase/storage';
 import { MockupState, ProjectMetadata } from '../types';
 import { hashDataUri, dataUriToBlob } from './imageHash';
@@ -440,6 +440,7 @@ export const StorageService = {
       userId: string,
       projectId: string,
       onResolveIssues?: (r: Pick<ResolveResult, 'failedRefs' | 'needsReconnect'>) => void,
+      throwOnCloudError = false,
   ): Promise<MockupState | null> => {
       const localCandidate = await StorageService.loadProjectLocal(projectId);
       if (userId.startsWith('guest_')) return localCandidate;
@@ -459,7 +460,7 @@ export const StorageService = {
       const hasPendingLocalChanges = local
           ? await StorageService.hasQueuedProjectSync(userId, projectId)
           : false;
-      const cloud = await StorageService.loadProjectCloud(userId, projectId, onResolveIssues);
+      const cloud = await StorageService.loadProjectCloud(userId, projectId, onResolveIssues, false, throwOnCloudError);
       // A failed/empty cloud read must not manufacture a dirty write. Existing
       // queued edits remain queued; a clean cached revision stays read-only.
       if (!cloud) return local;
@@ -515,6 +516,18 @@ export const StorageService = {
           if (!project) {
               await idbOperation(STORE_SYNC_QUEUE, 'readwrite', store => store.delete(job.projectId));
               projectSyncConflicts.delete(revisionKey(userId, job.projectId));
+              continue;
+          }
+          if (project.user?.uid !== job.userId) {
+              // Queue records are account-scoped. Never replay a guest or
+              // another account's local snapshot into this user's cloud path.
+              await idbOperation(STORE_SYNC_QUEUE, 'readwrite', store => store.delete(job.projectId));
+              projectSyncConflicts.delete(revisionKey(userId, job.projectId));
+              reportWarning('sync-queue', 'Discarded a queued project whose local owner no longer matches', {
+                  projectId: job.projectId,
+                  queuedUserId: job.userId,
+                  localOwnerUid: project.user?.uid ?? null,
+              });
               continue;
           }
           let projectToSync = project;
@@ -696,6 +709,14 @@ export const StorageService = {
   },
 
   saveProject: async (userId: string, state: MockupState, fromQueue = false, force = false): Promise<ProjectSaveResult> => {
+      if (!userId.startsWith('guest_') && state.user?.uid !== userId) {
+          reportWarning('sync-owner', 'Blocked a cloud save whose project owner does not match the active account', {
+              projectId: state.projectId,
+              userId,
+              projectOwnerUid: state.user?.uid ?? null,
+          });
+          return 'error';
+      }
       const key = revisionKey(userId, state.projectId);
       if (deletedProjectKeys.has(key)) return 'error';
       const deletionEpoch = projectDeletionEpochs.get(key) ?? 0;
@@ -950,14 +971,18 @@ export const StorageService = {
        }
    },
 
-  listProjectsCloud: async (userId: string): Promise<ProjectMetadata[]> => {
+  listProjectsCloud: async (userId: string, throwOnError = false): Promise<ProjectMetadata[]> => {
       if (userId.startsWith('guest_')) return [];
       try {
           // No orderBy — combining `where` with `orderBy` on a different field
           // requires a composite Firestore index to be deployed first, and fails
           // silently (empty list) until that index exists. Sorting client-side
           // needs only the automatic single-field index Firestore always has.
-          const snapshot = await getDocs(query(collection(db, FIRESTORE_COLLECTION), where('userId', '==', userId), limit(50)));
+          // Strict auth/discovery reads must never interpret an offline cache
+          // miss as an authoritative empty account. Ordinary project-manager
+          // reads may still use Firestore's normal cache-first fallback.
+          const readProjects = throwOnError ? getDocsFromServer : getDocs;
+          const snapshot = await readProjects(query(collection(db, FIRESTORE_COLLECTION), where('userId', '==', userId), limit(50)));
 
           const seen = new Set<string>();
           const projects = snapshot.docs.map(doc => {
@@ -983,6 +1008,7 @@ export const StorageService = {
           return projects;
       } catch (e) {
           reportError('firestore-list', e, { userId, permissionDenied: (e as any)?.code === 'permission-denied' });
+          if (throwOnError) throw e;
           return [];
       }
   },
@@ -992,6 +1018,7 @@ export const StorageService = {
       projectId: string,
       onResolveIssues?: (r: Pick<ResolveResult, 'failedRefs' | 'needsReconnect'>) => void,
       forceRefresh = false,
+      throwOnError = false,
   ): Promise<MockupState | null> => {
       if (userId.startsWith('guest_')) return null;
        try {
@@ -1005,7 +1032,8 @@ export const StorageService = {
            if (usedCachedIndex) knownCloudProjectIndexFetchedAt.delete(key);
            else index = undefined;
            if (!index) {
-               const snapshot = await getDoc(doc(db, FIRESTORE_COLLECTION, projectDocumentId(userId, projectId)));
+               const readIndex = forceRefresh || throwOnError ? getDocFromServer : getDoc;
+               const snapshot = await readIndex(doc(db, FIRESTORE_COLLECTION, projectDocumentId(userId, projectId)));
                if (!snapshot.exists()) {
                    knownCloudProjectIndexes.delete(key);
                    knownCloudProjectIndexFetchedAt.delete(key);
@@ -1021,7 +1049,7 @@ export const StorageService = {
               if (!usedCachedIndex) throw cachedError;
               // The cached pointer may have been superseded and aged out by
               // another device. Refresh once and retry the authoritative path.
-              const snapshot = await getDoc(doc(db, FIRESTORE_COLLECTION, projectDocumentId(userId, projectId)));
+              const snapshot = await getDocFromServer(doc(db, FIRESTORE_COLLECTION, projectDocumentId(userId, projectId)));
                if (!snapshot.exists()) {
                    knownCloudProjectIndexes.delete(key);
                    knownCloudProjectIndexFetchedAt.delete(key);
@@ -1041,6 +1069,7 @@ export const StorageService = {
           return resolved.state;
       } catch (e) {
           reportError('firestore-load', e, { userId, projectId, permissionDenied: (e as any)?.code === 'permission-denied' });
+          if (throwOnError) throw e;
           return null;
       }
   },

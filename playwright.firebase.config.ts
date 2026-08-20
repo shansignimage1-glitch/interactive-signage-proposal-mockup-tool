@@ -2,7 +2,7 @@ import { defineConfig, devices } from '@playwright/test';
 
 export default defineConfig({
   testDir: './tests/e2e',
-  testMatch: /firebase-cloud-sync\.spec\.ts/,
+  testMatch: /(?:firebase-cloud-sync\.spec|firebase-site-survey\.firebase)\.ts/,
   // The Xplore regression uploads/restores a 60,000-point project, holds the
   // cloud status for 12 seconds, then opens clean iPad and desktop contexts.
   // WebKit on loaded Windows hosts can legitimately take more than four minutes.

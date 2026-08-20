@@ -11,6 +11,9 @@ const readStateUpload = async (blob: Blob) => JSON.parse(
 const mocks = vi.hoisted(() => {
   const transactionSet = vi.fn();
   const getDoc = vi.fn();
+  const getDocFromServer = vi.fn();
+  const getDocs = vi.fn();
+  const getDocsFromServer = vi.fn();
   const getDownloadURL = vi.fn();
   const uploadBytes = vi.fn();
   const getBytes = vi.fn();
@@ -24,7 +27,7 @@ const mocks = vi.hoisted(() => {
     uploadImage, deleteImage: vi.fn(), deleteAllAppData: vi.fn(),
   };
   return {
-    transactionSet, getDoc, getDownloadURL, uploadBytes, getBytes, deleteDoc, listAll, deleteObject, uploadImage, ensureReady, connector,
+    transactionSet, getDoc, getDocFromServer, getDocs, getDocsFromServer, getDownloadURL, uploadBytes, getBytes, deleteDoc, listAll, deleteObject, uploadImage, ensureReady, connector,
     uploadedObjects: new Map<string, Uint8Array>(),
     remoteExists: false, remoteRevision: 0, remoteStatePath: undefined as string | undefined,
     cloudDocs: [] as Array<{ data: () => any }>,
@@ -40,7 +43,9 @@ vi.mock('firebase/firestore', () => ({
   limit: vi.fn((value) => value),
   doc: vi.fn((_db, collectionName, id) => ({ collectionName, id })),
   getDoc: mocks.getDoc,
-  getDocs: vi.fn(async () => ({ docs: mocks.cloudDocs, empty: mocks.cloudDocs.length === 0 })),
+  getDocFromServer: mocks.getDocFromServer,
+  getDocs: mocks.getDocs,
+  getDocsFromServer: mocks.getDocsFromServer,
   deleteDoc: mocks.deleteDoc,
   setDoc: vi.fn(),
   runTransaction: vi.fn(async (_db, callback) => callback({
@@ -97,6 +102,9 @@ describe('StorageService save/load', () => {
     mocks.uploadImage.mockReset();
     mocks.getDownloadURL.mockReset();
     mocks.getDoc.mockImplementation(async () => ({ exists: () => !!mocks.cloudProject, data: () => mocks.cloudProject }));
+    mocks.getDocFromServer.mockImplementation(async () => ({ exists: () => !!mocks.cloudProject, data: () => mocks.cloudProject }));
+    mocks.getDocs.mockImplementation(async () => ({ docs: mocks.cloudDocs, empty: mocks.cloudDocs.length === 0 }));
+    mocks.getDocsFromServer.mockImplementation(async () => ({ docs: mocks.cloudDocs, empty: mocks.cloudDocs.length === 0 }));
     mocks.ensureReady.mockResolvedValue(true);
     mocks.remoteExists = false;
     mocks.remoteRevision = 0;
@@ -296,7 +304,12 @@ describe('StorageService save/load', () => {
 
   it('serializes overlapping cloud saves while keeping the newest phone edit locally durable', async () => {
     const projectId = `overlap-${Date.now()}`;
-    const first = makeProject({ projectId, notes: 'first edit', cloudRevision: 0 });
+    const first = makeProject({
+      projectId,
+      notes: 'first edit',
+      cloudRevision: 0,
+      user: { uid: 'user-overlap', displayName: 'Owner', email: null, photoURL: null },
+    });
     const second = { ...first, notes: 'newest edit' };
     let releaseFirstUpload!: () => void;
     let markFirstUploadStarted!: () => void;
@@ -388,7 +401,11 @@ describe('StorageService save/load', () => {
 
   it('does not let an in-flight save recreate a deleted project', async () => {
     const projectId = `delete-race-${Date.now()}`;
-    const project = makeProject({ projectId, notes: 'must stay deleted' });
+    const project = makeProject({
+      projectId,
+      notes: 'must stay deleted',
+      user: { uid: 'user-delete-race', displayName: 'Owner', email: null, photoURL: null },
+    });
     const originalSaveLocal = StorageService.saveProjectLocal.bind(StorageService);
     let releaseLocal!: () => void;
     let markLocalStarted!: () => void;
@@ -421,7 +438,11 @@ describe('StorageService save/load', () => {
   });
 
   it('queues a project after an online cloud failure and flushes it without a browser online event', async () => {
-    const project = makeProject({ projectId: `retry-${Date.now()}`, projectName: 'Xplore aviation' });
+    const project = makeProject({
+      projectId: `retry-${Date.now()}`,
+      projectName: 'Xplore aviation',
+      user: { uid: 'user-retry', displayName: 'Owner', email: null, photoURL: null },
+    });
     mocks.uploadBytes.mockRejectedValueOnce(new Error('temporary Firebase outage'));
 
     await expect(StorageService.saveProject('user-retry', project)).resolves.toBe('queued');
@@ -434,6 +455,32 @@ describe('StorageService save/load', () => {
     await expect(StorageService.flushSyncQueue('user-retry')).resolves.toBe(1);
     expect(mocks.transactionSet).toHaveBeenCalledOnce();
     await StorageService.deleteProjectLocal(project.projectId);
+  });
+
+  it('discards a queued snapshot when its local owner no longer matches the queued account', async () => {
+    const project = makeProject({
+      projectId: `queue-owner-mismatch-${Date.now()}`,
+      projectName: 'Private project',
+      user: { uid: 'user-b', displayName: 'B', email: null, photoURL: null },
+    });
+    await StorageService.saveProjectLocal(project);
+    await StorageService.queueProjectSync('user-a', project.projectId);
+
+    await expect(StorageService.flushSyncQueue('user-a')).resolves.toBe(0);
+    expect(await StorageService.hasQueuedProjectSync('user-a', project.projectId)).toBe(false);
+    expect(mocks.transactionSet).not.toHaveBeenCalled();
+    await StorageService.deleteProjectLocal(project.projectId);
+  });
+
+  it('blocks a direct cloud save when the project owner differs from the account', async () => {
+    const project = makeProject({
+      projectId: `save-owner-mismatch-${Date.now()}`,
+      user: { uid: 'user-b', displayName: 'B', email: null, photoURL: null },
+    });
+
+    await expect(StorageService.saveProject('user-a', project)).resolves.toBe('error');
+    expect(mocks.uploadBytes).not.toHaveBeenCalled();
+    expect(mocks.transactionSet).not.toHaveBeenCalled();
   });
 
   it('rebases a newer queued revision-zero edit onto the existing cloud revision after reload', async () => {
@@ -514,6 +561,57 @@ describe('StorageService save/load', () => {
     expect(mocks.deleteObject).not.toHaveBeenCalled();
   });
 
+  it('preserves the empty-list fallback by default and rejects cloud-list failures in strict mode', async () => {
+    mocks.getDocs.mockRejectedValue(new Error('temporary Firestore list outage'));
+    mocks.getDocsFromServer.mockRejectedValue(new Error('temporary Firestore list outage'));
+
+    await expect(StorageService.listProjectsCloud('user-1')).resolves.toEqual([]);
+    await expect(StorageService.listProjectsCloud('user-1', true)).rejects.toThrow('temporary Firestore list outage');
+  });
+
+  it('preserves the local/null load fallback by default and rejects cloud-load failures in strict mode', async () => {
+    mocks.getDoc.mockRejectedValue(new Error('temporary Firestore load outage'));
+    mocks.getDocFromServer.mockRejectedValue(new Error('temporary Firestore load outage'));
+    const defaultProjectId = `default-load-fallback-${Date.now()}`;
+    const strictProjectId = `strict-load-fallback-${Date.now()}`;
+
+    await expect(StorageService.loadProject('user-1', defaultProjectId)).resolves.toBeNull();
+    await expect(StorageService.loadProject('user-1', strictProjectId, undefined, true)).rejects.toThrow('temporary Firestore load outage');
+  });
+
+  it('uses the server rather than a cache-only empty list for strict discovery', async () => {
+    const projectId = `server-list-${Date.now()}`;
+    mocks.cloudDocs = [{ data: () => ({
+      userId: 'user-1', projectId, projectName: 'Server project', updatedAt: 42, cloudRevision: 1,
+    }) }];
+    mocks.getDocs.mockResolvedValue({ docs: [], empty: true });
+
+    await expect(StorageService.listProjectsCloud('user-1', true)).resolves.toEqual([
+      expect.objectContaining({ id: projectId, name: 'Server project' }),
+    ]);
+    expect(mocks.getDocsFromServer).toHaveBeenCalledOnce();
+    expect(mocks.getDocs).not.toHaveBeenCalled();
+  });
+
+  it('uses the authoritative server document for strict project loading', async () => {
+    const project = makeProject({ projectId: `server-load-${Date.now()}`, projectName: 'Authoritative server project', cloudRevision: 2 });
+    const statePath = `users/user-1/projects/${project.projectId}/revisions/2.json.gz`;
+    mocks.uploadedObjects.set(statePath, gzipSync(strToU8(JSON.stringify(project))));
+    mocks.cloudProject = {
+      schemaVersion: 2, statePath, stateEncoding: 'gzip', userId: 'user-1',
+      projectId: project.projectId, projectName: project.projectName,
+      updatedAt: project.lastSaved, lastSaved: project.lastSaved, cloudRevision: 2,
+    };
+    mocks.getDoc.mockResolvedValue({ exists: () => false, data: () => undefined });
+
+    const restored = await StorageService.loadProject('user-1', project.projectId, undefined, true);
+
+    expect(restored?.projectName).toBe('Authoritative server project');
+    expect(restored?.cloudRevision).toBe(2);
+    expect(mocks.getDocFromServer).toHaveBeenCalledOnce();
+    expect(mocks.getDoc).not.toHaveBeenCalled();
+  });
+
   it('reuses the Firestore index returned by the project list when opening a cloud project', async () => {
     const project = makeProject({ projectId: `listed-${Date.now()}`, projectName: 'Xplore aviation' });
     const statePath = `users/user-1/projects/${project.projectId}/revisions/1.json.gz`;
@@ -562,7 +660,7 @@ describe('StorageService save/load', () => {
 
     expect(restored?.projectName).toBe('Fresh Xplore');
     expect(restored?.cloudRevision).toBe(2);
-    expect(mocks.getDoc).toHaveBeenCalledOnce();
+    expect(mocks.getDocFromServer).toHaveBeenCalledOnce();
   });
 
   it('refreshes a valid retained revision on the next selection instead of staying stale', async () => {

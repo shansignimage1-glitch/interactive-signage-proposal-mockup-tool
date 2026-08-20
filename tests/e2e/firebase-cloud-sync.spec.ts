@@ -3,6 +3,8 @@ import { devices, expect, test } from '@playwright/test';
 const EMAIL = 'xplore-iphone-e2e@example.test';
 const PASSWORD = 'xplore-iphone-e2e-password';
 const NEW_PROJECT_EMAIL = 'new-project-iphone-e2e@example.test';
+const INACTIVE_QUEUE_EMAIL = 'inactive-project-queue-e2e@example.test';
+const DISCOVERY_CANCELLATION_EMAIL = 'cloud-discovery-cancellation-e2e@example.test';
 const PROJECT_ID = 'proj_xplore_aviation_e2e';
 const QUEUED_PHONE_NOTE = 'Queued on iPhone before reload — preserve this newer survey note.';
 
@@ -250,4 +252,287 @@ test('a new authenticated iPhone project uploads immediately and opens on a clea
   });
   expect(restoredProjectId).toBe(created!.id);
   await cleanIpad.close();
+});
+
+test('drains a queued edit for inactive Project A after synced Project B opens', async ({ page }) => {
+  test.setTimeout(180_000);
+  const projectAId = 'proj_inactive_queue_a';
+  const projectBId = 'proj_active_synced_b';
+  const queuedNote = 'Project A phone edit queued while offline.';
+
+  await page.goto('/?mobileCapture=1');
+  await signIn(page, INACTIVE_QUEUE_EMAIL);
+
+  const seeded = await page.evaluate(async ({ projectAId, projectBId, queuedNote }) => {
+    const { auth } = await import(/* @vite-ignore */ ('/firebase.ts' as string));
+    const { StorageService } = await import(/* @vite-ignore */ ('/services/StorageService.ts' as string));
+    const uid = auth.currentUser!.uid;
+    const user = { uid, displayName: 'Queue Regression', email: null, photoURL: null };
+    const project = (projectId: string, projectName: string, notes: string) => ({
+      user,
+      projectId,
+      projectName,
+      canvases: [{
+        id: `${projectId}-canvas`,
+        name: 'Front elevation',
+        backgroundImage: '',
+        backgroundSize: { width: 1920, height: 1080 },
+        signs: [],
+        activeSignId: null,
+        dimensions: [],
+        activeDimensionId: null,
+        annotations: [],
+        calibration: null,
+        sheetTitle: 'FRONT ELEVATION',
+        sheetNumber: 'A-101',
+      }],
+      activeCanvasId: `${projectId}-canvas`,
+      isNightMode: false,
+      showDimensions: true,
+      unitSystem: 'metric',
+      titleBlock: {
+        enabled: false,
+        viewMode: 'canvas',
+        paperSize: 'A3',
+        orientation: 'landscape',
+        style: {
+          id: 'default', name: 'Default', layout: 'vertical-right',
+          headerColor: '#000000', textColor: '#ffffff', backgroundColor: '#ffffff',
+          fontFamily: 'Arial', logoPosition: 'top',
+        },
+        logoImage: null,
+        fields: [],
+        revisions: [],
+      },
+      buildingModel: undefined,
+      savedTemplates: [],
+      notes,
+      referenceImages: [],
+      siteCaptures: [],
+      lastSaved: Date.now(),
+      cloudRevision: 0,
+      isOnline: true,
+      isSyncing: false,
+    });
+
+    const projectB = project(projectBId, 'Project B synced', 'Authoritative cloud project.');
+    const projectBResult = await StorageService.saveProject(uid, projectB as any);
+    const persistedB = await StorageService.loadProjectLocal(projectBId);
+
+    Object.defineProperty(navigator, 'onLine', { configurable: true, value: false });
+    const projectA = project(projectAId, 'Project A queued', queuedNote);
+    const projectAResult = await StorageService.saveProject(uid, projectA as any);
+    const persistedA = await StorageService.loadProjectLocal(projectAId);
+    if (!persistedA || !persistedB) throw new Error('Regression fixture did not persist both projects.');
+
+    // Keep B newest so bootstrap opens it while A remains an inactive queued job.
+    await StorageService.saveProjectLocal({ ...persistedA, lastSaved: Math.max(1, persistedB.lastSaved - 1) });
+    return { projectAResult, projectBResult };
+  }, { projectAId, projectBId, queuedNote });
+
+  expect(seeded).toEqual({ projectAResult: 'queued', projectBResult: 'cloud' });
+  // Let the pre-reload retry observe the forced-offline state, then restore
+  // navigator.onLine without dispatching an `online` event. The reload must be
+  // the event that starts the account-wide queue drain under test.
+  await page.waitForTimeout(1_500);
+  await page.evaluate(() => {
+    Object.defineProperty(navigator, 'onLine', { configurable: true, value: true });
+  });
+  await page.reload();
+  await expect(page.getByRole('button', { name: 'Choose project' })).toContainText('Project B synced', { timeout: 45_000 });
+  await expect(page.getByText('Cloud saved', { exact: true })).toBeVisible({ timeout: 30_000 });
+
+  await expect.poll(() => page.evaluate(async ({ projectAId }) => {
+    const { auth } = await import(/* @vite-ignore */ ('/firebase.ts' as string));
+    const { StorageService } = await import(/* @vite-ignore */ ('/services/StorageService.ts' as string));
+    const uid = auth.currentUser!.uid;
+    return StorageService.hasQueuedProjectSync(uid, projectAId);
+  }, { projectAId }), { timeout: 75_000 }).toBe(false);
+
+  await expect.poll(() => page.evaluate(async ({ projectAId }) => {
+    const { auth } = await import(/* @vite-ignore */ ('/firebase.ts' as string));
+    const { StorageService } = await import(/* @vite-ignore */ ('/services/StorageService.ts' as string));
+    const uid = auth.currentUser!.uid;
+    const cloud = await StorageService.loadProjectCloud(uid, projectAId, undefined, true);
+    return cloud?.notes ?? null;
+  }, { projectAId }), { timeout: 75_000 }).toBe(queuedNote);
+});
+
+test('cloud discovery never replaces a fallback after editor interaction starts', async ({ browser, page }) => {
+  test.setTimeout(180_000);
+  const remoteProjectId = 'proj_discovery_cancellation_remote';
+  const remoteProjectName = 'Remote discovery source';
+  const remoteNote = 'This note belongs only to the previously synced cloud project.';
+  const fallbackNote = 'Started on the fallback while cloud discovery was still in flight.';
+
+  await page.goto('/?mobileCapture=1');
+  await signIn(page, DISCOVERY_CANCELLATION_EMAIL);
+  const seeded = await page.evaluate(async ({ remoteProjectId, remoteProjectName, remoteNote }) => {
+    const { auth } = await import(/* @vite-ignore */ ('/firebase.ts' as string));
+    const { StorageService } = await import(/* @vite-ignore */ ('/services/StorageService.ts' as string));
+    const uid = auth.currentUser!.uid;
+    const existing = await StorageService.loadProjectCloud(uid, remoteProjectId, undefined, true);
+    const now = Math.max(Date.now(), (existing?.lastSaved ?? 0) + 1);
+    const project = {
+      user: { uid, displayName: 'Discovery Regression', email: null, photoURL: null },
+      projectId: remoteProjectId,
+      projectName: remoteProjectName,
+      canvases: [{
+        id: `${remoteProjectId}-canvas`,
+        name: 'Cloud elevation',
+        backgroundImage: '',
+        backgroundSize: { width: 1920, height: 1080 },
+        signs: [],
+        activeSignId: null,
+        dimensions: [],
+        activeDimensionId: null,
+        annotations: [],
+        calibration: null,
+        sheetTitle: 'CLOUD ELEVATION',
+        sheetNumber: 'A-101',
+      }],
+      activeCanvasId: `${remoteProjectId}-canvas`,
+      isNightMode: false,
+      showDimensions: true,
+      unitSystem: 'metric',
+      titleBlock: {
+        enabled: false,
+        viewMode: 'canvas',
+        paperSize: 'A3',
+        orientation: 'landscape',
+        style: {
+          id: 'default', name: 'Default', layout: 'vertical-right',
+          headerColor: '#000000', textColor: '#ffffff', backgroundColor: '#ffffff',
+          fontFamily: 'Arial', logoPosition: 'top',
+        },
+        logoImage: null,
+        fields: [],
+        revisions: [],
+      },
+      buildingModel: undefined,
+      savedTemplates: [],
+      notes: remoteNote,
+      referenceImages: [],
+      siteCaptures: [],
+      lastSaved: now,
+      cloudRevision: existing?.cloudRevision ?? 0,
+      isOnline: true,
+      isSyncing: false,
+    };
+    const result = await StorageService.saveProject(uid, project as any, false, true);
+    const cloud = await StorageService.loadProjectCloud(uid, remoteProjectId, undefined, true);
+    return { result, projectName: cloud?.projectName, notes: cloud?.notes };
+  }, { remoteProjectId, remoteProjectName, remoteNote });
+  expect(seeded).toEqual({ result: 'cloud', projectName: remoteProjectName, notes: remoteNote });
+
+  const cleanDevice = await browser.newContext(devices['iPhone 13']);
+  const cleanPage = await cleanDevice.newPage();
+  try {
+    await cleanPage.goto('http://127.0.0.1:4174/?mobileCapture=1');
+    await expect.poll(() => cleanPage.evaluate(async projectId => {
+      const { StorageService } = await import(/* @vite-ignore */ ('/services/StorageService.ts' as string));
+      return (await StorageService.loadProjectLocal(projectId)) ?? null;
+    }, remoteProjectId)).toBeNull();
+
+    await cleanPage.evaluate(async remoteId => {
+      const { StorageService } = await import(/* @vite-ignore */ ('/services/StorageService.ts' as string));
+      const originalList = StorageService.listProjectsCloud.bind(StorageService);
+      const originalLoad = StorageService.loadProject.bind(StorageService);
+      const gate: {
+        listCalls: Array<{ uid: string; strict: boolean }>;
+        heldProjectId: string | null;
+        loadReturned: boolean;
+        releaseLoad?: () => void;
+      } = {
+        listCalls: [],
+        heldProjectId: null,
+        loadReturned: false,
+      };
+      (window as any).__cloudDiscoveryInteractionGate = gate;
+
+      StorageService.listProjectsCloud = (async (uid: string, strict = false) => {
+        gate.listCalls.push({ uid, strict });
+        if (gate.listCalls.length === 1) return new Promise<never>(() => undefined);
+        return originalList(uid, strict);
+      }) as typeof StorageService.listProjectsCloud;
+
+      StorageService.loadProject = (async (...args: Parameters<typeof originalLoad>) => {
+        const loaded = await originalLoad(...args);
+        if (args[1] === remoteId && gate.heldProjectId === null) {
+          gate.heldProjectId = remoteId;
+          await new Promise<void>(resolve => { gate.releaseLoad = resolve; });
+          gate.loadReturned = true;
+        }
+        return loaded;
+      }) as typeof StorageService.loadProject;
+    }, remoteProjectId);
+
+    await signIn(cleanPage, DISCOVERY_CANCELLATION_EMAIL);
+    await expect(cleanPage.getByRole('button', { name: 'Choose project' })).toContainText('Untitled Project');
+    await expect.poll(() => cleanPage.evaluate(() => {
+      const gate = (window as any).__cloudDiscoveryInteractionGate;
+      return {
+        listCalls: gate.listCalls.length,
+        strictCalls: gate.listCalls.filter((call: { strict: boolean }) => call.strict).length,
+        heldProjectId: gate.heldProjectId,
+      };
+    }), { timeout: 60_000 }).toEqual({
+      listCalls: 2,
+      strictCalls: 2,
+      heldProjectId: remoteProjectId,
+    });
+
+    await cleanPage.getByRole('button', { name: 'Notes', exact: true }).click();
+    const notes = cleanPage.getByPlaceholder('Access, power, installation conditions, client instructions…');
+    await notes.fill(fallbackNote);
+    await expect(notes).toHaveValue(fallbackNote);
+
+    const released = await cleanPage.evaluate(() => {
+      const gate = (window as any).__cloudDiscoveryInteractionGate;
+      if (!gate.releaseLoad) return false;
+      gate.releaseLoad();
+      return true;
+    });
+    expect(released).toBe(true);
+    await expect.poll(() => cleanPage.evaluate(
+      () => (window as any).__cloudDiscoveryInteractionGate.loadReturned,
+    )).toBe(true);
+
+    await expect(cleanPage.getByRole('button', { name: 'Choose project' })).toContainText('Untitled Project');
+    await expect(cleanPage.getByRole('button', { name: 'Choose project' })).not.toContainText(remoteProjectName);
+    await expect(notes).toHaveValue(fallbackNote);
+    await expect(cleanPage.getByText('Cloud saved', { exact: true })).toBeVisible({ timeout: 60_000 });
+
+    const readFallbackProjectId = () => cleanPage.evaluate(async note => {
+      const { StorageService } = await import(/* @vite-ignore */ ('/services/StorageService.ts' as string));
+      const projects = await StorageService.listProjectsLocal();
+      for (const project of projects) {
+        const state = await StorageService.loadProjectLocal(project.id);
+        if (state?.notes === note) return state.projectId;
+      }
+      return null;
+    }, fallbackNote);
+    await expect.poll(readFallbackProjectId, { timeout: 30_000 }).not.toBeNull();
+    const fallbackProjectId = await readFallbackProjectId();
+    expect(fallbackProjectId).not.toBe(remoteProjectId);
+
+    await expect.poll(() => cleanPage.evaluate(async ({ remoteProjectId, fallbackProjectId }) => {
+      const { auth } = await import(/* @vite-ignore */ ('/firebase.ts' as string));
+      const { StorageService } = await import(/* @vite-ignore */ ('/services/StorageService.ts' as string));
+      const uid = auth.currentUser!.uid;
+      const [remote, fallback] = await Promise.all([
+        StorageService.loadProjectCloud(uid, remoteProjectId, undefined, true),
+        StorageService.loadProjectCloud(uid, fallbackProjectId!, undefined, true),
+      ]);
+      return {
+        remote: { name: remote?.projectName ?? null, notes: remote?.notes ?? null },
+        fallback: { id: fallback?.projectId ?? null, notes: fallback?.notes ?? null },
+      };
+    }, { remoteProjectId, fallbackProjectId }), { timeout: 60_000 }).toEqual({
+      remote: { name: remoteProjectName, notes: remoteNote },
+      fallback: { id: fallbackProjectId, notes: fallbackNote },
+    });
+  } finally {
+    await cleanDevice.close();
+  }
 });

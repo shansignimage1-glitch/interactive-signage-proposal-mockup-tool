@@ -22,6 +22,7 @@ import { isAuthCancellationError, isMissingRedirectStateError } from './utils/au
 import { prefersRedirectSignIn } from './utils/authSignIn';
 import { measureLine, measureBox, getMmPerPx } from './utils/measure';
 import { normalizeProjectState } from './utils/projectMigration';
+import { isValidSurveyPlaneSize } from './utils/fieldMeasurements';
 import CalibrationWizard, { CalibrationDraft } from './components/CalibrationWizard';
 import { TITLE_BLOCK_TEMPLATES } from './data/titleBlockTemplates';
 import { getSiteCaptureAsset, StorageService, type ProjectSaveResult } from './services/StorageService';
@@ -193,6 +194,7 @@ const App: React.FC = () => {
   const [syncStatus, setSyncStatus] = useState<'synced' | 'local_only' | 'error'>('local_only');
   const [lastCloudSavedAt, setLastCloudSavedAt] = useState<number | null>(null);
   const [syncConflict, setSyncConflict] = useState(false);
+  const [needsCloudDiscovery, setNeedsCloudDiscovery] = useState(false);
   
   // History for Undo/Redo
   const [history, setHistory] = useState<MockupState[]>([state]);
@@ -228,7 +230,31 @@ const App: React.FC = () => {
   const authSessionRef = useRef<{ uid: string | null; epoch: number }>({ uid: null, epoch: 0 });
   const completedAuthUidRef = useRef<string | null>(null);
   const authBootstrapPromisesRef = useRef(new Map<string, { epoch: number; promise: Promise<void> }>());
+  const userInteractionEpochRef = useRef(0);
+  const cloudDiscoveryFallbackRef = useRef<{ uid: string; state: MockupState; interactionEpoch: number } | null>(null);
   useEffect(() => { stateRef.current = state; }, [state]);
+  useEffect(() => {
+      const markUserInteraction = () => {
+          userInteractionEpochRef.current += 1;
+          // Once the user begins any pointer, keyboard, form, crop, recording,
+          // drawing, or calibration action, a delayed discovery response may
+          // no longer replace the workspace underneath that in-flight work.
+          if (cloudDiscoveryFallbackRef.current) {
+              cloudDiscoveryFallbackRef.current = null;
+              setNeedsCloudDiscovery(false);
+          }
+      };
+      window.addEventListener('pointerdown', markUserInteraction, true);
+      window.addEventListener('keydown', markUserInteraction, true);
+      window.addEventListener('input', markUserInteraction, true);
+      window.addEventListener('change', markUserInteraction, true);
+      return () => {
+          window.removeEventListener('pointerdown', markUserInteraction, true);
+          window.removeEventListener('keydown', markUserInteraction, true);
+          window.removeEventListener('input', markUserInteraction, true);
+          window.removeEventListener('change', markUserInteraction, true);
+      };
+  }, []);
   useEffect(() => {
       document.documentElement.classList.toggle('signagepro-authenticated', !!state.user);
       return () => document.documentElement.classList.remove('signagepro-authenticated');
@@ -325,19 +351,13 @@ const App: React.FC = () => {
               setConnectorUid(uid);
               setDriveStatus(getActiveConnector() ? 'connected' : 'disconnected');
 
-              // A queued phone edit is the newest durable copy. Retry it before
-              // reading cloud state so a fresh Safari bootstrap can never cache
-              // an older cloud revision over that newer IndexedDB snapshot.
-              try {
-                  if (await StorageService.hasQueuedProjectSync(uid)) {
-                      await withTimeout(StorageService.flushSyncQueue(uid), 10_000, 'Pending cloud sync');
-                  }
-              } catch (error) {
-                  reportWarning('auth-bootstrap', 'Pending phone changes will retry after the app opens', {
-                      error: String(error),
-                  });
-              }
-              if (!isCurrentSession()) return;
+              // A queued phone edit is already the newest durable copy. Do not
+              // start its upload while the fresh iPhone WebKit auth channel is
+              // still initializing: timing that upload out cannot cancel the
+              // Firebase request, and a second retry would then wait behind it.
+              // The merged local/cloud load below always keeps a queued local
+              // copy, and the post-bootstrap retry effect uploads it exactly
+              // once after the editor session and auth channel are stable.
 
               // Always load local metadata first. Cloud listing is best-effort:
               // a slow Firebase channel must not hide or replace a saved phone
@@ -354,13 +374,15 @@ const App: React.FC = () => {
               }));
               const localProjects = localProjectCandidates.filter((_, index) => localOwnership[index]);
               let cloudProjects: typeof localProjects = [];
+              let cloudBootstrapUnconfirmed = false;
               try {
                   cloudProjects = await withTimeout(
-                      StorageService.listProjectsCloud(uid),
+                      StorageService.listProjectsCloud(uid, true),
                       10_000,
                       'Cloud project list',
                   );
               } catch (error) {
+                  cloudBootstrapUnconfirmed = true;
                   reportWarning('auth-bootstrap', 'Cloud project list is not ready; opening the newest phone copy', {
                       error: String(error),
                   });
@@ -374,21 +396,35 @@ const App: React.FC = () => {
               if (!isCurrentSession()) return;
               if (projects.length > 0) {
                   const latest = projects.sort((a, b) => (b.lastModified ?? 0) - (a.lastModified ?? 0))[0];
-                  const loaded = await withTimeout(
-                      StorageService.loadProject(uid, latest.id, ({ needsReconnect, failedRefs }) => {
-                          if (!isCurrentSession() || !needsReconnect) return;
-                          setDriveNeedsReconnect(true);
-                          setDriveReconnectProvider(failedRefs[0] ? getConnectorForRef(failedRefs[0])?.id ?? null : null);
-                          setDriveStatus('expired');
-                      }),
-                      AUTH_BOOT_TIMEOUT_MS,
-                      'Cloud project load',
-                  );
+                  const latestHasCloudMetadata = cloudProjects.some(project => project.id === latest.id);
+                  let loaded: MockupState | null = null;
+                  try {
+                      loaded = await withTimeout(
+                          StorageService.loadProject(uid, latest.id, ({ needsReconnect, failedRefs }) => {
+                              if (!isCurrentSession() || !needsReconnect) return;
+                              setDriveNeedsReconnect(true);
+                              setDriveReconnectProvider(failedRefs[0] ? getConnectorForRef(failedRefs[0])?.id ?? null : null);
+                              setDriveStatus('expired');
+                          }, true),
+                          AUTH_BOOT_TIMEOUT_MS,
+                          'Cloud project load',
+                      );
+                  } catch (error) {
+                      cloudBootstrapUnconfirmed = true;
+                      reportWarning('auth-bootstrap', 'Cloud project data is not ready; opening the saved device copy', {
+                          projectId: latest.id,
+                          error: String(error),
+                      });
+                      loaded = localProjects.some(project => project.id === latest.id)
+                          ? await StorageService.loadProjectLocal(latest.id)
+                          : null;
+                  }
+                  if (!loaded && latestHasCloudMetadata) cloudBootstrapUnconfirmed = true;
                   if (!isCurrentSession()) return;
                   if (loaded) {
                       const cloudMetadata = cloudProjects.find(project => project.id === loaded.projectId);
                       let hasPendingSync = await StorageService.hasQueuedProjectSync(uid, loaded.projectId);
-                      const cloudCopyConfirmed = Boolean(
+                      const cloudCopyConfirmed = !cloudBootstrapUnconfirmed && Boolean(
                           cloudMetadata
                           && (loaded.cloudRevision ?? 0) > 0
                           && cloudMetadata.lastModified >= loaded.lastSaved,
@@ -405,8 +441,22 @@ const App: React.FC = () => {
                                   error: String(error),
                               });
                           });
+                          if (localStorage.getItem(GUEST_PROJECT_ID_KEY) === loaded.projectId) {
+                              localStorage.removeItem(GUEST_PROJECT_ID_KEY);
+                          }
                       }
                       startSession(sessionState);
+                      if (cloudBootstrapUnconfirmed) {
+                          cloudDiscoveryFallbackRef.current = {
+                              uid,
+                              state: stateRef.current,
+                              interactionEpoch: userInteractionEpochRef.current,
+                          };
+                          setNeedsCloudDiscovery(true);
+                      } else {
+                          cloudDiscoveryFallbackRef.current = null;
+                          setNeedsCloudDiscovery(false);
+                      }
                       const cloudSynced = cloudCopyConfirmed && !hasPendingSync;
                       setSyncStatus(cloudSynced ? 'synced' : 'local_only');
                       setLastCloudSavedAt(cloudSynced ? Date.now() : null);
@@ -416,6 +466,17 @@ const App: React.FC = () => {
               }
 
               startSession({ ...getInitialState(), user, isOnline: navigator.onLine });
+              if (cloudBootstrapUnconfirmed) {
+                  cloudDiscoveryFallbackRef.current = {
+                      uid,
+                      state: stateRef.current,
+                      interactionEpoch: userInteractionEpochRef.current,
+                  };
+                  setNeedsCloudDiscovery(true);
+              } else {
+                  cloudDiscoveryFallbackRef.current = null;
+                  setNeedsCloudDiscovery(false);
+              }
               setSyncStatus('local_only');
               setLastCloudSavedAt(null);
               completedAuthUidRef.current = uid;
@@ -462,7 +523,12 @@ const App: React.FC = () => {
       // fresh projectId every login — otherwise autosave quietly accumulates a new
       // "Sign Image Demo" copy in IndexedDB every time Guest is clicked.
       const existingProjectId = localStorage.getItem(GUEST_PROJECT_ID_KEY);
-      const existingProject = existingProjectId ? await StorageService.loadProjectLocal(existingProjectId) : null;
+      const existingProjectCandidate = existingProjectId ? await StorageService.loadProjectLocal(existingProjectId) : null;
+      const existingOwnerUid = existingProjectCandidate?.user?.uid;
+      const existingProject = !existingOwnerUid || existingOwnerUid.startsWith('guest_')
+          ? existingProjectCandidate
+          : null;
+      if (existingProjectId && !existingProject) localStorage.removeItem(GUEST_PROJECT_ID_KEY);
 
       const newState: MockupState = existingProject
         ? { ...existingProject, user: guestUser, isOnline: false }
@@ -621,6 +687,10 @@ const App: React.FC = () => {
     setIsLoginPending(false);
     selectAuthUser(null);
     await signOut(auth);
+    if (localStorage.getItem(GUEST_PROJECT_ID_KEY) === stateRef.current.projectId
+        && stateRef.current.user?.uid && !stateRef.current.user.uid.startsWith('guest_')) {
+      localStorage.removeItem(GUEST_PROJECT_ID_KEY);
+    }
     const initialState = getInitialState();
     stateRef.current = initialState;
     setState(initialState);
@@ -730,11 +800,16 @@ const App: React.FC = () => {
       const initial = stateRef.current;
       if (initial.user?.uid !== uid || !initial.isOnline) return;
       const projectId = initial.projectId;
+      const hadAnyQueuedChanges = await StorageService.hasQueuedProjectSync(uid);
       const hadQueuedChanges = await StorageService.hasQueuedProjectSync(uid, projectId);
-      if (hadQueuedChanges) await StorageService.flushSyncQueue(uid);
+      if (hadAnyQueuedChanges) await StorageService.flushSyncQueue(uid);
 
       const active = stateRef.current;
       if (active.user?.uid !== uid || active.projectId !== projectId || !active.isOnline) return;
+      // Queue flushing is account-wide so a phone edit to Project A is not
+      // stranded merely because Project B is the active tablet workspace.
+      // Only the active project needs UI/revision reconciliation below.
+      if (hadAnyQueuedChanges && !hadQueuedChanges) return;
       if (await StorageService.hasQueuedProjectSync(uid, projectId)) {
           if (StorageService.hasProjectSyncConflict(uid, projectId)) {
               setSyncConflict(true);
@@ -793,6 +868,89 @@ const App: React.FC = () => {
       }
   }, [triggerBackendSync, updateState]);
 
+  // A clean device can occasionally finish authentication before Safari's
+  // Firestore channel returns its first project list. Keep retrying discovery
+  // while the temporary local workspace is still completely untouched. The
+  // identity check is intentionally strict: any editor update cancels the
+  // replacement so a delayed cloud response can never erase new work.
+  useEffect(() => {
+      const fallback = cloudDiscoveryFallbackRef.current;
+      const uid = state.user?.uid;
+      const fallbackIsUntouched = (current: MockupState) => fallback?.interactionEpoch === userInteractionEpochRef.current
+          && current.projectId === fallback.state.projectId
+          && current.projectName === fallback.state.projectName
+          && current.canvases === fallback.state.canvases
+          && current.activeCanvasId === fallback.state.activeCanvasId
+          && current.isNightMode === fallback.state.isNightMode
+          && current.showDimensions === fallback.state.showDimensions
+          && current.unitSystem === fallback.state.unitSystem
+          && current.titleBlock === fallback.state.titleBlock
+          && current.buildingModel === fallback.state.buildingModel
+          && current.savedTemplates === fallback.state.savedTemplates
+          && current.notes === fallback.state.notes
+          && current.referenceImages === fallback.state.referenceImages
+          && current.siteCaptures === fallback.state.siteCaptures;
+      if (!needsCloudDiscovery || isAuthLoading || !uid || uid.startsWith('guest_')
+          || fallback?.uid !== uid || !fallbackIsUntouched(stateRef.current)) return;
+
+      let cancelled = false;
+      let running = false;
+      const discover = async () => {
+          if (running || cancelled) return;
+          if (!fallbackIsUntouched(stateRef.current)) {
+              cloudDiscoveryFallbackRef.current = null;
+              setNeedsCloudDiscovery(false);
+              return;
+          }
+          running = true;
+          try {
+              // Do not wrap these Firebase reads in Promise.race timeouts. A
+              // timed-out Firestore promise keeps running and repeated retries
+              // would accumulate orphaned requests on iOS. `running` keeps one
+              // discovery attempt in flight; rejected attempts retry on the
+              // 30-second backoff below.
+              const projects = await StorageService.listProjectsCloud(uid, true);
+              if (cancelled || !fallbackIsUntouched(stateRef.current)) return;
+              if (projects.length === 0) {
+                  // A successful server response with no projects is
+                  // authoritative, not a transient failure.
+                  cloudDiscoveryFallbackRef.current = null;
+                  setNeedsCloudDiscovery(false);
+                  return;
+              }
+              const latest = [...projects].sort((a, b) => (b.lastModified ?? 0) - (a.lastModified ?? 0))[0];
+              const loaded = await StorageService.loadProject(uid, latest.id, undefined, true);
+              if (!loaded) throw new Error(`Cloud project ${latest.id} could not be loaded.`);
+              if (cancelled || !fallbackIsUntouched(stateRef.current)) return;
+              const currentUser = stateRef.current.user;
+              if (!currentUser?.uid || currentUser.uid !== uid) return;
+              const hasPendingSync = await StorageService.hasQueuedProjectSync(uid, loaded.projectId);
+              if (cancelled || !fallbackIsUntouched(stateRef.current)) return;
+              startSession({ ...loaded, user: currentUser, isOnline: navigator.onLine, isSyncing: false });
+              cloudDiscoveryFallbackRef.current = null;
+              setNeedsCloudDiscovery(false);
+              setSyncConflict(false);
+              const cloudSynced = (loaded.cloudRevision ?? 0) > 0 && !hasPendingSync;
+              setSyncStatus(cloudSynced ? 'synced' : 'local_only');
+              setLastCloudSavedAt(cloudSynced ? Date.now() : null);
+          } catch (error) {
+              reportWarning('cloud-discovery', 'Cloud projects are still unavailable; another retry is scheduled', {
+                  uid,
+                  error: String(error),
+              });
+          } finally {
+              running = false;
+          }
+      };
+
+      void discover();
+      const interval = window.setInterval(() => void discover(), 30_000);
+      return () => {
+          cancelled = true;
+          window.clearInterval(interval);
+      };
+  }, [isAuthLoading, needsCloudDiscovery, startSession, state.user?.uid]);
+
   // Online/Offline Listeners
   useEffect(() => {
       const handleOnline = () => {
@@ -832,17 +990,19 @@ const App: React.FC = () => {
   }, [state.canvases, state.titleBlock, state.notes, state.referenceImages, state.siteCaptures, triggerBackendSync, state.user, state.projectName]);
 
   // `navigator.onLine` only reports network attachment, not whether Firebase
-  // was temporarily reachable. Keep retrying queued authenticated saves while
-  // the UI is local-only, including after a fresh app launch where no new
-  // browser `online` event will fire.
+  // was temporarily reachable. Check the entire user's durable queue after
+  // bootstrap even when the active project is already cloud-saved; otherwise
+  // an edit queued for a different phone project could remain device-only.
   useEffect(() => {
       const uid = state.user?.uid;
-      if (syncStatus !== 'local_only' || !state.isOnline || !uid || uid.startsWith('guest_')) return;
+      if (isAuthLoading || !state.isOnline || !uid || uid.startsWith('guest_')) return;
       let running = false;
       const retry = async () => {
           if (running) return;
           running = true;
           try {
+              const hasQueuedChanges = await StorageService.hasQueuedProjectSync(uid);
+              if (syncStatus !== 'local_only' && !hasQueuedChanges) return;
               await retryPendingCloudSync(uid);
           } catch (error) {
               reportWarning('sync-retry', 'Queued cloud sync retry failed', { error: String(error) });
@@ -850,13 +1010,14 @@ const App: React.FC = () => {
               running = false;
           }
       };
-      const initialRetry = window.setTimeout(() => void retry(), 10_000);
+      // Let the authenticated Firebase channel settle, then drain promptly.
+      const initialRetry = window.setTimeout(() => void retry(), 1_000);
       const retryInterval = window.setInterval(() => void retry(), 30_000);
       return () => {
           window.clearTimeout(initialRetry);
           window.clearInterval(retryInterval);
       };
-  }, [state.isOnline, state.user?.uid, syncStatus, retryPendingCloudSync]);
+  }, [isAuthLoading, state.isOnline, state.user?.uid, syncStatus, retryPendingCloudSync]);
 
 
   const activeCanvas = state.canvases.find(c => c.id === state.activeCanvasId) || state.canvases[0];
@@ -1087,24 +1248,30 @@ const App: React.FC = () => {
   }, [activeCanvas, updateActiveCanvasWithHistory]);
 
   // --- Guided calibration workflow ---
-  const openCalibration = (options?: { addPlane?: boolean }) => {
+  const openCalibration = (options?: { addPlane?: boolean; widthMm?: number; heightMm?: number; planeName?: string }) => {
       const existing = activeCanvas?.calibration ?? null;
       const existingPlanes = existing?.planes?.length
           ? existing.planes
           : existing?.plane ? [{ id: 'legacy-plane', name: 'Wall 1', ...existing.plane }] : [];
       const activeExistingPlane = existingPlanes.find(plane => plane.id === existing?.activePlaneId) ?? existingPlanes[0];
       const isPlane = !!existing?.plane && !options?.addPlane;
+      const surveyPlaneRequested = options?.widthMm !== undefined || options?.heightMm !== undefined;
+      const hasSurveyPlane = isValidSurveyPlaneSize(options?.widthMm, options?.heightMm);
+      if (surveyPlaneRequested && !hasSurveyPlane) {
+          notify('Enter a wall width and height greater than zero before calibrating.', 'warning');
+          return;
+      }
       setCalibrationDraft({
           stage: 'choose',
-          method: options?.addPlane ? 'plane' : isPlane ? 'plane' : existing ? 'line' : null,
-          points: options?.addPlane ? [] : activeExistingPlane ? [...activeExistingPlane.corners] : existing ? [existing.start, existing.end] : [],
-          presetId: isPlane ? 'custom_plane' : existing ? 'custom' : 'door_height',
+          method: options?.addPlane || hasSurveyPlane ? 'plane' : isPlane ? 'plane' : existing ? 'line' : null,
+          points: options?.addPlane ? [] : activeExistingPlane ? [...activeExistingPlane.corners] : hasSurveyPlane ? [] : existing ? [existing.start, existing.end] : [],
+          presetId: hasSurveyPlane || isPlane ? 'custom_plane' : existing ? 'custom' : 'door_height',
           value: existing && !isPlane ? String(existing.realValue) : '',
-          width: options?.addPlane ? '0.813' : activeExistingPlane ? String(activeExistingPlane.widthMm / 1000) : '0.813',
-          height: options?.addPlane ? '2.032' : activeExistingPlane ? String(activeExistingPlane.heightMm / 1000) : '2.032',
-          unit: options?.addPlane ? 'mm' : isPlane ? 'm' : existing?.unit ?? 'm',
+          width: hasSurveyPlane ? String(Number(options?.widthMm) / 1000) : options?.addPlane ? '0.813' : activeExistingPlane ? String(activeExistingPlane.widthMm / 1000) : '0.813',
+          height: hasSurveyPlane ? String(Number(options?.heightMm) / 1000) : options?.addPlane ? '2.032' : activeExistingPlane ? String(activeExistingPlane.heightMm / 1000) : '2.032',
+          unit: hasSurveyPlane ? 'm' : options?.addPlane ? 'mm' : isPlane ? 'm' : existing?.unit ?? 'm',
           reapply: false,
-          planeName: options?.addPlane ? `Wall ${existingPlanes.length + 1}` : (activeExistingPlane?.name ?? 'Wall 1'),
+          planeName: options?.planeName || (options?.addPlane ? `Wall ${existingPlanes.length + 1}` : (activeExistingPlane?.name ?? 'Wall 1')),
           addPlane: !!options?.addPlane,
           editingPlaneId: options?.addPlane ? null : activeExistingPlane?.id ?? null,
           planeMode: activeExistingPlane?.calibrationKind === 'parallel-offset' ? 'parallel-offset' : 'known-size',
@@ -1476,31 +1643,46 @@ const App: React.FC = () => {
 
   const handlePromoteSiteCapture = async (capture: SiteCapturePhoto) => {
       if (capture.promotedCanvasId) return;
-      let backgroundImage = capture.workingRef;
-      if (capture.workingRef.startsWith('site-capture://')) {
-          const blob = await getSiteCaptureAsset(capture.workingRef);
+      const expectedProjectId = stateRef.current.projectId;
+      const requestedCapture = (stateRef.current.siteCaptures ?? []).find(item => item.id === capture.id);
+      if (!requestedCapture) throw new Error('This site capture no longer belongs to the active project.');
+      if (requestedCapture.promotedCanvasId) return;
+      let backgroundImage = requestedCapture.workingRef;
+      if (requestedCapture.workingRef.startsWith('site-capture://')) {
+          const blob = await getSiteCaptureAsset(requestedCapture.workingRef);
           if (!blob) throw new Error('The working photograph is missing from this device.');
           backgroundImage = await blobToDataUri(blob);
       }
       const current = stateRef.current;
+      if (current.projectId !== expectedProjectId) {
+          throw new Error('Editor view creation stopped because the active project changed.');
+      }
+      const liveCapture = (current.siteCaptures ?? []).find(item => item.id === capture.id);
+      if (!liveCapture) throw new Error('This site capture was removed before its editor view was created.');
+      // A second concurrent click can finish while the first blob is loading.
+      // Re-check the live record so only one canvas is ever created.
+      if (liveCapture.promotedCanvasId) return;
+      if (!isValidSurveyPlaneSize(liveCapture.referenceWall.widthMm, liveCapture.referenceWall.heightMm)) {
+          throw new Error('Enter a wall width and height greater than zero before creating an editor view.');
+      }
       const newCanvas = createDefaultCanvas(current.canvases.length);
       const replaceableCanvas = current.canvases.length === 1 && !current.canvases[0].backgroundImage && current.canvases[0].signs.length === 0 && current.canvases[0].dimensions.length === 0 && !current.canvases[0].calibration;
       if (replaceableCanvas) newCanvas.id = current.canvases[0].id;
-      newCanvas.name = capture.label;
-      newCanvas.sheetTitle = capture.label.toUpperCase();
+      newCanvas.name = liveCapture.label;
+      newCanvas.sheetTitle = liveCapture.label.toUpperCase();
       newCanvas.backgroundImage = backgroundImage;
-      newCanvas.backgroundSize = { width: capture.workingPixelWidth, height: capture.workingPixelHeight };
-      const nextCaptures = (current.siteCaptures ?? []).map(item => item.id === capture.id ? { ...item, promotedCanvasId: newCanvas.id } : item);
+      newCanvas.backgroundSize = { width: liveCapture.workingPixelWidth, height: liveCapture.workingPixelHeight };
+      const nextCaptures = (current.siteCaptures ?? []).map(item => item.id === liveCapture.id ? { ...item, promotedCanvasId: newCanvas.id } : item);
       let titleBlock = current.titleBlock;
-      if (capture.location?.address) {
-          titleBlock = { ...titleBlock, fields: titleBlock.fields.map(field => field.label === 'ADDRESS' && !field.value ? { ...field, value: capture.location!.address! } : field) };
+      if (liveCapture.location?.address) {
+          titleBlock = { ...titleBlock, fields: titleBlock.fields.map(field => field.label === 'ADDRESS' && !field.value ? { ...field, value: liveCapture.location!.address! } : field) };
       }
       const nextCanvases = replaceableCanvas ? [newCanvas] : [...current.canvases, newCanvas];
       const next = { ...current, canvases: nextCanvases, activeCanvasId: newCanvas.id, siteCaptures: nextCaptures, titleBlock, lastSaved: Date.now() };
       stateRef.current = next;
       setState(next);
       addToHistory(next);
-      notify(`${capture.label} is ready in the iPad and desktop editor.`, 'success');
+      notify(`${liveCapture.label} is ready in the iPad and desktop editor.`, 'success');
   };
 
   // --- Render ---
@@ -1682,6 +1864,7 @@ const App: React.FC = () => {
         viewLocked={viewLocked}
         onViewLockedChange={handleViewLockedChange}
         onOpenCalibration={openCalibration}
+        onPromoteCapture={handlePromoteSiteCapture}
         showCalibrationReference={showCalibrationReference}
         setShowCalibrationReference={setShowCalibrationReference}
         updateDimension={updateDimension}

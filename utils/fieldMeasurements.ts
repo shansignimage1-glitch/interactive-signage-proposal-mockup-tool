@@ -53,3 +53,7 @@ export const displayMeasurement = (mm: number | undefined, unit: MeasureUnit): s
   return String(Math.round((mm / divisors[unit]) * 1000) / 1000);
 };
 
+/** A survey calibration plane must have two real, strictly positive dimensions. */
+export const isValidSurveyPlaneSize = (widthMm: number | undefined, heightMm: number | undefined): boolean =>
+  Number.isFinite(widthMm) && Number(widthMm) > 0
+  && Number.isFinite(heightMm) && Number(heightMm) > 0;
