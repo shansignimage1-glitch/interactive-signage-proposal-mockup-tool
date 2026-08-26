@@ -737,6 +737,19 @@ test('phone user adds supporting photos to an elevation and creates another elev
   await expect(mobile.getByText('2 photos')).toBeVisible();
   await expect(mobile.locator('article')).toHaveCount(1);
 
+  await mobile.getByRole('button', { name: 'Open Elevation 1 photo 2' }).click();
+  const photoViewer = page.getByRole('dialog', { name: 'Elevation 1 photo viewer' });
+  await expect(photoViewer).toBeVisible();
+  await expect(photoViewer.getByText('Photo 2 of 2')).toBeVisible();
+  await expect(photoViewer.getByAltText('Elevation 1 photo 2 full view')).toBeVisible();
+  await expect(photoViewer.getByRole('button', { name: 'Previous photo' })).toBeEnabled();
+  await expect(photoViewer.getByRole('button', { name: 'Next photo' })).toBeDisabled();
+  await photoViewer.getByRole('button', { name: 'Previous photo' }).click();
+  await expect(photoViewer.getByText('Photo 1 of 2')).toBeVisible();
+  await expect(photoViewer.getByAltText('Elevation 1 photo 1 full view')).toBeVisible();
+  await photoViewer.getByRole('button', { name: 'Close photo viewer' }).click();
+  await expect(photoViewer).toHaveCount(0);
+
   await mobile.getByRole('button', { name: 'Capture', exact: true }).click();
   await mobile.getByRole('button', { name: 'Add another elevation' }).click();
   const newElevationChooser = page.waitForEvent('filechooser');

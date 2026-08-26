@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
-  ArrowUpRight, Camera, Check, ChevronDown, Cloud, CloudOff, FolderOpen, Images,
+  ArrowUpRight, Camera, Check, ChevronDown, ChevronLeft, ChevronRight, Cloud, CloudOff, FolderOpen, Images,
   ImagePlus, Loader2, LogOut, MapPin, Mic, NotebookPen, PencilLine, Plus, Ruler, Save, Square, Trash2, WifiOff, X,
 } from 'lucide-react';
 import { MeasureUnit, MockupState, ProjectMetadata, ReferenceWallFieldMeasurement, SiteCapturePhoto, SiteCaptureSupportingPhoto } from '../types';
@@ -21,6 +21,7 @@ type MobileTab = 'capture' | 'views' | 'measure' | 'notes';
 type DictationState = 'idle' | 'listening' | 'recording' | 'transcribing';
 type CaptureIntent = 'new-elevation' | 'same-elevation';
 type CaptureRequest = { intent: CaptureIntent; targetCaptureId: string | null; projectId: string; epoch: number };
+type GallerySelection = { captureId: string; photoId: string };
 
 class CaptureContextChangedError extends Error {}
 
@@ -234,6 +235,7 @@ const MobileSiteCapture: React.FC<MobileSiteCaptureProps> = ({ state, syncStatus
   const [selectedProjectId, setSelectedProjectId] = useState(state.projectId);
   const [measurementUnit, setMeasurementUnit] = useState<MeasureUnit>('m');
   const [annotationCaptureId, setAnnotationCaptureId] = useState<string | null>(null);
+  const [gallerySelection, setGallerySelection] = useState<GallerySelection | null>(null);
   const captureProjectIdRef = useRef(state.projectId);
   const captureRequestEpochRef = useRef(0);
   const captureRequestRef = useRef<CaptureRequest>({
@@ -249,6 +251,27 @@ const MobileSiteCapture: React.FC<MobileSiteCaptureProps> = ({ state, syncStatus
   const cameraStreamRef = useRef<MediaStream | null>(null);
   const activeCapture = captures.find(capture => capture.id === activeCaptureId) ?? captures[0] ?? null;
   const annotationCapture = captures.find(capture => capture.id === annotationCaptureId) ?? null;
+  const galleryCapture = captures.find(capture => capture.id === gallerySelection?.captureId) ?? null;
+  const galleryPhotos = galleryCapture ? [
+    {
+      id: galleryCapture.id,
+      assetRef: galleryCapture.workingRef,
+      fileName: galleryCapture.fileName,
+      pixelWidth: galleryCapture.workingPixelWidth,
+      pixelHeight: galleryCapture.workingPixelHeight,
+    },
+    ...(galleryCapture.supportingPhotos ?? []).map(photo => ({
+      id: photo.id,
+      assetRef: photo.workingRef,
+      fileName: photo.fileName,
+      pixelWidth: photo.workingPixelWidth,
+      pixelHeight: photo.workingPixelHeight,
+    })),
+  ] : [];
+  const galleryIndex = gallerySelection
+    ? galleryPhotos.findIndex(photo => photo.id === gallerySelection.photoId)
+    : -1;
+  const galleryPhoto = galleryIndex >= 0 ? galleryPhotos[galleryIndex] : null;
 
   const stopCameraTracks = () => {
     const stream = cameraStreamRef.current;
@@ -270,7 +293,27 @@ const MobileSiteCapture: React.FC<MobileSiteCaptureProps> = ({ state, syncStatus
   useEffect(() => {
     if (!activeCaptureId && captures[0]) setActiveCaptureId(captures[0].id);
   }, [captures, activeCaptureId]);
-  useEffect(() => { setAnnotationCaptureId(null); }, [state.projectId]);
+  useEffect(() => {
+    setAnnotationCaptureId(null);
+    setGallerySelection(null);
+  }, [state.projectId]);
+  useEffect(() => {
+    if (!gallerySelection) return;
+    const capture = captures.find(item => item.id === gallerySelection.captureId);
+    const photoExists = capture && (
+      capture.id === gallerySelection.photoId
+      || capture.supportingPhotos?.some(photo => photo.id === gallerySelection.photoId)
+    );
+    if (!photoExists) setGallerySelection(null);
+  }, [captures, gallerySelection]);
+  useEffect(() => {
+    if (!gallerySelection) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setGallerySelection(null);
+    };
+    window.addEventListener('keydown', closeOnEscape);
+    return () => window.removeEventListener('keydown', closeOnEscape);
+  }, [gallerySelection]);
   useEffect(() => {
     capturesRef.current = captures;
     stateRef.current = state;
@@ -635,6 +678,31 @@ const MobileSiteCapture: React.FC<MobileSiteCaptureProps> = ({ state, syncStatus
         captureChooserOpenRef.current = false;
         if (event.target.files?.[0]) void capturePhoto(event.target.files[0], captureRequestRef.current);
       }} />
+      {galleryCapture && galleryPhoto && (
+        <div className="fixed inset-0 z-[145] flex flex-col bg-[#05080b] text-white" role="dialog" aria-modal="true" aria-label={`${galleryCapture.label} photo viewer`}>
+          <header className="flex items-center gap-3 border-b border-white/10 px-4 pb-3 pt-[max(0.75rem,env(safe-area-inset-top))]">
+            <button type="button" onClick={() => setGallerySelection(null)} className="grid h-12 w-12 shrink-0 place-items-center rounded-2xl border border-slate-700 bg-[#0c1219] text-slate-200" aria-label="Close photo viewer"><X className="h-6 w-6" /></button>
+            <div className="min-w-0 flex-1">
+              <p className="truncate text-sm font-bold">{galleryCapture.label}</p>
+              <p className="mt-0.5 truncate text-[10px] text-slate-400">{galleryPhoto.fileName}</p>
+            </div>
+            <span className="rounded-full bg-white/10 px-3 py-1.5 text-xs font-bold text-slate-200">{galleryIndex + 1} / {galleryPhotos.length}</span>
+          </header>
+          <div className="flex min-h-0 flex-1 items-center justify-center overflow-hidden p-3">
+            <SiteCaptureImage assetRef={galleryPhoto.assetRef} alt={`${galleryCapture.label} photo ${galleryIndex + 1} full view`} className="max-h-full max-w-full rounded-2xl object-contain" />
+          </div>
+          <footer className="border-t border-white/10 bg-[#0c1219] px-4 pb-[max(1rem,env(safe-area-inset-bottom))] pt-3">
+            <div className="mb-3 text-center">
+              <p className="text-sm font-semibold">Photo {galleryIndex + 1} of {galleryPhotos.length}</p>
+              <p className="mt-1 font-mono text-[10px] text-slate-500">{galleryPhoto.pixelWidth} × {galleryPhoto.pixelHeight}</p>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <button type="button" disabled={galleryIndex <= 0} onClick={() => setGallerySelection({ captureId: galleryCapture.id, photoId: galleryPhotos[galleryIndex - 1].id })} className="flex min-h-14 items-center justify-center gap-2 rounded-2xl border border-slate-700 text-sm font-bold text-slate-200 disabled:opacity-30" aria-label="Previous photo"><ChevronLeft className="h-5 w-5" />Previous</button>
+              <button type="button" disabled={galleryIndex >= galleryPhotos.length - 1} onClick={() => setGallerySelection({ captureId: galleryCapture.id, photoId: galleryPhotos[galleryIndex + 1].id })} className="flex min-h-14 items-center justify-center gap-2 rounded-2xl border border-slate-700 text-sm font-bold text-slate-200 disabled:opacity-30" aria-label="Next photo">Next<ChevronRight className="h-5 w-5" /></button>
+            </div>
+          </footer>
+        </div>
+      )}
       {annotationCapture && (
         <CaptureAnnotationEditor
           key={`${annotationCapture.id}:${annotationCapture.annotationUpdatedAt ?? 0}`}
@@ -724,8 +792,8 @@ const MobileSiteCapture: React.FC<MobileSiteCaptureProps> = ({ state, syncStatus
             {!captures.length && <button onClick={() => setTab('capture')} className="min-h-32 w-full rounded-2xl border border-dashed border-slate-700 text-sm text-slate-400">Capture your first elevation</button>}
             {captures.map(capture => (
               <article key={capture.id} onClick={() => setActiveCaptureId(capture.id)} className={`overflow-hidden rounded-2xl border bg-[#111821] ${activeCaptureId === capture.id ? 'border-orange-400/60' : 'border-slate-800'}`}>
-                <div className="flex gap-3 p-3"><SiteCaptureImage assetRef={capture.thumbnailRef} alt={capture.label} className="h-24 w-24 shrink-0 rounded-xl object-cover" /><div className="min-w-0 flex-1"><input value={capture.label} onChange={event => patchCapture(capture.id, { label: event.target.value })} onClick={event => event.stopPropagation()} className="w-full bg-transparent text-sm font-semibold outline-none focus:text-orange-200" aria-label="Elevation label" /><p className="mt-1 font-mono text-[10px] text-slate-500">{1 + (capture.supportingPhotos?.length ?? 0)} photo{capture.supportingPhotos?.length ? 's' : ''} · {capture.pixelWidth} × {capture.pixelHeight}</p>{capture.location?.address && <p className="mt-2 line-clamp-2 flex gap-1 text-[10px] leading-relaxed text-slate-400"><MapPin className="mt-0.5 h-3 w-3 shrink-0 text-orange-300" />{capture.location.address}</p>}</div></div>
-                {!!capture.supportingPhotos?.length && <div className="flex gap-2 overflow-x-auto border-t border-white/5 px-3 py-2">{capture.supportingPhotos.map((photo, index) => <SiteCaptureImage key={photo.id} assetRef={photo.thumbnailRef} alt={`${capture.label} supporting photo ${index + 2}`} className="h-16 w-16 shrink-0 rounded-lg object-cover" />)}</div>}
+                <div className="flex gap-3 p-3"><button type="button" onClick={event => { event.stopPropagation(); setActiveCaptureId(capture.id); setGallerySelection({ captureId: capture.id, photoId: capture.id }); }} className="relative h-24 w-24 shrink-0 overflow-hidden rounded-xl border border-white/10 focus:outline-none focus:ring-2 focus:ring-orange-400" aria-label={`Open ${capture.label} photo 1`}><SiteCaptureImage assetRef={capture.thumbnailRef} alt={capture.label} className="h-full w-full object-cover" /><span className="absolute bottom-1 right-1 rounded-md bg-black/75 px-1.5 py-0.5 text-[9px] font-bold text-white">1</span></button><div className="min-w-0 flex-1"><input value={capture.label} onChange={event => patchCapture(capture.id, { label: event.target.value })} onClick={event => event.stopPropagation()} className="w-full bg-transparent text-sm font-semibold outline-none focus:text-orange-200" aria-label="Elevation label" /><p className="mt-1 font-mono text-[10px] text-slate-500">{1 + (capture.supportingPhotos?.length ?? 0)} photo{capture.supportingPhotos?.length ? 's' : ''} · {capture.pixelWidth} × {capture.pixelHeight}</p><p className="mt-1 text-[10px] font-semibold text-cyan-300">Tap any photo to open it</p>{capture.location?.address && <p className="mt-2 line-clamp-2 flex gap-1 text-[10px] leading-relaxed text-slate-400"><MapPin className="mt-0.5 h-3 w-3 shrink-0 text-orange-300" />{capture.location.address}</p>}</div></div>
+                {!!capture.supportingPhotos?.length && <div className="flex gap-2 overflow-x-auto border-t border-white/5 px-3 py-2">{capture.supportingPhotos.map((photo, index) => <button key={photo.id} type="button" onClick={event => { event.stopPropagation(); setActiveCaptureId(capture.id); setGallerySelection({ captureId: capture.id, photoId: photo.id }); }} className="relative h-16 w-16 shrink-0 overflow-hidden rounded-lg border border-white/10 focus:outline-none focus:ring-2 focus:ring-cyan-300" aria-label={`Open ${capture.label} photo ${index + 2}`}><SiteCaptureImage assetRef={photo.thumbnailRef} alt={`${capture.label} supporting photo ${index + 2}`} className="h-full w-full object-cover" /><span className="absolute bottom-1 right-1 rounded-md bg-black/75 px-1.5 py-0.5 text-[9px] font-bold text-white">{index + 2}</span></button>)}</div>}
                 <button type="button" onClick={() => { setActiveCaptureId(capture.id); setAnnotationCaptureId(capture.id); }} className="flex min-h-12 w-full items-center justify-center gap-2 border-t border-cyan-400/15 bg-cyan-400/[0.06] px-3 text-xs font-bold text-cyan-200" aria-label={`Draw & Note on ${capture.label}`}><PencilLine className="h-4 w-4" />Draw & Note{capture.annotations?.length ? <span className="rounded-full bg-cyan-300/15 px-2 py-0.5 text-[9px] text-cyan-100">{capture.annotations.length} mark{capture.annotations.length === 1 ? '' : 's'}</span> : null}</button>
                 <div className="flex border-t border-white/5">
                   <button onClick={() => { setActiveCaptureId(capture.id); choosePhoto('same-elevation', capture.id); }} className="grid min-h-12 w-12 place-items-center text-cyan-300" aria-label={`Add photo to ${capture.label}`}><Plus className="h-4 w-4" /></button>
