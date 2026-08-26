@@ -15,6 +15,7 @@ import { detectSignArtwork } from '../utils/elementDetection';
 import { defaultExtrusionModeForType, getBackingDepth, getSignExtrusionMode, VISUAL_EXTRUSION_REFERENCE_WIDTH_PX } from '../utils/signExtrusion';
 import { isValidSurveyPlaneSize } from '../utils/fieldMeasurements';
 import { transcribeAudio } from '../services/GeminiService';
+import SiteCaptureImage from './SiteCaptureImage';
 
 interface ControlsPanelProps {
   state: MockupState;
@@ -471,6 +472,7 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
              updateActiveCanvas({
                  backgroundImage: dataUrl,
                  backgroundSize: { width: img.width, height: img.height },
+                 siteCaptureLink: undefined,
                  calibration: null, // new or levelled photo — old image coordinates are invalid
                  placement: { ...placement, lens: { enabled: false, k1: 0, k2: 0 }, camera: { enabled: false, fieldOfViewDeg: 60, estimated: true } },
                  dimensions: [],
@@ -1696,6 +1698,14 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
                                   <span className={`rounded-full px-2 py-1 font-semibold ${selectedSiteCapture.promotedCanvasId === activeCanvas.id ? 'bg-emerald-500/15 text-emerald-300' : 'bg-gray-700 text-gray-400'}`}>{selectedSiteCapture.promotedCanvasId === activeCanvas.id ? 'Current editor view' : selectedSiteCapture.promotedCanvasId ? 'Editor view ready' : 'Capture only'}</span>
                               </div>
                           </div>
+
+                          <section className="overflow-hidden rounded-xl border border-cyan-500/20 bg-gray-900/70">
+                              <div data-testid="survey-marked-photo" className="relative aspect-[4/3] bg-black">
+                                  <SiteCaptureImage assetRef={selectedSiteCapture.workingRef} alt={`${selectedSiteCapture.label} phone markup`} className="h-full w-full object-contain" />
+                                  {!!selectedSiteCapture.annotations?.length && <span data-testid="survey-annotation-count" className="absolute right-2 top-2 rounded-full border border-cyan-300/30 bg-black/70 px-2 py-1 text-[9px] font-semibold text-cyan-100 backdrop-blur">{selectedSiteCapture.annotations.length} phone mark{selectedSiteCapture.annotations.length === 1 ? '' : 's'}</span>}
+                              </div>
+                              <p className="border-t border-white/5 px-3 py-2 text-[10px] leading-relaxed text-gray-500">Marked-up phone image. The retained original remains unchanged.</p>
+                          </section>
 
                           <section className="space-y-3 rounded-xl border border-orange-500/25 bg-orange-500/5 p-3">
                               <div className="flex items-center gap-2"><Ruler className="h-4 w-4 text-orange-300" /><h3 className="text-xs font-semibold uppercase tracking-wider text-orange-100">Field dimensions</h3></div>

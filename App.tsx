@@ -1412,6 +1412,7 @@ const App: React.FC = () => {
              updateActiveCanvas({
                  backgroundImage: result,
                  backgroundSize: { width: img.width, height: img.height },
+                 siteCaptureLink: undefined,
                  calibration: null, // new photo, old scale no longer applies
                  placement: activeCanvas ? { ...(activeCanvas.placement ?? { snapEnabled: true, showVanishingGuides: false, lens: { enabled: false, k1: 0, k2: 0 }, camera: { enabled: false, fieldOfViewDeg: 60, estimated: true } }), lens: { enabled: false, k1: 0, k2: 0 }, camera: { enabled: false, fieldOfViewDeg: 60, estimated: true } } : undefined,
              });
@@ -1459,6 +1460,7 @@ const App: React.FC = () => {
     updateActiveCanvasWithHistory({
         backgroundImage: newImageUrl,
         backgroundSize: newSize,
+        siteCaptureLink: undefined,
         signs: newSigns,
         dimensions: newDims,
         annotations: newAnnotations,
@@ -1479,6 +1481,7 @@ const App: React.FC = () => {
           updateActiveCanvas({
               backgroundImage: newImageUrl,
               backgroundSize: { width: img.width, height: img.height },
+              siteCaptureLink: undefined,
               calibration: null,
               placement: activeCanvas ? { ...(activeCanvas.placement ?? { snapEnabled: true, showVanishingGuides: false, lens: { enabled: false, k1: 0, k2: 0 }, camera: { enabled: false, fieldOfViewDeg: 60, estimated: true } }), lens: { enabled: false, k1: 0, k2: 0 }, camera: { enabled: false, fieldOfViewDeg: 60, estimated: true } } : undefined,
           });
@@ -1672,6 +1675,10 @@ const App: React.FC = () => {
       newCanvas.sheetTitle = liveCapture.label.toUpperCase();
       newCanvas.backgroundImage = backgroundImage;
       newCanvas.backgroundSize = { width: liveCapture.workingPixelWidth, height: liveCapture.workingPixelHeight };
+      newCanvas.siteCaptureLink = {
+          captureId: liveCapture.id,
+          annotationUpdatedAt: liveCapture.annotationUpdatedAt ?? liveCapture.capturedAt,
+      };
       const nextCaptures = (current.siteCaptures ?? []).map(item => item.id === liveCapture.id ? { ...item, promotedCanvasId: newCanvas.id } : item);
       let titleBlock = current.titleBlock;
       if (liveCapture.location?.address) {

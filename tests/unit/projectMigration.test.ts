@@ -44,7 +44,9 @@ describe('project migration and normalization', () => {
     const normalized = normalizeProjectState(legacy);
 
     expect(normalized.siteCaptures[0].supportingPhotos).toEqual([]);
+    expect(normalized.siteCaptures[0].annotations).toEqual([]);
     expect(normalizeProjectState(normalized).siteCaptures[0].supportingPhotos).toEqual([]);
+    expect(normalizeProjectState(normalized).siteCaptures[0].annotations).toEqual([]);
   });
 
   it('migrates legacy auto-detected extrusion to a stable sign-relative depth once', () => {

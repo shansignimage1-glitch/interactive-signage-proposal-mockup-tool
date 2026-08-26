@@ -19,7 +19,8 @@ const STORE_PROJECTS = 'projects';
 const STORE_METADATA = 'metadata';
 const STORE_ASSETS = 'assets'; // cached cloud-drive image blobs, keyed by ref
 const STORE_SYNC_QUEUE = 'syncQueue';
-const DB_VERSION = 4; // Site-capture blobs reuse the existing durable assets store.
+const STORE_CAPTURE_CLOUD_REFS = 'captureCloudRefs';
+const DB_VERSION = 5; // v5 persists local/hosted capture-ref to committed cloud-object mappings.
 const PROJECT_STATE_SCHEMA_VERSION = 2;
 const knownCloudRevisions = new Map<string, number>();
 const knownCloudProjectIndexes = new Map<string, CloudProjectIndex>();
@@ -52,6 +53,8 @@ type CloudProjectIndex = {
     previousStateUrl?: string;
     previousStateEncoding?: 'json' | 'gzip';
     previousStateRevision?: number;
+    captureObjectPaths?: string[];
+    previousCaptureObjectPaths?: string[];
     userId: string;
     projectId: string;
     projectName?: string;
@@ -176,6 +179,9 @@ const initDB = (): Promise<IDBDatabase> => {
       if (!db.objectStoreNames.contains(STORE_SYNC_QUEUE)) {
         db.createObjectStore(STORE_SYNC_QUEUE, { keyPath: 'projectId' });
       }
+      if (!db.objectStoreNames.contains(STORE_CAPTURE_CLOUD_REFS)) {
+        db.createObjectStore(STORE_CAPTURE_CLOUD_REFS, { keyPath: 'key' });
+      }
     };
   });
 
@@ -214,6 +220,24 @@ interface StoredCachedAsset {
     cachedAt: number;
 }
 
+interface CaptureCloudRefMapping {
+    key: string;
+    userId: string;
+    projectId: string;
+    sourceRef: string;
+    cloudUrl: string;
+    objectPath: string;
+    updatedAt: number;
+}
+
+const captureCloudRefMappingKey = (
+    userId: string,
+    projectId: string,
+    captureId: string,
+    kind: SiteCaptureAssetKind,
+    sourceRef: string,
+) => `${userId}|${projectId}|${captureId}|${kind}|${sourceRef}`;
+
 export const getCachedAsset = async (ref: string): Promise<CachedAsset | null> => {
     const stored = (await idbOperation<StoredCachedAsset>(STORE_ASSETS, 'readonly', store => store.get(ref))) ?? null;
     if (!stored) return null;
@@ -232,11 +256,30 @@ export const putCachedAsset = async (ref: string, blob: Blob): Promise<void> => 
         store.put({ ref, bytes, mime: blob.type, cachedAt: Date.now() } as StoredCachedAsset));
 };
 
-export type SiteCaptureAssetKind = 'original' | 'working' | 'thumbnail' | 'dictation';
+export type SiteCaptureAssetKind = 'original' | 'working' | 'thumbnail' | 'dictation' | 'annotation-base';
 const SITE_CAPTURE_SCHEME = 'site-capture://';
 
-export const makeSiteCaptureAssetRef = (projectId: string, captureId: string, kind: SiteCaptureAssetKind): string =>
-    `${SITE_CAPTURE_SCHEME}${projectId}/${captureId}/${kind}`;
+export const makeSiteCaptureAssetRef = (projectId: string, captureId: string, kind: SiteCaptureAssetKind, version?: string): string => {
+    const safeVersion = version?.replace(/[^a-zA-Z0-9_-]/g, '_');
+    return `${SITE_CAPTURE_SCHEME}${projectId}/${captureId}/${kind}${safeVersion ? `/${safeVersion}` : ''}`;
+};
+
+const getCaptureCloudRefMapping = async (key: string): Promise<CaptureCloudRefMapping | null> =>
+    (await idbOperation<CaptureCloudRefMapping>(STORE_CAPTURE_CLOUD_REFS, 'readonly', store => store.get(key))) ?? null;
+
+const putCaptureCloudRefMappings = async (mappings: Iterable<CaptureCloudRefMapping>): Promise<void> => {
+    const entries = [...mappings];
+    if (!entries.length) return;
+    const db = await initDB();
+    await new Promise<void>((resolve, reject) => {
+        const tx = db.transaction(STORE_CAPTURE_CLOUD_REFS, 'readwrite');
+        const store = tx.objectStore(STORE_CAPTURE_CLOUD_REFS);
+        entries.forEach(mapping => store.put(mapping));
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+        tx.onabort = () => reject(tx.error ?? new Error('Capture cloud-reference mapping save was aborted.'));
+    });
+};
 
 export const putSiteCaptureAsset = async (ref: string, blob: Blob): Promise<void> => {
     if (!ref.startsWith(SITE_CAPTURE_SCHEME)) throw new Error('Invalid site-capture asset reference.');
@@ -263,15 +306,90 @@ export const deleteSiteCaptureAssets = async (projectId: string, captureId?: str
     });
 };
 
-const uploadSiteCaptureAsset = async (userId: string, projectId: string, captureId: string, kind: SiteCaptureAssetKind, ref: string): Promise<string> => {
-    if (!ref.startsWith(SITE_CAPTURE_SCHEME)) return ref;
+export const deleteSiteCaptureAssetRefs = async (refs: readonly string[]): Promise<void> => {
+    const uniqueRefs = [...new Set(refs.filter(ref => ref.startsWith(SITE_CAPTURE_SCHEME)))];
+    if (!uniqueRefs.length) return;
+    const db = await initDB();
+    await new Promise<void>((resolve, reject) => {
+        const tx = db.transaction(STORE_ASSETS, 'readwrite');
+        uniqueRefs.forEach(ref => tx.objectStore(STORE_ASSETS).delete(ref));
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+    });
+};
+
+const uploadSiteCaptureAsset = async (
+    userId: string,
+    projectId: string,
+    captureId: string,
+    kind: SiteCaptureAssetKind,
+    ref: string,
+    createdObjectPaths?: Set<string>,
+    uploadAttemptId?: string,
+    retainedObjectPaths?: Set<string>,
+    pendingMappings?: Map<string, CaptureCloudRefMapping>,
+): Promise<string> => {
+    const attemptId = uploadAttemptId?.replace(/[^a-zA-Z0-9_-]/g, '_') ?? Math.random().toString(36).slice(2);
+    const mappingKey = captureCloudRefMappingKey(userId, projectId, captureId, kind, ref);
+    const mapped = await getCaptureCloudRefMapping(mappingKey);
+    if (mapped && retainedObjectPaths?.has(mapped.objectPath)) return mapped.cloudUrl;
+    const rememberMapping = (cloudUrl: string, objectPath: string) => {
+        pendingMappings?.set(mappingKey, {
+            key: mappingKey,
+            userId,
+            projectId,
+            sourceRef: ref,
+            cloudUrl,
+            objectPath,
+            updatedAt: Date.now(),
+        });
+        return cloudUrl;
+    };
+    if (!ref.startsWith(SITE_CAPTURE_SCHEME)) {
+        const hostedPath = extractStorageObjectPath(ref);
+        if (hostedPath && retainedObjectPaths?.has(hostedPath)) return ref;
+
+        // A forced restore can carry a URL older than both retained revisions.
+        // Copy it to this save's unique path before committing so concurrent GC
+        // can remove the obsolete source without breaking the new revision.
+        let asset = (await getCachedAsset(ref))?.blob;
+        if (!asset) {
+            try {
+                const response = await fetch(ref);
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                asset = await response.blob();
+            } catch (downloadError) {
+                if (!hostedPath) throw downloadError;
+                const bytes = await getBytes(storageRef(storage, hostedPath), 50 * 1024 * 1024);
+                asset = new Blob([bytes]);
+            }
+        }
+        const restoredPath = `users/${userId}/captures/${projectId}/${captureId}/${kind}-restore-${attemptId}`;
+        const restoredRef = storageRef(storage, restoredPath);
+        await uploadBytes(restoredRef, asset, { contentType: asset.type || undefined });
+        createdObjectPaths?.add(restoredPath);
+        return rememberMapping(await getDownloadURL(restoredRef), restoredPath);
+    }
     const asset = await getSiteCaptureAsset(ref);
     if (!asset) throw new Error(`Site-capture ${kind} is missing from this device.`);
-    const destination = storageRef(storage, `users/${userId}/captures/${projectId}/${captureId}/${kind}`);
-    try { return await getDownloadURL(destination); }
-    catch {
+    const localParts = ref.slice(SITE_CAPTURE_SCHEME.length).split('/');
+    const version = localParts.length > 3
+        ? localParts.slice(3).join('-').replace(/[^a-zA-Z0-9_-]/g, '_')
+        : '';
+    // Marked-up working images use a new immutable object name per save. This
+    // prevents Firebase's existing-object shortcut from returning an older,
+    // unannotated photo while another device is syncing the new revision.
+    const objectName = version ? `${kind}-${version}-${attemptId}` : kind;
+    const destinationPath = `users/${userId}/captures/${projectId}/${captureId}/${objectName}`;
+    const destination = storageRef(storage, destinationPath);
+    try { return rememberMapping(await getDownloadURL(destination), destinationPath); }
+    catch (error) {
         await uploadBytes(destination, asset, { contentType: asset.type || undefined });
-        return getDownloadURL(destination);
+        // Only attempt-unique paths are rolled back. Stable original/base
+        // objects can be shared by concurrent tabs and are pruned with their
+        // project, never by a losing save.
+        if (version) createdObjectPaths?.add(destinationPath);
+        return rememberMapping(await getDownloadURL(destination), destinationPath);
     }
 };
 
@@ -281,17 +399,271 @@ const deleteStorageTree = async (root: StorageReference): Promise<void> => {
     await Promise.all(listing.prefixes.map(deleteStorageTree));
 };
 
-const collectSiteCaptureAssetIds = (project: any): string[] => {
-    const ids = new Set<string>();
+const collectSiteCaptureAssetRefs = (project: any): string[] => {
+    const refs = new Set<string>();
+    const track = (value?: string | null) => {
+        if (typeof value === 'string' && value.startsWith(SITE_CAPTURE_SCHEME)) refs.add(value);
+    };
     if (!Array.isArray(project?.siteCaptures)) return [];
     project.siteCaptures.forEach((capture: any) => {
-        if (typeof capture?.id === 'string' && capture.id) ids.add(capture.id);
+        track(capture?.originalRef);
+        track(capture?.annotationBaseRef);
+        track(capture?.workingRef);
+        track(capture?.thumbnailRef);
         if (!Array.isArray(capture?.supportingPhotos)) return;
         capture.supportingPhotos.forEach((photo: any) => {
-            if (typeof photo?.id === 'string' && photo.id) ids.add(photo.id);
+            track(photo?.originalRef);
+            track(photo?.workingRef);
+            track(photo?.thumbnailRef);
         });
     });
-    return [...ids];
+    return [...refs];
+};
+
+type CloudStatePointer = {
+    path: string;
+    url?: string;
+    encoding?: 'json' | 'gzip';
+};
+
+const cloudStatePointer = (index: CloudProjectIndex, previous = false): CloudStatePointer | null => {
+    const path = previous ? index.previousStatePath : index.statePath;
+    if (!path) return null;
+    return {
+        path,
+        url: previous ? index.previousStateUrl : index.stateUrl,
+        encoding: previous ? index.previousStateEncoding : index.stateEncoding,
+    };
+};
+
+const readCloudStatePointer = async (pointer: CloudStatePointer): Promise<MockupState> => {
+    const bytes = await downloadCloudProjectState(pointer.path, pointer.url);
+    return decodeCloudProjectState(bytes, pointer.encoding);
+};
+
+const readRetainedCloudStates = async (index: CloudProjectIndex): Promise<MockupState[]> => {
+    const pointers = [cloudStatePointer(index), cloudStatePointer(index, true)]
+        .filter((pointer): pointer is CloudStatePointer => Boolean(pointer));
+    return Promise.all(pointers.map(readCloudStatePointer));
+};
+
+const extractStorageObjectPath = (url: string): string | null => {
+    if (!url) return null;
+    const encodedPath = /\/o\/([^?]+)/.exec(url)?.[1];
+    if (encodedPath) {
+        try { return decodeURIComponent(encodedPath); }
+        catch { return null; }
+    }
+    try {
+        const path = decodeURIComponent(new URL(url).pathname);
+        const usersIndex = path.indexOf('/users/');
+        return usersIndex >= 0 ? path.slice(usersIndex + 1) : null;
+    } catch {
+        return null;
+    }
+};
+
+const captureProjectObjectPrefix = (userId: string, projectId: string) =>
+    `users/${userId}/captures/${projectId}/`;
+
+const collectCloudSiteCaptureObjectPaths = (project: any, expectedPrefix?: string): Set<string> => {
+    const paths = new Set<string>();
+    const track = (value?: string | null) => {
+        if (typeof value !== 'string') return;
+        const path = extractStorageObjectPath(value);
+        if (path?.includes('/captures/') && (!expectedPrefix || path.startsWith(expectedPrefix))) paths.add(path);
+    };
+    (project?.siteCaptures ?? []).forEach((capture: any) => {
+        track(capture?.originalRef);
+        track(capture?.annotationBaseRef);
+        track(capture?.workingRef);
+        track(capture?.thumbnailRef);
+        (capture?.supportingPhotos ?? []).forEach((photo: any) => {
+            track(photo?.originalRef);
+            track(photo?.workingRef);
+            track(photo?.thumbnailRef);
+        });
+    });
+    // Legacy promoted canvases do not have siteCaptureLink metadata. Their
+    // background can still point at an older immutable capture object after a
+    // newer phone annotation replaces workingRef, so it must remain in the
+    // retained manifest until that canvas is changed or removed.
+    (project?.canvases ?? []).forEach((canvas: any) => track(canvas?.backgroundImage));
+    return paths;
+};
+
+const collectHostedSiteCaptureRefs = (project: any): string[] => {
+    const refs = new Set<string>();
+    const track = (value?: string | null) => {
+        if (typeof value === 'string' && /^https?:/i.test(value)) refs.add(value);
+    };
+    (project?.siteCaptures ?? []).forEach((capture: any) => {
+        track(capture?.originalRef);
+        track(capture?.annotationBaseRef);
+        track(capture?.workingRef);
+        track(capture?.thumbnailRef);
+        (capture?.supportingPhotos ?? []).forEach((photo: any) => {
+            track(photo?.originalRef);
+            track(photo?.workingRef);
+            track(photo?.thumbnailRef);
+        });
+    });
+    // Keep the durable cached copy for a capture-backed editor background too.
+    // This covers legacy promoted canvases and prevents local pruning from
+    // removing the only offline copy while the canvas still references it.
+    (project?.canvases ?? []).forEach((canvas: any) => {
+        const value = canvas?.backgroundImage;
+        if (typeof value !== 'string' || !/^https?:/i.test(value)) return;
+        const path = extractStorageObjectPath(value);
+        if (path?.startsWith('users/') && path.includes(`/captures/${project.projectId}/`)) refs.add(value);
+    });
+    return [...refs];
+};
+
+const downloadHostedSiteCapture = async (url: string): Promise<Blob> => {
+    const path = extractStorageObjectPath(url);
+    if (path) {
+        try {
+            // Prefer the authenticated SDK path. Direct download URLs can
+            // remain pending in iPhone WebKit against the Storage emulator and
+            // stale tokens fail even when the signed-in user still has access.
+            // getBytes is deterministic in both cases and enforces Storage
+            // rules for the current account.
+            const bytes = await getBytes(storageRef(storage, path), 50 * 1024 * 1024);
+            return new Blob([bytes]);
+        } catch (storageError) {
+            try {
+                const response = await fetch(url);
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                return response.blob();
+            } catch {
+                throw storageError;
+            }
+        }
+    }
+    try {
+        const response = await fetch(url);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return response.blob();
+    } catch (downloadError) {
+        if (!path) throw downloadError;
+        const bytes = await getBytes(storageRef(storage, path), 50 * 1024 * 1024);
+        return new Blob([bytes]);
+    }
+};
+
+const cacheHostedSiteCaptureAssets = async (project: MockupState): Promise<void> => {
+    const refs = collectHostedSiteCaptureRefs(project);
+    if (!refs.length) return;
+    let cursor = 0;
+    const failures: unknown[] = [];
+    const worker = async () => {
+        while (cursor < refs.length) {
+            const ref = refs[cursor++];
+            try {
+                if (await getCachedAsset(ref)) continue;
+                await putCachedAsset(ref, await downloadHostedSiteCapture(ref));
+            } catch (error) {
+                failures.push(error);
+            }
+        }
+    };
+    await Promise.all(Array.from({ length: Math.min(3, refs.length) }, worker));
+    if (failures.length) {
+        throw new Error('One or more site photographs could not be cached safely for offline recovery.', { cause: failures[0] });
+    }
+};
+
+type CloudCaptureRetentionState = {
+    revision: number;
+    currentObjectPaths: Set<string>;
+    retainedObjectPaths: Set<string>;
+    expectedExists: boolean;
+    expectedStatePath?: string;
+};
+
+const captureRetentionStateFromIndex = async (
+    userId: string,
+    projectId: string,
+    index: CloudProjectIndex,
+): Promise<CloudCaptureRetentionState> => {
+    const hasCurrentManifest = Array.isArray(index.captureObjectPaths);
+    const hasPreviousManifest = Array.isArray(index.previousCaptureObjectPaths) || !index.previousStatePath;
+    if (hasCurrentManifest && hasPreviousManifest) {
+        const currentObjectPaths = new Set(index.captureObjectPaths ?? []);
+        return {
+            revision: index.cloudRevision ?? 0,
+            currentObjectPaths,
+            retainedObjectPaths: new Set([...currentObjectPaths, ...(index.previousCaptureObjectPaths ?? [])]),
+            expectedExists: true,
+            expectedStatePath: index.statePath,
+        };
+    }
+
+    const currentState = cloudStatePointer(index) ? await readCloudStatePointer(cloudStatePointer(index)!) : null;
+    const previousState = cloudStatePointer(index, true) ? await readCloudStatePointer(cloudStatePointer(index, true)!) : null;
+    const expectedPrefix = captureProjectObjectPrefix(userId, projectId);
+    const currentObjectPaths = currentState ? collectCloudSiteCaptureObjectPaths(currentState, expectedPrefix) : new Set<string>();
+    const previousObjectPaths = previousState ? collectCloudSiteCaptureObjectPaths(previousState, expectedPrefix) : new Set<string>();
+    return {
+        revision: index.cloudRevision ?? 0,
+        currentObjectPaths,
+        retainedObjectPaths: new Set([...currentObjectPaths, ...previousObjectPaths]),
+        expectedExists: true,
+        expectedStatePath: index.statePath,
+    };
+};
+
+const readAuthoritativeCloudCaptureState = async (
+    userId: string,
+    projectId: string,
+): Promise<CloudCaptureRetentionState> => {
+    const snapshot = await getDocFromServer(doc(db, FIRESTORE_COLLECTION, projectDocumentId(userId, projectId)));
+    if (!snapshot.exists()) {
+        return {
+            revision: 0,
+            currentObjectPaths: new Set(),
+            retainedObjectPaths: new Set(),
+            expectedExists: false,
+        };
+    }
+    return captureRetentionStateFromIndex(userId, projectId, snapshot.data() as CloudProjectIndex);
+};
+
+const deleteCloudCaptureObjectPaths = async (paths: Iterable<string>): Promise<void> => {
+    await Promise.all([...new Set(paths)].map(path => deleteObject(storageRef(storage, path))));
+};
+
+const pruneSupersededCloudCaptureAssets = async (
+    userId: string,
+    projectId: string,
+    obsoleteState: CloudStatePointer | null,
+    obsoleteObjectPaths?: string[],
+): Promise<void> => {
+    if (!obsoleteState && !obsoleteObjectPaths?.length) return;
+    const candidates = obsoleteObjectPaths?.length
+        ? new Set(obsoleteObjectPaths)
+        : collectCloudSiteCaptureObjectPaths(
+            await readCloudStatePointer(obsoleteState!),
+            captureProjectObjectPrefix(userId, projectId),
+        );
+    if (!candidates.size) return;
+
+    // Refresh the authoritative pointer immediately before deleting anything.
+    // Only objects absent from both retained project revisions are eligible.
+    const latestSnapshot = await getDocFromServer(doc(db, FIRESTORE_COLLECTION, projectDocumentId(userId, projectId)));
+    if (!latestSnapshot.exists()) return;
+    const latestIndex = latestSnapshot.data() as CloudProjectIndex;
+    const hasManifest = Array.isArray(latestIndex.captureObjectPaths)
+        && (Array.isArray(latestIndex.previousCaptureObjectPaths) || !latestIndex.previousStatePath);
+    const retained = hasManifest
+        ? new Set([...(latestIndex.captureObjectPaths ?? []), ...(latestIndex.previousCaptureObjectPaths ?? [])])
+        : new Set((await readRetainedCloudStates(latestIndex)).flatMap(state => [
+            ...collectCloudSiteCaptureObjectPaths(state, captureProjectObjectPrefix(userId, projectId)),
+        ]));
+    if (!hasManifest && !retained.size) return;
+    const projectPrefix = `users/${userId}/captures/${projectId}/`;
+    await deleteCloudCaptureObjectPaths([...candidates].filter(path => path.startsWith(projectPrefix) && !retained.has(path)));
 };
 
 // --- Cloud Image Upload Helpers ---
@@ -380,9 +752,6 @@ export const StorageService = {
 
   saveProjectLocal: async (state: MockupState, thumbnail?: string): Promise<void> => {
       const { projectId, projectName, lastSaved } = state;
-      const previous = await idbOperation<MockupState>(STORE_PROJECTS, 'readonly', store => store.get(projectId));
-      const retainedCaptureIds = new Set(collectSiteCaptureAssetIds(state));
-      const removedCaptureIds = collectSiteCaptureAssetIds(previous).filter(id => !retainedCaptureIds.has(id));
       const metadata: ProjectMetadata = {
           id: projectId,
           name: projectName,
@@ -392,17 +761,50 @@ export const StorageService = {
       };
 
       await assertStorageCapacity(new Blob([JSON.stringify(state)]).size);
-      // Save Full Data
-      await idbOperation(STORE_PROJECTS, 'readwrite', (store) => store.put(state));
-      // Save Metadata
-      await idbOperation(STORE_METADATA, 'readwrite', (store) => store.put(metadata));
-      // Keep the previous blobs until the replacement project revision is
-      // durable. If IndexedDB persistence fails, the last saved project still
-      // has every photograph it references.
-      await Promise.all(removedCaptureIds.map(captureId =>
-          deleteSiteCaptureAssets(projectId, captureId).catch(error => {
-              reportWarning('capture-delete', 'Local capture cleanup failed', { projectId, captureId, error: String(error) });
-          })));
+      const db = await initDB();
+      await new Promise<void>((resolve, reject) => {
+          // One transaction makes the project pointer and asset cleanup atomic,
+          // and IndexedDB serializes overlapping writers across browser tabs.
+          const tx = db.transaction([STORE_PROJECTS, STORE_METADATA, STORE_ASSETS, STORE_CAPTURE_CLOUD_REFS], 'readwrite');
+          const projects = tx.objectStore(STORE_PROJECTS);
+          const assets = tx.objectStore(STORE_ASSETS);
+          const mappings = tx.objectStore(STORE_CAPTURE_CLOUD_REFS);
+          const previousRequest = projects.get(projectId);
+          const mappingRequest = mappings.getAll();
+          let removedCaptureRefs: Set<string> | null = null;
+          let mappingRecords: CaptureCloudRefMapping[] | null = null;
+          const pruneMappings = () => {
+              if (!removedCaptureRefs || !mappingRecords) return;
+              mappingRecords
+                  .filter(mapping => mapping.projectId === projectId && removedCaptureRefs!.has(mapping.sourceRef))
+                  .forEach(mapping => mappings.delete(mapping.key));
+          };
+          previousRequest.onsuccess = () => {
+              const retainedCaptureRefs = new Set([
+                  ...collectSiteCaptureAssetRefs(state),
+                  ...collectHostedSiteCaptureRefs(state),
+              ]);
+              removedCaptureRefs = new Set([
+                  ...collectSiteCaptureAssetRefs(previousRequest.result),
+                  ...collectHostedSiteCaptureRefs(previousRequest.result),
+              ].filter(ref => !retainedCaptureRefs.has(ref)));
+              removedCaptureRefs.forEach(ref => {
+                  if (!retainedCaptureRefs.has(ref)) assets.delete(ref);
+              });
+              pruneMappings();
+              projects.put(state);
+              tx.objectStore(STORE_METADATA).put(metadata);
+          };
+          mappingRequest.onsuccess = () => {
+              mappingRecords = mappingRequest.result as CaptureCloudRefMapping[];
+              pruneMappings();
+          };
+          previousRequest.onerror = () => tx.abort();
+          mappingRequest.onerror = () => tx.abort();
+          tx.oncomplete = () => resolve();
+          tx.onerror = () => reject(tx.error ?? previousRequest.error ?? mappingRequest.error);
+          tx.onabort = () => reject(tx.error ?? previousRequest.error ?? mappingRequest.error ?? new Error('Local project save was aborted.'));
+      });
   },
 
   loadProjectLocal: async (projectId: string): Promise<MockupState | null> => {
@@ -477,10 +879,34 @@ export const StorageService = {
   },
 
   deleteProjectLocal: async (projectId: string): Promise<void> => {
-      await idbOperation(STORE_PROJECTS, 'readwrite', (store) => store.delete(projectId));
-      await idbOperation(STORE_METADATA, 'readwrite', (store) => store.delete(projectId));
-      await idbOperation(STORE_SYNC_QUEUE, 'readwrite', (store) => store.delete(projectId));
-      await deleteSiteCaptureAssets(projectId);
+      const db = await initDB();
+      await new Promise<void>((resolve, reject) => {
+          const tx = db.transaction(
+              [STORE_PROJECTS, STORE_METADATA, STORE_SYNC_QUEUE, STORE_ASSETS, STORE_CAPTURE_CLOUD_REFS],
+              'readwrite',
+          );
+          const projects = tx.objectStore(STORE_PROJECTS);
+          const assets = tx.objectStore(STORE_ASSETS);
+          const mappings = tx.objectStore(STORE_CAPTURE_CLOUD_REFS);
+          const projectRequest = projects.get(projectId);
+          const mappingRequest = mappings.getAll();
+          projectRequest.onsuccess = () => {
+              const project = projectRequest.result;
+              [...collectSiteCaptureAssetRefs(project), ...collectHostedSiteCaptureRefs(project)]
+                  .forEach(ref => assets.delete(ref));
+          };
+          mappingRequest.onsuccess = () => {
+              (mappingRequest.result as CaptureCloudRefMapping[])
+                  .filter(mapping => mapping.projectId === projectId)
+                  .forEach(mapping => mappings.delete(mapping.key));
+          };
+          projects.delete(projectId);
+          tx.objectStore(STORE_METADATA).delete(projectId);
+          tx.objectStore(STORE_SYNC_QUEUE).delete(projectId);
+          tx.oncomplete = () => resolve();
+          tx.onerror = () => reject(tx.error ?? projectRequest.error ?? mappingRequest.error);
+          tx.onabort = () => reject(tx.error ?? projectRequest.error ?? mappingRequest.error ?? new Error('Local project deletion was aborted.'));
+      });
   },
 
   queueProjectSync: async (userId: string, projectId: string): Promise<void> => {
@@ -764,7 +1190,45 @@ export const StorageService = {
           if ((latestPersistedProjectSaveSequences.get(key) ?? 0) > saveSequence) return 'local';
 
       let pendingStatePath: string | null = null;
+      const createdCaptureObjectPaths = new Set<string>();
+      const pendingCaptureMappings = new Map<string, CaptureCloudRefMapping>();
+      const uploadAttemptId = `${Date.now()}-${crypto.randomUUID?.() ?? Math.random().toString(36).slice(2)}`;
+      const removeCreatedCaptureObjects = async () => {
+          const paths = [...createdCaptureObjectPaths];
+          if (!paths.length) return;
+          await Promise.all(paths.map(path => deleteObject(storageRef(storage, path)).catch(error => {
+              reportWarning('capture-upload-cleanup', 'Abandoned cloud capture cleanup failed', {
+                  projectId: state.projectId,
+                  path,
+                  error: String(error),
+              });
+          })));
+          createdCaptureObjectPaths.clear();
+      };
       try {
+          const baseRevision = knownCloudRevisions.get(key) ?? state.cloudRevision ?? 0;
+          const cachedIndex = knownCloudProjectIndexes.get(key);
+          // A known index is safe to reuse because the Firestore transaction
+          // below verifies both its revision and immutable state pointer. A
+          // genuinely new local project can likewise assume "absent" and let
+          // the transaction reject that assumption if another device already
+          // created the same id. This avoids a redundant server round-trip on
+          // every iPhone autosave without weakening stale-object protection.
+          const authoritativeCaptureState = !force && cachedIndex?.statePath
+              && (cachedIndex.cloudRevision ?? 0) === baseRevision
+              ? await captureRetentionStateFromIndex(userId, state.projectId, cachedIndex)
+              : !force && !cachedIndex && baseRevision === 0
+                  ? {
+                      revision: 0,
+                      currentObjectPaths: new Set<string>(),
+                      retainedObjectPaths: new Set<string>(),
+                      expectedExists: false,
+                    }
+                  : await readAuthoritativeCloudCaptureState(userId, state.projectId);
+          if (!force && authoritativeCaptureState.revision > baseRevision) {
+              projectSyncConflicts.add(key);
+              return 'conflict';
+          }
           // Upload base64 images — Firestore only ever gets a URL or drive ref.
           // Destination: the user's connected cloud drive when available, else
           // Firebase Storage. Uploads are deduped per-save (and across saves,
@@ -807,15 +1271,6 @@ export const StorageService = {
               return uploadCache.get(dataUri)!;
           };
 
-          const canvases = await Promise.all(state.canvases.map(async canvas => ({
-              ...canvas,
-              backgroundImage: await resolveImage(canvas.backgroundImage),
-              signs: await Promise.all(canvas.signs.map(async sign => ({
-                  ...sign,
-                  image: await resolveImage(sign.image),
-              }))),
-          })));
-
           const logoImage = state.titleBlock.logoImage ? await resolveImage(state.titleBlock.logoImage) : null;
 
           // Reference images were previously synced as raw data URIs — a
@@ -825,16 +1280,45 @@ export const StorageService = {
               image: await resolveImage(r.image),
           })));
 
-          const siteCaptures = await Promise.all((state.siteCaptures ?? []).map(async capture => ({
+          const settleCaptureUploads = async <T,>(promises: Promise<T>[]): Promise<T[]> => {
+              const results = await Promise.allSettled(promises);
+              const failed = results.find((result): result is PromiseRejectedResult => result.status === 'rejected');
+              if (failed) throw failed.reason;
+              return results.map(result => (result as PromiseFulfilledResult<T>).value);
+          };
+          const siteCaptures = await settleCaptureUploads((state.siteCaptures ?? []).map(async capture => ({
               ...capture,
-              originalRef: await uploadSiteCaptureAsset(userId, state.projectId, capture.id, 'original', capture.originalRef),
-              workingRef: await uploadSiteCaptureAsset(userId, state.projectId, capture.id, 'working', capture.workingRef),
-              thumbnailRef: await uploadSiteCaptureAsset(userId, state.projectId, capture.id, 'thumbnail', capture.thumbnailRef),
-              supportingPhotos: await Promise.all((capture.supportingPhotos ?? []).map(async photo => ({
+              originalRef: await uploadSiteCaptureAsset(userId, state.projectId, capture.id, 'original', capture.originalRef, createdCaptureObjectPaths, uploadAttemptId, authoritativeCaptureState.retainedObjectPaths, pendingCaptureMappings),
+              annotationBaseRef: capture.annotationBaseRef
+                  ? await uploadSiteCaptureAsset(userId, state.projectId, capture.id, 'annotation-base', capture.annotationBaseRef, createdCaptureObjectPaths, uploadAttemptId, authoritativeCaptureState.retainedObjectPaths, pendingCaptureMappings)
+                  : undefined,
+              workingRef: await uploadSiteCaptureAsset(userId, state.projectId, capture.id, 'working', capture.workingRef, createdCaptureObjectPaths, uploadAttemptId, authoritativeCaptureState.retainedObjectPaths, pendingCaptureMappings),
+              thumbnailRef: await uploadSiteCaptureAsset(userId, state.projectId, capture.id, 'thumbnail', capture.thumbnailRef, createdCaptureObjectPaths, uploadAttemptId, authoritativeCaptureState.retainedObjectPaths, pendingCaptureMappings),
+              supportingPhotos: await settleCaptureUploads((capture.supportingPhotos ?? []).map(async photo => ({
                   ...photo,
-                  originalRef: await uploadSiteCaptureAsset(userId, state.projectId, photo.id, 'original', photo.originalRef),
-                  workingRef: await uploadSiteCaptureAsset(userId, state.projectId, photo.id, 'working', photo.workingRef),
-                  thumbnailRef: await uploadSiteCaptureAsset(userId, state.projectId, photo.id, 'thumbnail', photo.thumbnailRef),
+                  originalRef: await uploadSiteCaptureAsset(userId, state.projectId, photo.id, 'original', photo.originalRef, createdCaptureObjectPaths, uploadAttemptId, authoritativeCaptureState.retainedObjectPaths, pendingCaptureMappings),
+                  workingRef: await uploadSiteCaptureAsset(userId, state.projectId, photo.id, 'working', photo.workingRef, createdCaptureObjectPaths, uploadAttemptId, authoritativeCaptureState.retainedObjectPaths, pendingCaptureMappings),
+                  thumbnailRef: await uploadSiteCaptureAsset(userId, state.projectId, photo.id, 'thumbnail', photo.thumbnailRef, createdCaptureObjectPaths, uploadAttemptId, authoritativeCaptureState.retainedObjectPaths, pendingCaptureMappings),
+              }))),
+          })));
+
+          const promotedCaptureBackgrounds = new Map(
+              state.canvases.flatMap(canvas => {
+                  const capture = siteCaptures.find(candidate => candidate.promotedCanvasId === canvas.id
+                      && canvas.siteCaptureLink?.captureId === candidate.id
+                      && canvas.siteCaptureLink.annotationUpdatedAt === (candidate.annotationUpdatedAt ?? candidate.capturedAt));
+                  return capture ? [[canvas.id, capture.workingRef] as const] : [];
+              }),
+          );
+          const canvases = await Promise.all(state.canvases.map(async canvas => ({
+              ...canvas,
+              // A promoted site photo already has an immutable capture object.
+              // Reuse it instead of uploading another full marked image into
+              // the generic content-addressed image tree on every edit.
+              backgroundImage: promotedCaptureBackgrounds.get(canvas.id) ?? await resolveImage(canvas.backgroundImage),
+              signs: await Promise.all(canvas.signs.map(async sign => ({
+                  ...sign,
+                  image: await resolveImage(sign.image),
               }))),
           })));
 
@@ -862,20 +1346,36 @@ export const StorageService = {
            if (deletedProjectKeys.has(key)
                || (projectDeletionEpochs.get(key) ?? 0) !== deletionEpoch
                || (latestPersistedProjectSaveSequences.get(key) ?? 0) > saveSequence) {
-               await deleteObject(projectStateRef).catch(() => undefined);
-               pendingStatePath = null;
-               return deletedProjectKeys.has(key) ? 'error' : 'local';
+                await deleteObject(projectStateRef).catch(() => undefined);
+                pendingStatePath = null;
+                await removeCreatedCaptureObjects();
+                return deletedProjectKeys.has(key) ? 'error' : 'local';
            }
 
            const projectRef = doc(db, FIRESTORE_COLLECTION, projectDocumentId(userId, state.projectId));
-          const baseRevision = knownCloudRevisions.get(key) ?? state.cloudRevision ?? 0;
           const transactionResult = await runTransaction(db, async transaction => {
               const remote = await transaction.get(projectRef);
-              const remoteRevision = remote.exists() ? (remote.data().cloudRevision ?? 0) : 0;
-              if (!force && remote.exists() && remoteRevision > baseRevision) return null;
-              const revision = remoteRevision + 1;
               const remoteData = remote.exists() ? remote.data() as CloudProjectIndex : undefined;
-              const obsoleteStatePath = remoteData?.previousStatePath;
+              const remoteRevision = remoteData?.cloudRevision ?? 0;
+              // Any change after the asset preflight must restart the save.
+              // This guarantees that obsolete hosted refs are either retained
+              // or copied before a forced restore can commit them again.
+              if (remoteRevision !== authoritativeCaptureState.revision
+                  || remote.exists() !== authoritativeCaptureState.expectedExists
+                  || (authoritativeCaptureState.expectedStatePath !== undefined
+                      && remoteData?.statePath !== authoritativeCaptureState.expectedStatePath)) return null;
+              const revision = remoteRevision + 1;
+              const obsoleteState: CloudStatePointer | null = remoteData?.previousStatePath ? {
+                  path: remoteData.previousStatePath,
+                  url: remoteData.previousStateUrl,
+                  encoding: remoteData.previousStateEncoding,
+              } : null;
+              const captureObjectPaths = [
+                  ...collectCloudSiteCaptureObjectPaths(
+                      cloudState,
+                      captureProjectObjectPrefix(userId, state.projectId),
+                  ),
+              ];
               const index: CloudProjectIndex = {
                   schemaVersion: PROJECT_STATE_SCHEMA_VERSION,
                   statePath: pendingStatePath,
@@ -889,6 +1389,8 @@ export const StorageService = {
                   previousStateUrl: remoteData?.stateUrl,
                   previousStateEncoding: remoteData?.stateEncoding,
                   previousStateRevision: remoteData?.cloudRevision,
+                  captureObjectPaths,
+                  previousCaptureObjectPaths: [...authoritativeCaptureState.currentObjectPaths],
                   userId,
                   projectId: state.projectId,
                   projectName: state.projectName,
@@ -903,14 +1405,30 @@ export const StorageService = {
               };
               const firestoreIndex = withoutUndefined(index) as CloudProjectIndex;
               transaction.set(projectRef, firestoreIndex);
-              return { revision, obsoleteStatePath, index: firestoreIndex };
+              return {
+                  revision,
+                  obsoleteState,
+                  obsoleteCaptureObjectPaths: remoteData?.previousCaptureObjectPaths,
+                  index: firestoreIndex,
+              };
           });
           if (transactionResult === null) {
               await deleteObject(storageRef(storage, pendingStatePath)).catch(() => undefined);
               pendingStatePath = null;
-              projectSyncConflicts.add(key);
-              return 'conflict';
+              await removeCreatedCaptureObjects();
+              if (!fromQueue) await StorageService.queueProjectSync(userId, state.projectId);
+              return 'queued';
           }
+          // The Firestore pointer now owns these objects. Later local/cache
+          // bookkeeping failures must never delete assets from the committed
+          // cloud revision.
+          createdCaptureObjectPaths.clear();
+          await putCaptureCloudRefMappings(pendingCaptureMappings.values()).catch(error => {
+              reportWarning('capture-ref-mapping', 'Committed capture-reference mapping could not be cached', {
+                  projectId: state.projectId,
+                  error: String(error),
+              });
+          });
           const committedStatePath = pendingStatePath;
            pendingStatePath = null;
            knownCloudRevisions.set(key, transactionResult.revision);
@@ -937,8 +1455,19 @@ export const StorageService = {
                await idbOperation(STORE_SYNC_QUEUE, 'readwrite', store => store.delete(state.projectId));
            }
 
-          if (transactionResult.obsoleteStatePath && transactionResult.obsoleteStatePath !== committedStatePath) {
-              await deleteObject(storageRef(storage, transactionResult.obsoleteStatePath)).catch(error => {
+          if (transactionResult.obsoleteState && transactionResult.obsoleteState.path !== committedStatePath) {
+              await pruneSupersededCloudCaptureAssets(
+                  userId,
+                  state.projectId,
+                  transactionResult.obsoleteState,
+                  transactionResult.obsoleteCaptureObjectPaths,
+              ).catch(error => {
+                  reportWarning('capture-cloud-cleanup', 'Superseded cloud capture cleanup failed', {
+                      projectId: state.projectId,
+                      error: String(error),
+                  });
+              });
+              await deleteObject(storageRef(storage, transactionResult.obsoleteState.path)).catch(error => {
                   reportWarning('project-state-cleanup', 'Old cloud project revision cleanup failed', {
                       projectId: state.projectId,
                       error: String(error),
@@ -946,15 +1475,10 @@ export const StorageService = {
               });
           }
 
-          // Do not garbage-collect individual cloud capture trees here. A
-          // concurrent device can legitimately restore an older elevation in
-          // a newer forced revision after this save commits. Deleting the
-          // shared path would then break that newer revision. Project/account
-          // deletion remains the safe, lossless cloud cleanup boundary.
-
           return 'cloud';
       } catch (e) {
           if (pendingStatePath) await deleteObject(storageRef(storage, pendingStatePath)).catch(() => undefined);
+          await removeCreatedCaptureObjects();
           reportError('firestore-sync', e, { userId, projectId: state.projectId, permissionDenied: (e as any)?.code === 'permission-denied' });
           if (fromQueue) return 'queued';
           try {
@@ -1058,8 +1582,13 @@ export const StorageService = {
               index = snapshot.data() as CloudProjectIndex;
               knownCloudProjectIndexes.set(key, index);
               projectState = await readCloudProjectState(index);
-          }
-          knownCloudRevisions.set(revisionKey(userId, projectId), projectState.cloudRevision ?? 0);
+           }
+           // A device that has opened the project must be able to keep its
+           // local copy even after later revisions age old cloud objects out.
+           // Cache every hosted capture blob before treating the cloud load as
+           // successful; stale-ref rehoming reads this durable cache first.
+           await cacheHostedSiteCaptureAssets(projectState);
+           knownCloudRevisions.set(revisionKey(userId, projectId), projectState.cloudRevision ?? 0);
 
           // Materialize any cloud-drive refs into displayable data URIs
           const resolved = await resolveProjectImages(projectState);

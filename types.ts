@@ -227,6 +227,11 @@ export interface Canvas {
   // Background
   backgroundImage: string;
   backgroundSize: Size;
+  /** Present only while this background still follows a promoted site photo. */
+  siteCaptureLink?: {
+    captureId: string;
+    annotationUpdatedAt: number;
+  };
 
   // Objects
   signs: Sign[];
@@ -304,6 +309,11 @@ export interface SiteCapturePhoto {
   workingPixelHeight: number;
   capturedAt: number;
   notes: string;
+  /** Unmarked working image used to rebuild editable phone annotations. */
+  annotationBaseRef?: string;
+  /** Finger/pen strokes stored in normalized image coordinates. */
+  annotations?: SiteCaptureAnnotationStroke[];
+  annotationUpdatedAt?: number;
   location?: {
     latitude: number;
     longitude: number;
@@ -313,6 +323,19 @@ export interface SiteCapturePhoto {
   supportingPhotos?: SiteCaptureSupportingPhoto[];
   referenceWall: ReferenceWallFieldMeasurement;
   promotedCanvasId?: string;
+}
+
+export interface SiteCaptureAnnotationPoint extends Point {
+  /** Pointer pressure from 0 to 1 when supplied by a tablet pen. */
+  pressure?: number;
+}
+
+export interface SiteCaptureAnnotationStroke {
+  id: string;
+  color: string;
+  /** Brush width as a fraction of the image's shortest side. */
+  width: number;
+  points: SiteCaptureAnnotationPoint[];
 }
 
 export interface UserProfile {

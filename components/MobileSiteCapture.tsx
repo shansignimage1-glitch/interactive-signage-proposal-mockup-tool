@@ -1,18 +1,21 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
   ArrowUpRight, Camera, Check, ChevronDown, Cloud, CloudOff, FolderOpen, Images,
-  ImagePlus, Loader2, LogOut, MapPin, Mic, NotebookPen, Plus, Ruler, Save, Square, Trash2, WifiOff, X,
+  ImagePlus, Loader2, LogOut, MapPin, Mic, NotebookPen, PencilLine, Plus, Ruler, Save, Square, Trash2, WifiOff, X,
 } from 'lucide-react';
 import { MeasureUnit, MockupState, ProjectMetadata, ReferenceWallFieldMeasurement, SiteCapturePhoto, SiteCaptureSupportingPhoto } from '../types';
 import { coordinatesFromPhoto, currentCoordinates, reverseGeocode } from '../services/PhotoLocationService';
 import { optimizeImageBlob, readImageDimensions } from '../services/imageProcessing';
+import { blobToDataUri } from '../services/imageHash';
 import {
-  deleteSiteCaptureAssets, getSiteCaptureAsset, makeSiteCaptureAssetRef, putSiteCaptureAsset, StorageService, type ProjectSaveResult,
+  deleteSiteCaptureAssetRefs, deleteSiteCaptureAssets, makeSiteCaptureAssetRef, putSiteCaptureAsset, StorageService, type ProjectSaveResult,
 } from '../services/StorageService';
 import { transcribeAudio } from '../services/GeminiService';
 import { notify } from '../services/toast';
 import { displayMeasurement, isValidSurveyPlaneSize, parseSpokenMeasurementMm } from '../utils/fieldMeasurements';
 import { normalizeProjectState } from '../utils/projectMigration';
+import CaptureAnnotationEditor, { type CaptureAnnotationSave } from './CaptureAnnotationEditor';
+import SiteCaptureImage from './SiteCaptureImage';
 
 type MobileTab = 'capture' | 'views' | 'measure' | 'notes';
 type DictationState = 'idle' | 'listening' | 'recording' | 'transcribing';
@@ -31,26 +34,6 @@ interface MobileSiteCaptureProps {
   onPromoteCapture: (capture: SiteCapturePhoto) => Promise<void>;
   onLogout: () => Promise<void>;
 }
-
-const DIRECT_ASSET = /^(https?:|data:|blob:)/;
-
-const CaptureImage: React.FC<{ assetRef: string; alt: string; className?: string }> = ({ assetRef, alt, className }) => {
-  const [src, setSrc] = useState(DIRECT_ASSET.test(assetRef) ? assetRef : '');
-  useEffect(() => {
-    if (DIRECT_ASSET.test(assetRef)) { setSrc(assetRef); return; }
-    let objectUrl = '';
-    let active = true;
-    getSiteCaptureAsset(assetRef).then(blob => {
-      if (!active || !blob) return;
-      objectUrl = URL.createObjectURL(blob);
-      setSrc(objectUrl);
-    });
-    return () => { active = false; if (objectUrl) URL.revokeObjectURL(objectUrl); };
-  }, [assetRef]);
-  return src
-    ? <img src={src} alt={alt} className={className} />
-    : <div className={`${className ?? ''} grid place-items-center bg-slate-900 text-slate-600`}><Images className="h-7 w-7" /></div>;
-};
 
 const CameraLevelGuide: React.FC = () => (
   <div className="pointer-events-none absolute inset-0 z-10" data-testid="camera-level-guide" aria-hidden="true">
@@ -250,6 +233,7 @@ const MobileSiteCapture: React.FC<MobileSiteCaptureProps> = ({ state, syncStatus
   const [cameraStream, setCameraStream] = useState<MediaStream | null>(null);
   const [selectedProjectId, setSelectedProjectId] = useState(state.projectId);
   const [measurementUnit, setMeasurementUnit] = useState<MeasureUnit>('m');
+  const [annotationCaptureId, setAnnotationCaptureId] = useState<string | null>(null);
   const captureProjectIdRef = useRef(state.projectId);
   const captureRequestEpochRef = useRef(0);
   const captureRequestRef = useRef<CaptureRequest>({
@@ -257,12 +241,14 @@ const MobileSiteCapture: React.FC<MobileSiteCaptureProps> = ({ state, syncStatus
   });
   const captureChooserOpenRef = useRef(false);
   const capturesRef = useRef(captures);
+  const stateRef = useRef(state);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const cameraVideoRef = useRef<HTMLVideoElement>(null);
   const cameraSessionRef = useRef(0);
   const cameraCaptureSessionRef = useRef<number | null>(null);
   const cameraStreamRef = useRef<MediaStream | null>(null);
   const activeCapture = captures.find(capture => capture.id === activeCaptureId) ?? captures[0] ?? null;
+  const annotationCapture = captures.find(capture => capture.id === annotationCaptureId) ?? null;
 
   const stopCameraTracks = () => {
     const stream = cameraStreamRef.current;
@@ -284,7 +270,11 @@ const MobileSiteCapture: React.FC<MobileSiteCaptureProps> = ({ state, syncStatus
   useEffect(() => {
     if (!activeCaptureId && captures[0]) setActiveCaptureId(captures[0].id);
   }, [captures, activeCaptureId]);
-  useEffect(() => { capturesRef.current = captures; }, [captures]);
+  useEffect(() => { setAnnotationCaptureId(null); }, [state.projectId]);
+  useEffect(() => {
+    capturesRef.current = captures;
+    stateRef.current = state;
+  }, [captures, state]);
   useEffect(() => {
     captureRequestRef.current = {
       intent: 'new-elevation', targetCaptureId: null, projectId: captureProjectIdRef.current, epoch: captureRequestEpochRef.current,
@@ -567,6 +557,73 @@ const MobileSiteCapture: React.FC<MobileSiteCaptureProps> = ({ state, syncStatus
     if (activeCaptureId === capture.id) setActiveCaptureId(captures.find(item => item.id !== capture.id)?.id ?? null);
   };
 
+  const saveCaptureAnnotation = async (captureId: string, result: CaptureAnnotationSave) => {
+    const expectedProjectId = stateRef.current.projectId;
+    const requestedCapture = (stateRef.current.siteCaptures ?? []).find(capture => capture.id === captureId);
+    if (!requestedCapture) throw new Error('This photograph no longer belongs to the active project.');
+
+    const stagedRefs: string[] = [];
+    let workingRef = requestedCapture.workingRef;
+    let thumbnailRef = requestedCapture.thumbnailRef;
+    try {
+      let canvasBackground: string | undefined;
+      if (result.workingBlob && result.thumbnailBlob) {
+        const version = `markup_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        workingRef = makeSiteCaptureAssetRef(expectedProjectId, captureId, 'working', version);
+        thumbnailRef = makeSiteCaptureAssetRef(expectedProjectId, captureId, 'thumbnail', version);
+        stagedRefs.push(workingRef, thumbnailRef);
+        const writes = await Promise.allSettled([
+          putSiteCaptureAsset(workingRef, result.workingBlob),
+          putSiteCaptureAsset(thumbnailRef, result.thumbnailBlob),
+        ]);
+        const failedWrite = writes.find((write): write is PromiseRejectedResult => write.status === 'rejected');
+        if (failedWrite) throw failedWrite.reason;
+        canvasBackground = await blobToDataUri(result.workingBlob);
+      }
+
+      const current = stateRef.current;
+      if (current.projectId !== expectedProjectId) {
+        throw new Error('Annotation save stopped because the active project changed.');
+      }
+      const liveCapture = (current.siteCaptures ?? []).find(capture => capture.id === captureId);
+      if (!liveCapture) throw new Error('This photograph was removed before the annotation finished saving.');
+
+      const previousAnnotationUpdatedAt = liveCapture.annotationUpdatedAt ?? liveCapture.capturedAt;
+      const annotationUpdatedAt = result.workingBlob ? Date.now() : previousAnnotationUpdatedAt;
+      const updatedCapture: SiteCapturePhoto = {
+        ...liveCapture,
+        notes: result.note,
+        annotations: result.annotations,
+        annotationBaseRef: result.workingBlob ? (liveCapture.annotationBaseRef ?? liveCapture.workingRef) : liveCapture.annotationBaseRef,
+        annotationUpdatedAt,
+        workingRef,
+        thumbnailRef,
+      };
+      const siteCaptures = (current.siteCaptures ?? []).map(capture => capture.id === captureId ? updatedCapture : capture);
+      const canvases = canvasBackground && liveCapture.promotedCanvasId
+        ? current.canvases.map(canvas => canvas.id === liveCapture.promotedCanvasId
+          && canvas.siteCaptureLink?.captureId === liveCapture.id
+          && canvas.siteCaptureLink.annotationUpdatedAt === previousAnnotationUpdatedAt
+          ? {
+              ...canvas,
+              backgroundImage: canvasBackground,
+              siteCaptureLink: { captureId: liveCapture.id, annotationUpdatedAt },
+            }
+          : canvas)
+        : current.canvases;
+      const updates: Partial<MockupState> = { siteCaptures, canvases, lastSaved: Date.now() };
+      onUpdate(updates);
+      capturesRef.current = siteCaptures;
+      stateRef.current = { ...current, ...updates };
+      stagedRefs.length = 0;
+      setAnnotationCaptureId(null);
+      notify('Photo drawing and note saved. The original photograph is untouched.', 'success');
+    } catch (error) {
+      await deleteSiteCaptureAssetRefs(stagedRefs).catch(() => undefined);
+      throw error;
+    }
+  };
+
   const appendProjectNote = (text: string) => onUpdate({ notes: state.notes ? `${state.notes} ${text}` : text, lastSaved: Date.now() });
   const appendCaptureNote = (text: string) => activeCapture && patchCapture(activeCapture.id, { notes: activeCapture.notes ? `${activeCapture.notes} ${text}` : text });
 
@@ -578,6 +635,15 @@ const MobileSiteCapture: React.FC<MobileSiteCaptureProps> = ({ state, syncStatus
         captureChooserOpenRef.current = false;
         if (event.target.files?.[0]) void capturePhoto(event.target.files[0], captureRequestRef.current);
       }} />
+      {annotationCapture && (
+        <CaptureAnnotationEditor
+          key={`${annotationCapture.id}:${annotationCapture.annotationUpdatedAt ?? 0}`}
+          capture={annotationCapture}
+          onCancel={() => setAnnotationCaptureId(null)}
+          onSave={result => saveCaptureAnnotation(annotationCapture.id, result)}
+          onDictate={append => <DictationButton label={`Dictate note for ${annotationCapture.label}`} onTranscript={append} />}
+        />
+      )}
       {cameraPreviewOpen && (
         <div className="fixed inset-0 z-[130] flex flex-col bg-black text-white" role="dialog" aria-modal="true" aria-label="Site camera with level guide">
           <div className="relative min-h-0 flex-1 overflow-hidden bg-[#05080b]">
@@ -631,7 +697,7 @@ const MobileSiteCapture: React.FC<MobileSiteCaptureProps> = ({ state, syncStatus
           <div className="space-y-5">
             <section className="overflow-hidden rounded-[28px] border border-white/10 bg-[#111821] shadow-2xl">
               <div className="relative aspect-[4/5] max-h-[58vh] bg-[radial-gradient(circle_at_50%_35%,#243140_0,#111821_42%,#080c11_100%)]">
-                {captures.length ? <CaptureImage assetRef={captures[captures.length - 1].thumbnailRef} alt="Latest site capture" className="h-full w-full object-cover opacity-55" /> : <div className="absolute inset-0 grid place-items-center text-center"><div><Camera className="mx-auto h-12 w-12 text-slate-600" /><p className="mt-3 text-sm font-medium text-slate-400">Capture the first elevation</p><p className="mt-1 text-xs text-slate-600">The original file remains untouched</p></div></div>}
+                {captures.length ? <SiteCaptureImage assetRef={captures[captures.length - 1].thumbnailRef} alt="Latest site capture" className="h-full w-full object-cover opacity-55" /> : <div className="absolute inset-0 grid place-items-center text-center"><div><Camera className="mx-auto h-12 w-12 text-slate-600" /><p className="mt-3 text-sm font-medium text-slate-400">Capture the first elevation</p><p className="mt-1 text-xs text-slate-600">The original file remains untouched</p></div></div>}
                 <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/90 via-black/45 to-transparent px-5 pb-5 pt-16">
                   <button onClick={() => choosePhoto('new-elevation')} disabled={isProcessing} className="flex min-h-16 w-full items-center justify-center gap-3 rounded-2xl bg-orange-500 px-5 text-sm font-black uppercase tracking-[0.12em] text-black shadow-[0_14px_38px_rgba(249,115,22,0.3)] transition active:scale-[0.98] disabled:opacity-60" aria-label="Open camera with level guide">
                     {isProcessing ? <><Loader2 className="h-6 w-6 animate-spin" /> Preserving original…</> : <><Camera className="h-6 w-6" /> Take site photo</>}
@@ -642,6 +708,7 @@ const MobileSiteCapture: React.FC<MobileSiteCaptureProps> = ({ state, syncStatus
             <div className="grid grid-cols-2 gap-3">
               <button onClick={() => setTab('views')} className="min-h-20 rounded-2xl border border-slate-800 bg-[#111821] p-4 text-left"><Images className="h-5 w-5 text-cyan-300" /><span className="mt-2 block text-sm font-semibold">{captures.length} captured</span></button>
               <button onClick={() => setTab('measure')} disabled={!activeCapture} className="min-h-20 rounded-2xl border border-slate-800 bg-[#111821] p-4 text-left disabled:opacity-40"><Ruler className="h-5 w-5 text-orange-300" /><span className="mt-2 block text-sm font-semibold">Field dimensions</span></button>
+              <button type="button" onClick={() => activeCapture && setAnnotationCaptureId(activeCapture.id)} disabled={!activeCapture} className="col-span-2 flex min-h-16 items-center gap-3 rounded-2xl border border-cyan-400/30 bg-cyan-400/[0.08] px-4 text-left text-cyan-100 disabled:opacity-40" aria-label="Draw & Note"><span className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-cyan-400/15"><PencilLine className="h-5 w-5" /></span><span><span className="block text-sm font-bold">Draw & Note</span><span className="mt-0.5 block text-[10px] text-cyan-100/55">Mark the photo with a finger or tablet pen</span></span></button>
             </div>
             <p className="flex items-start gap-2 px-1 text-[10px] leading-relaxed text-slate-500"><MapPin className="mt-0.5 h-3.5 w-3.5 shrink-0" />GPS is attached to a new elevation only after you allow location access. Embedded photo GPS is used for accuracy when available.</p>
             {captures.length > 0 && <div className="grid grid-cols-2 gap-3">
@@ -657,8 +724,9 @@ const MobileSiteCapture: React.FC<MobileSiteCaptureProps> = ({ state, syncStatus
             {!captures.length && <button onClick={() => setTab('capture')} className="min-h-32 w-full rounded-2xl border border-dashed border-slate-700 text-sm text-slate-400">Capture your first elevation</button>}
             {captures.map(capture => (
               <article key={capture.id} onClick={() => setActiveCaptureId(capture.id)} className={`overflow-hidden rounded-2xl border bg-[#111821] ${activeCaptureId === capture.id ? 'border-orange-400/60' : 'border-slate-800'}`}>
-                <div className="flex gap-3 p-3"><CaptureImage assetRef={capture.thumbnailRef} alt={capture.label} className="h-24 w-24 shrink-0 rounded-xl object-cover" /><div className="min-w-0 flex-1"><input value={capture.label} onChange={event => patchCapture(capture.id, { label: event.target.value })} onClick={event => event.stopPropagation()} className="w-full bg-transparent text-sm font-semibold outline-none focus:text-orange-200" aria-label="Elevation label" /><p className="mt-1 font-mono text-[10px] text-slate-500">{1 + (capture.supportingPhotos?.length ?? 0)} photo{capture.supportingPhotos?.length ? 's' : ''} · {capture.pixelWidth} × {capture.pixelHeight}</p>{capture.location?.address && <p className="mt-2 line-clamp-2 flex gap-1 text-[10px] leading-relaxed text-slate-400"><MapPin className="mt-0.5 h-3 w-3 shrink-0 text-orange-300" />{capture.location.address}</p>}</div></div>
-                {!!capture.supportingPhotos?.length && <div className="flex gap-2 overflow-x-auto border-t border-white/5 px-3 py-2">{capture.supportingPhotos.map((photo, index) => <CaptureImage key={photo.id} assetRef={photo.thumbnailRef} alt={`${capture.label} supporting photo ${index + 2}`} className="h-16 w-16 shrink-0 rounded-lg object-cover" />)}</div>}
+                <div className="flex gap-3 p-3"><SiteCaptureImage assetRef={capture.thumbnailRef} alt={capture.label} className="h-24 w-24 shrink-0 rounded-xl object-cover" /><div className="min-w-0 flex-1"><input value={capture.label} onChange={event => patchCapture(capture.id, { label: event.target.value })} onClick={event => event.stopPropagation()} className="w-full bg-transparent text-sm font-semibold outline-none focus:text-orange-200" aria-label="Elevation label" /><p className="mt-1 font-mono text-[10px] text-slate-500">{1 + (capture.supportingPhotos?.length ?? 0)} photo{capture.supportingPhotos?.length ? 's' : ''} · {capture.pixelWidth} × {capture.pixelHeight}</p>{capture.location?.address && <p className="mt-2 line-clamp-2 flex gap-1 text-[10px] leading-relaxed text-slate-400"><MapPin className="mt-0.5 h-3 w-3 shrink-0 text-orange-300" />{capture.location.address}</p>}</div></div>
+                {!!capture.supportingPhotos?.length && <div className="flex gap-2 overflow-x-auto border-t border-white/5 px-3 py-2">{capture.supportingPhotos.map((photo, index) => <SiteCaptureImage key={photo.id} assetRef={photo.thumbnailRef} alt={`${capture.label} supporting photo ${index + 2}`} className="h-16 w-16 shrink-0 rounded-lg object-cover" />)}</div>}
+                <button type="button" onClick={() => { setActiveCaptureId(capture.id); setAnnotationCaptureId(capture.id); }} className="flex min-h-12 w-full items-center justify-center gap-2 border-t border-cyan-400/15 bg-cyan-400/[0.06] px-3 text-xs font-bold text-cyan-200" aria-label={`Draw & Note on ${capture.label}`}><PencilLine className="h-4 w-4" />Draw & Note{capture.annotations?.length ? <span className="rounded-full bg-cyan-300/15 px-2 py-0.5 text-[9px] text-cyan-100">{capture.annotations.length} mark{capture.annotations.length === 1 ? '' : 's'}</span> : null}</button>
                 <div className="flex border-t border-white/5">
                   <button onClick={() => { setActiveCaptureId(capture.id); choosePhoto('same-elevation', capture.id); }} className="grid min-h-12 w-12 place-items-center text-cyan-300" aria-label={`Add photo to ${capture.label}`}><Plus className="h-4 w-4" /></button>
                   <button onClick={() => { setActiveCaptureId(capture.id); setTab('measure'); }} className="min-h-12 flex-1 text-xs font-semibold text-slate-300">Measurements</button>
@@ -694,6 +762,7 @@ const MobileSiteCapture: React.FC<MobileSiteCaptureProps> = ({ state, syncStatus
         {tab === 'notes' && (
           <div className="space-y-5">
             <div><h1 className="text-2xl font-semibold tracking-tight">Site notes</h1><p className="mt-1 text-xs text-slate-500">Type, use the phone keyboard microphone, or tap the in-app microphone.</p></div>
+            {activeCapture && <button type="button" onClick={() => setAnnotationCaptureId(activeCapture.id)} className="flex min-h-16 w-full items-center gap-3 rounded-2xl border border-cyan-400/30 bg-cyan-400/[0.08] px-4 text-left" aria-label={`Draw & Note on ${activeCapture.label}`}><span className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-cyan-400/15 text-cyan-200"><PencilLine className="h-5 w-5" /></span><span><span className="block text-sm font-bold text-cyan-100">Draw on {activeCapture.label}</span><span className="mt-0.5 block text-[10px] text-cyan-100/55">Circle conditions directly on the photograph</span></span></button>}
             <label className="block"><span className="mb-2 block text-[10px] font-bold uppercase tracking-[0.16em] text-slate-500">Project notes</span><div className="flex items-start gap-2"><textarea value={state.notes} onChange={event => onUpdate({ notes: event.target.value, lastSaved: Date.now() })} rows={7} className="min-w-0 flex-1 rounded-2xl border border-slate-700 bg-[#111821] p-4 text-base leading-relaxed outline-none focus:border-orange-400" placeholder="Access, power, installation conditions, client instructions…" /><DictationButton label="Dictate project notes" onTranscript={appendProjectNote} /></div></label>
             {activeCapture && <label className="block"><span className="mb-2 block text-[10px] font-bold uppercase tracking-[0.16em] text-slate-500">{activeCapture.label} notes</span><div className="flex items-start gap-2"><textarea value={activeCapture.notes} onChange={event => patchCapture(activeCapture.id, { notes: event.target.value })} rows={6} className="min-w-0 flex-1 rounded-2xl border border-slate-700 bg-[#111821] p-4 text-base leading-relaxed outline-none focus:border-cyan-400" placeholder="Condition of this elevation…" /><DictationButton label={`Dictate notes for ${activeCapture.label}`} onTranscript={appendCaptureNote} /></div></label>}
           </div>

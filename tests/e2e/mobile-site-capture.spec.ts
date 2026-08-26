@@ -177,6 +177,248 @@ test('phone mode captures an original, records wall geometry, dictates notes, an
   await expect(page.getByTestId('mobile-site-capture')).toBeVisible();
 });
 
+test('iPhone user draws and notes on a captured image without changing the original', async ({ page }, testInfo) => {
+  test.skip(!['iphone', 'iphone-webkit'].includes(testInfo.project.name), 'The annotation regression runs on both iPhone browser engines.');
+  test.setTimeout(testInfo.project.name === 'iphone-webkit' ? 90_000 : 45_000);
+
+  await page.goto('/?mobileCapture=1');
+  await page.getByRole('button', { name: 'Continue as Guest' }).click();
+  const mobile = page.getByTestId('mobile-site-capture');
+  const photoBase64 = await page.evaluate(() => {
+    const canvas = document.createElement('canvas');
+    canvas.width = 240;
+    canvas.height = 160;
+    const context = canvas.getContext('2d')!;
+    context.fillStyle = '#f8fafc';
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    context.fillStyle = '#cbd5e1';
+    context.fillRect(20, 20, 200, 120);
+    return canvas.toDataURL('image/png').split(',')[1];
+  });
+  await mobile.locator('input[type=file]').setInputFiles({
+    name: 'annotation-elevation.png',
+    mimeType: 'image/png',
+    buffer: Buffer.from(photoBase64, 'base64'),
+  });
+  await expect(mobile.getByRole('heading', { name: 'Reference wall' })).toBeVisible();
+
+  const readStoredCapture = () => page.evaluate(async () => {
+    const storage = await import(/* @vite-ignore */ ('/services/StorageService.ts' as string));
+    const projectId = localStorage.getItem('signagepro_guest_project_id');
+    const project = projectId ? await storage.StorageService.loadProjectLocal(projectId) : null;
+    const capture = project?.siteCaptures?.[0] as any;
+    if (!capture) return null;
+    const original = await storage.getSiteCaptureAsset(capture.originalRef);
+    const bytes = new Uint8Array(await original!.arrayBuffer());
+    let digest = 2166136261;
+    for (const byte of bytes) {
+      digest ^= byte;
+      digest = Math.imul(digest, 16777619);
+    }
+    return {
+      originalRef: capture.originalRef as string,
+      originalDigest: `${bytes.byteLength}:${digest >>> 0}`,
+      annotationBaseRef: capture.annotationBaseRef as string | undefined,
+      workingRef: capture.workingRef as string,
+      thumbnailRef: capture.thumbnailRef as string,
+      notes: capture.notes as string,
+      annotations: (capture.annotations ?? []) as Array<{ points: Array<{ x: number; y: number }> }>,
+    };
+  });
+
+  await mobile.getByRole('button', { name: 'Choose project' }).click();
+  const savedProjects = page.getByLabel('Saved projects');
+  await savedProjects.getByLabel('Current project name').fill('iPhone annotation regression');
+  await savedProjects.getByRole('button', { name: 'Save current project' }).click();
+  await expect.poll(readStoredCapture).not.toBeNull();
+  const before = await readStoredCapture();
+  expect(before).not.toBeNull();
+  expect(before!.annotations).toEqual([]);
+  await savedProjects.getByTestId('current-saved-project').click();
+
+  await mobile.getByRole('button', { name: 'Views' }).click();
+  await mobile.getByRole('button', { name: 'Draw & Note' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Draw & Note' });
+  await expect(dialog).toBeVisible();
+  const annotationCanvas = dialog.getByTestId('capture-annotation-canvas');
+  await expect(annotationCanvas).toBeVisible();
+  await expect(dialog.getByRole('button', { name: 'Save annotation' })).toBeEnabled();
+  await annotationCanvas.evaluate(canvas => {
+    (window as any).__annotationPointerTypes = [];
+    canvas.addEventListener('pointerdown', event => {
+      (window as any).__annotationPointerTypes.push((event as PointerEvent).pointerType);
+    });
+  });
+
+  const useTrustedPen = testInfo.project.name === 'iphone';
+  const cdp = useTrustedPen ? await page.context().newCDPSession(page) : null;
+  let nextTouchPointerId = 41;
+  const drawPenStroke = async (points: Array<{ x: number; y: number }>) => {
+    const bounds = await annotationCanvas.boundingBox();
+    if (!bounds) throw new Error('Annotation canvas has no visible bounds.');
+    const absolute = points.map(point => ({
+      x: bounds.x + bounds.width * point.x,
+      y: bounds.y + bounds.height * point.y,
+    }));
+    if (cdp) {
+      await cdp.send('Input.dispatchMouseEvent', {
+        type: 'mouseMoved', x: absolute[0].x, y: absolute[0].y, pointerType: 'pen',
+      });
+      await cdp.send('Input.dispatchMouseEvent', {
+        type: 'mousePressed', x: absolute[0].x, y: absolute[0].y,
+        button: 'left', buttons: 1, clickCount: 1, pointerType: 'pen', force: 0.55, tiltX: 8, tiltY: -5,
+      });
+      for (const point of absolute.slice(1)) {
+        await cdp.send('Input.dispatchMouseEvent', {
+          type: 'mouseMoved', x: point.x, y: point.y,
+          button: 'left', buttons: 1, pointerType: 'pen', force: 0.7, tiltX: 10, tiltY: -4,
+        });
+      }
+      const last = absolute[absolute.length - 1];
+      await cdp.send('Input.dispatchMouseEvent', {
+        type: 'mouseReleased', x: last.x, y: last.y,
+        button: 'left', buttons: 0, clickCount: 1, pointerType: 'pen', force: 0,
+      });
+      return;
+    }
+
+    const pointerId = nextTouchPointerId++;
+    await annotationCanvas.evaluate((canvas, input) => {
+      const emit = (type: string, point: { x: number; y: number }, buttons: number, pressure: number) => {
+        canvas.dispatchEvent(new PointerEvent(type, {
+          bubbles: true,
+          cancelable: true,
+          composed: true,
+          pointerId: input.pointerId,
+          pointerType: 'touch',
+          isPrimary: true,
+          clientX: point.x,
+          clientY: point.y,
+          button: type === 'pointermove' ? -1 : 0,
+          buttons,
+          pressure,
+          width: 9,
+          height: 9,
+        }));
+      };
+      emit('pointerdown', input.points[0], 1, 0.55);
+      input.points.slice(1).forEach((point, index) => emit('pointermove', point, 1, 0.62 + index * 0.06));
+      emit('pointerup', input.points[input.points.length - 1], 0, 0);
+    }, { points: absolute, pointerId });
+  };
+
+  await drawPenStroke([{ x: 0.15, y: 0.25 }, { x: 0.35, y: 0.4 }, { x: 0.55, y: 0.3 }]);
+  await drawPenStroke([{ x: 0.2, y: 0.7 }, { x: 0.45, y: 0.6 }, { x: 0.7, y: 0.75 }]);
+  await dialog.getByRole('button', { name: 'Undo' }).click();
+  await dialog.getByRole('button', { name: 'Clear drawing' }).click();
+  await drawPenStroke([{ x: 0.18, y: 0.55 }, { x: 0.42, y: 0.35 }, { x: 0.72, y: 0.5 }]);
+  const expectedPointerType = useTrustedPen ? 'pen' : 'touch';
+  expect(await page.evaluate(() => (window as any).__annotationPointerTypes)).toEqual([
+    expectedPointerType, expectedPointerType, expectedPointerType,
+  ]);
+  await dialog.getByLabel('Photo note').fill('Crack above the left edge of the fascia.');
+  await dialog.getByRole('button', { name: 'Save annotation' }).click();
+  await expect(dialog).toHaveCount(0);
+
+  await mobile.getByRole('button', { name: 'Choose project' }).click();
+  await savedProjects.getByRole('button', { name: 'Save current project' }).click();
+  await expect.poll(async () => (await readStoredCapture())?.notes).toBe('Crack above the left edge of the fascia.');
+  const saved = await readStoredCapture();
+  expect(saved).not.toBeNull();
+  expect(saved!.originalRef).toBe(before!.originalRef);
+  expect(saved!.originalDigest).toBe(before!.originalDigest);
+  expect(saved!.workingRef).toMatch(/^site-capture:\/\//);
+  expect(saved!.thumbnailRef).toMatch(/^site-capture:\/\//);
+  expect(saved!.workingRef).not.toBe(before!.workingRef);
+  expect(saved!.thumbnailRef).not.toBe(before!.thumbnailRef);
+  expect(saved!.annotations).toHaveLength(1);
+  expect(saved!.annotations[0].points.length).toBeGreaterThanOrEqual(2);
+  for (const point of saved!.annotations[0].points) {
+    expect(point.x).toBeGreaterThanOrEqual(0);
+    expect(point.x).toBeLessThanOrEqual(1);
+    expect(point.y).toBeGreaterThanOrEqual(0);
+    expect(point.y).toBeLessThanOrEqual(1);
+  }
+
+  await savedProjects.getByTestId('current-saved-project').click();
+  await mobile.getByRole('button', { name: 'Draw & Note' }).click();
+  await expect(dialog.getByLabel('Photo note')).toHaveValue('Crack above the left edge of the fascia.');
+  await expect(dialog.getByRole('button', { name: 'Undo' })).toBeEnabled();
+
+  await drawPenStroke([{ x: 0.25, y: 0.2 }, { x: 0.5, y: 0.15 }, { x: 0.75, y: 0.25 }]);
+  await dialog.getByLabel('Photo note').fill('This edit must be discarded.');
+  await dialog.getByRole('button', { name: 'Cancel' }).click();
+  await expect(dialog).toHaveCount(0);
+
+  await mobile.getByRole('button', { name: 'Choose project' }).click();
+  await savedProjects.getByRole('button', { name: 'Save current project' }).click();
+  await page.waitForTimeout(250);
+  const afterCancel = await readStoredCapture();
+  expect(afterCancel).toEqual(saved);
+  await savedProjects.getByTestId('current-saved-project').click();
+  await mobile.getByRole('button', { name: 'Draw & Note' }).click();
+  await expect(dialog.getByLabel('Photo note')).toHaveValue('Crack above the left edge of the fascia.');
+  await dialog.getByRole('button', { name: 'Cancel' }).click();
+
+  if (testInfo.project.name === 'iphone') {
+    // Stage one more marked image, then switch projects while its data URI is
+    // still being prepared. The abandoned working/thumbnail pair must be
+    // removed without touching the durable original, annotation base, or last
+    // successfully saved markup. This engine-independent cleanup race runs
+    // once because WebKit does not reliably honor a late FileReader prototype
+    // replacement after the annotation canvas has already used FileReader.
+    const abandonedProjectId = await page.evaluate(() => localStorage.getItem('signagepro_guest_project_id'));
+    expect(abandonedProjectId).toBeTruthy();
+    await mobile.getByRole('button', { name: 'Draw & Note' }).click();
+    await drawPenStroke([{ x: 0.22, y: 0.25 }, { x: 0.48, y: 0.45 }, { x: 0.76, y: 0.32 }]);
+    await page.evaluate(() => {
+      const originalReadAsDataURL = FileReader.prototype.readAsDataURL;
+      FileReader.prototype.readAsDataURL = function (blob: Blob) {
+        const reader = this;
+        (window as any).__annotationBlobReadStarted = true;
+        (window as any).__resumeAnnotationBlobRead = () => {
+          FileReader.prototype.readAsDataURL = originalReadAsDataURL;
+          originalReadAsDataURL.call(reader, blob);
+        };
+      };
+    });
+    await dialog.getByRole('button', { name: 'Save annotation' }).click();
+    await expect.poll(
+      () => page.evaluate(() => Boolean((window as any).__annotationBlobReadStarted)),
+    ).toBe(true);
+
+    const listProjectAssetRefs = (projectId: string) => page.evaluate(async id => {
+      const request = indexedDB.open('SignageProDB');
+      const db = await new Promise<IDBDatabase>((resolve, reject) => {
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+      const tx = db.transaction('assets', 'readonly');
+      const all = tx.objectStore('assets').getAll();
+      const assets = await new Promise<any[]>((resolve, reject) => {
+        all.onsuccess = () => resolve(all.result);
+        all.onerror = () => reject(all.error);
+      });
+      return assets.map(asset => String(asset.ref)).filter(ref => ref.startsWith(`site-capture://${id}/`)).sort();
+    }, projectId);
+    const retainedRefs = [saved!.originalRef, saved!.annotationBaseRef, saved!.workingRef, saved!.thumbnailRef]
+      .filter((ref): ref is string => Boolean(ref));
+    const stagedRefs = (await listProjectAssetRefs(abandonedProjectId!)).filter(ref => !retainedRefs.includes(ref));
+    expect(stagedRefs).toHaveLength(2);
+    expect(stagedRefs.some(ref => ref.includes('/working/markup_'))).toBe(true);
+    expect(stagedRefs.some(ref => ref.includes('/thumbnail/markup_'))).toBe(true);
+
+    await mobile.getByRole('button', { name: 'Choose project' }).evaluate(element => (element as HTMLButtonElement).click());
+    await page.getByRole('button', { name: 'New project' }).evaluate(element => (element as HTMLButtonElement).click());
+    await expect.poll(() => page.evaluate(() => localStorage.getItem('signagepro_guest_project_id'))).not.toBe(abandonedProjectId);
+    await page.evaluate(() => (window as any).__resumeAnnotationBlobRead());
+    await expect.poll(async () => (await listProjectAssetRefs(abandonedProjectId!)).filter(ref => stagedRefs.includes(ref))).toEqual([]);
+    const retainedAfterAbort = await listProjectAssetRefs(abandonedProjectId!);
+    expect(retainedAfterAbort).toEqual(expect.arrayContaining(retainedRefs));
+  }
+  await cdp?.detach();
+});
+
 test('zero wall dimensions show validation and keep editor-view promotion disabled', async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== 'iphone', 'Wall-size validation is platform-independent and runs once on the iPhone profile.');
 

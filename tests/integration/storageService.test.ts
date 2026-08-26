@@ -29,7 +29,15 @@ const mocks = vi.hoisted(() => {
   return {
     transactionSet, getDoc, getDocFromServer, getDocs, getDocsFromServer, getDownloadURL, uploadBytes, getBytes, deleteDoc, listAll, deleteObject, uploadImage, ensureReady, connector,
     uploadedObjects: new Map<string, Uint8Array>(),
-    remoteExists: false, remoteRevision: 0, remoteStatePath: undefined as string | undefined,
+    remoteExists: false, remoteRevision: 0,
+    remoteStatePath: undefined as string | undefined,
+    remoteStateUrl: undefined as string | undefined,
+    remoteStateEncoding: undefined as 'json' | 'gzip' | undefined,
+    remotePreviousStatePath: undefined as string | undefined,
+    remotePreviousStateUrl: undefined as string | undefined,
+    remotePreviousStateEncoding: undefined as 'json' | 'gzip' | undefined,
+    remoteCaptureObjectPaths: undefined as string[] | undefined,
+    remotePreviousCaptureObjectPaths: undefined as string[] | undefined,
     cloudDocs: [] as Array<{ data: () => any }>,
     cloudProject: null as any,
   };
@@ -51,7 +59,17 @@ vi.mock('firebase/firestore', () => ({
   runTransaction: vi.fn(async (_db, callback) => callback({
     get: vi.fn(async () => ({
       exists: () => mocks.remoteExists,
-      data: () => ({ cloudRevision: mocks.remoteRevision, statePath: mocks.remoteStatePath }),
+      data: () => ({
+        cloudRevision: mocks.remoteRevision,
+        statePath: mocks.remoteStatePath,
+        stateUrl: mocks.remoteStateUrl,
+        stateEncoding: mocks.remoteStateEncoding,
+        previousStatePath: mocks.remotePreviousStatePath,
+        previousStateUrl: mocks.remotePreviousStateUrl,
+        previousStateEncoding: mocks.remotePreviousStateEncoding,
+        captureObjectPaths: mocks.remoteCaptureObjectPaths,
+        previousCaptureObjectPaths: mocks.remotePreviousCaptureObjectPaths,
+      }),
     })),
     set: mocks.transactionSet,
   })),
@@ -109,6 +127,13 @@ describe('StorageService save/load', () => {
     mocks.remoteExists = false;
     mocks.remoteRevision = 0;
     mocks.remoteStatePath = undefined;
+    mocks.remoteStateUrl = undefined;
+    mocks.remoteStateEncoding = undefined;
+    mocks.remotePreviousStatePath = undefined;
+    mocks.remotePreviousStateUrl = undefined;
+    mocks.remotePreviousStateEncoding = undefined;
+    mocks.remoteCaptureObjectPaths = undefined;
+    mocks.remotePreviousCaptureObjectPaths = undefined;
     mocks.cloudDocs = [];
     mocks.cloudProject = null;
     Object.defineProperty(navigator, 'onLine', { configurable: true, value: true });
@@ -162,9 +187,85 @@ describe('StorageService save/load', () => {
     const project = makeProject({ projectId: `conflict-${Date.now()}`, cloudRevision: 2 });
     mocks.remoteExists = true;
     mocks.remoteRevision = 3;
+    mocks.cloudProject = {
+      schemaVersion: 2,
+      userId: 'user-1',
+      projectId: project.projectId,
+      projectName: project.projectName,
+      updatedAt: project.lastSaved,
+      cloudRevision: 3,
+    };
     await expect(StorageService.saveProject('user-1', project)).resolves.toBe('conflict');
     expect(mocks.transactionSet).not.toHaveBeenCalled();
     expect(mocks.listAll).not.toHaveBeenCalled();
+    await StorageService.deleteProjectLocal(project.projectId);
+  });
+
+  it('does not require a redundant server preflight for a transaction-verified new project', async () => {
+    const project = makeProject({ projectId: `new-fast-preflight-${Date.now()}`, cloudRevision: 0 });
+
+    await expect(StorageService.saveProject('user-1', project)).resolves.toBe('cloud');
+
+    expect(mocks.getDocFromServer).not.toHaveBeenCalled();
+    expect(mocks.transactionSet).toHaveBeenCalledOnce();
+    await StorageService.deleteProjectLocal(project.projectId);
+  });
+
+  it('queues instead of overwriting when a revision-zero project id already exists remotely', async () => {
+    const project = makeProject({ projectId: `new-id-collision-${Date.now()}`, cloudRevision: 0 });
+    mocks.remoteExists = true;
+    mocks.remoteRevision = 0;
+
+    await expect(StorageService.saveProject('user-1', project)).resolves.toBe('queued');
+
+    expect(mocks.transactionSet).not.toHaveBeenCalled();
+    expect(await StorageService.hasQueuedProjectSync('user-1', project.projectId)).toBe(true);
+    await StorageService.deleteProjectLocal(project.projectId);
+  });
+
+  it('migrates a cached legacy inline revision-zero project instead of queueing forever', async () => {
+    const project = makeProject({ projectId: `legacy-inline-zero-${Date.now()}`, cloudRevision: 0 });
+    const legacyIndex = {
+      ...project,
+      userId: 'user-1',
+      updatedAt: project.lastSaved - 1,
+      cloudRevision: 0,
+    };
+    mocks.cloudProject = legacyIndex;
+    mocks.remoteExists = true;
+    mocks.remoteRevision = 0;
+    await expect(StorageService.loadProjectCloud('user-1', project.projectId, undefined, true, true))
+      .resolves.toEqual(expect.objectContaining({ projectId: project.projectId, cloudRevision: 0 }));
+    mocks.getDocFromServer.mockClear();
+
+    await expect(StorageService.saveProject('user-1', project)).resolves.toBe('cloud');
+
+    expect(mocks.getDocFromServer).toHaveBeenCalled();
+    expect(mocks.transactionSet).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      projectId: project.projectId,
+      cloudRevision: 1,
+      statePath: expect.stringContaining('/revisions/'),
+    }));
+    await StorageService.deleteProjectLocal(project.projectId);
+  });
+
+  it('queues when a cached cloud revision points at a different immutable state object', async () => {
+    const project = makeProject({ projectId: `state-pointer-race-${Date.now()}`, cloudRevision: 0 });
+    await expect(StorageService.saveProject('user-1', project)).resolves.toBe('cloud');
+    const firstIndex = mocks.transactionSet.mock.calls.at(-1)![1];
+    mocks.transactionSet.mockClear();
+    mocks.remoteExists = true;
+    mocks.remoteRevision = firstIndex.cloudRevision;
+    mocks.remoteStatePath = `${firstIndex.statePath}-replaced-by-another-device`;
+
+    await expect(StorageService.saveProject('user-1', {
+      ...project,
+      cloudRevision: firstIndex.cloudRevision,
+      notes: 'must not overwrite the replacement pointer',
+    })).resolves.toBe('queued');
+
+    expect(mocks.transactionSet).not.toHaveBeenCalled();
+    expect(await StorageService.hasQueuedProjectSync('user-1', project.projectId)).toBe(true);
     await StorageService.deleteProjectLocal(project.projectId);
   });
 
@@ -322,6 +423,11 @@ describe('StorageService save/load', () => {
       mocks.remoteExists = true;
       mocks.remoteRevision = index.cloudRevision;
       mocks.remoteStatePath = index.statePath;
+      mocks.remoteStateUrl = index.stateUrl;
+      mocks.remoteStateEncoding = index.stateEncoding;
+      mocks.remoteCaptureObjectPaths = index.captureObjectPaths;
+      mocks.remotePreviousCaptureObjectPaths = index.previousCaptureObjectPaths;
+      mocks.cloudProject = index;
     });
     mocks.uploadBytes.mockImplementation(async (ref: any, value: Blob | Uint8Array) => {
       if (ref.path.includes('/projects/')) {
@@ -378,6 +484,11 @@ describe('StorageService save/load', () => {
       mocks.remoteExists = true;
       mocks.remoteRevision = index.cloudRevision;
       mocks.remoteStatePath = index.statePath;
+      mocks.remoteStateUrl = index.stateUrl;
+      mocks.remoteStateEncoding = index.stateEncoding;
+      mocks.remoteCaptureObjectPaths = index.captureObjectPaths;
+      mocks.remotePreviousCaptureObjectPaths = index.previousCaptureObjectPaths;
+      mocks.cloudProject = index;
     });
 
     try {
@@ -496,6 +607,7 @@ describe('StorageService save/load', () => {
 
     mocks.remoteExists = true;
     mocks.remoteRevision = 1;
+    const existingStatePath = 'users/user-1/projects/existing/revisions/1.json.gz';
     mocks.cloudProject = {
       schemaVersion: 2,
       userId: 'user-1',
@@ -504,8 +616,16 @@ describe('StorageService save/load', () => {
       updatedAt: queuedLocal.lastSaved - 1,
       lastSaved: queuedLocal.lastSaved - 1,
       cloudRevision: 1,
-      statePath: 'users/user-1/projects/existing/revisions/1.json.gz',
+      statePath: existingStatePath,
+      stateEncoding: 'gzip',
     };
+    mocks.remoteStatePath = existingStatePath;
+    mocks.remoteStateEncoding = 'gzip';
+    mocks.uploadedObjects.set(existingStatePath, gzipSync(strToU8(JSON.stringify({
+      ...project,
+      lastSaved: queuedLocal.lastSaved - 1,
+      cloudRevision: 1,
+    }))));
     Object.defineProperty(navigator, 'onLine', { configurable: true, value: true });
 
     await expect(StorageService.flushSyncQueue('user-1')).resolves.toBe(1);
@@ -812,15 +932,699 @@ describe('StorageService save/load', () => {
     await StorageService.deleteProjectLocal(project.projectId);
   });
 
+  it('prunes only superseded annotation working assets after the replacement project is durable', async () => {
+    const project = makeProject({ projectId: `annotation-prune-local-${Date.now()}` });
+    const captureId = 'front-annotation';
+    const originalRef = makeSiteCaptureAssetRef(project.projectId, captureId, 'original');
+    const annotationBaseRef = makeSiteCaptureAssetRef(project.projectId, captureId, 'annotation-base');
+    const oldWorkingRef = makeSiteCaptureAssetRef(project.projectId, captureId, 'working', 'markup_old');
+    const oldThumbnailRef = makeSiteCaptureAssetRef(project.projectId, captureId, 'thumbnail', 'markup_old');
+    const currentWorkingRef = makeSiteCaptureAssetRef(project.projectId, captureId, 'working', 'markup_current');
+    const currentThumbnailRef = makeSiteCaptureAssetRef(project.projectId, captureId, 'thumbnail', 'markup_current');
+    await Promise.all([
+      putSiteCaptureAsset(originalRef, new Blob(['camera-original'], { type: 'image/jpeg' })),
+      putSiteCaptureAsset(annotationBaseRef, new Blob(['unmarked-working-base'], { type: 'image/jpeg' })),
+      putSiteCaptureAsset(oldWorkingRef, new Blob(['old-marked-working'], { type: 'image/jpeg' })),
+      putSiteCaptureAsset(oldThumbnailRef, new Blob(['old-marked-thumbnail'], { type: 'image/jpeg' })),
+      putSiteCaptureAsset(currentWorkingRef, new Blob(['current-marked-working'], { type: 'image/jpeg' })),
+      putSiteCaptureAsset(currentThumbnailRef, new Blob(['current-marked-thumbnail'], { type: 'image/jpeg' })),
+    ]);
+    const capture = {
+      id: captureId,
+      label: 'Front',
+      originalRef,
+      annotationBaseRef,
+      workingRef: oldWorkingRef,
+      thumbnailRef: oldThumbnailRef,
+      fileName: 'front.jpg',
+      mimeType: 'image/jpeg',
+      byteSize: 15,
+      pixelWidth: 100,
+      pixelHeight: 60,
+      workingPixelWidth: 100,
+      workingPixelHeight: 60,
+      capturedAt: Date.now(),
+      notes: 'Old annotation',
+      annotations: [],
+      supportingPhotos: [],
+      referenceWall: { wallName: 'Front', planeDepthMm: 0, planeDepthDirection: 'behind' as const, referencePlaneName: 'Front', method: 'laser' as const, notes: '' },
+    };
+    project.siteCaptures = [capture];
+    await StorageService.saveProjectLocal(project);
+
+    const replacement = {
+      ...project,
+      lastSaved: project.lastSaved + 1,
+      siteCaptures: [{
+        ...capture,
+        workingRef: currentWorkingRef,
+        thumbnailRef: currentThumbnailRef,
+        notes: 'Current annotation',
+      }],
+    };
+    await StorageService.saveProjectLocal(replacement);
+
+    expect((await StorageService.loadProjectLocal(project.projectId))?.siteCaptures?.[0]).toEqual(expect.objectContaining({
+      originalRef,
+      annotationBaseRef,
+      workingRef: currentWorkingRef,
+      thumbnailRef: currentThumbnailRef,
+    }));
+    expect(await getSiteCaptureAsset(oldWorkingRef)).toBeNull();
+    expect(await getSiteCaptureAsset(oldThumbnailRef)).toBeNull();
+    expect(await getSiteCaptureAsset(originalRef)).not.toBeNull();
+    expect(await getSiteCaptureAsset(annotationBaseRef)).not.toBeNull();
+    expect(await getSiteCaptureAsset(currentWorkingRef)).not.toBeNull();
+    expect(await getSiteCaptureAsset(currentThumbnailRef)).not.toBeNull();
+    await StorageService.deleteProjectLocal(project.projectId);
+  });
+
+  it('rolls back the project pointer and asset pruning together when the local save transaction aborts', async () => {
+    const project = makeProject({ projectId: `annotation-atomic-local-${Date.now()}`, projectName: 'Durable annotation' });
+    const captureId = 'front-atomic';
+    const originalRef = makeSiteCaptureAssetRef(project.projectId, captureId, 'original');
+    const annotationBaseRef = makeSiteCaptureAssetRef(project.projectId, captureId, 'annotation-base');
+    const oldWorkingRef = makeSiteCaptureAssetRef(project.projectId, captureId, 'working', 'markup_durable');
+    const oldThumbnailRef = makeSiteCaptureAssetRef(project.projectId, captureId, 'thumbnail', 'markup_durable');
+    const replacementWorkingRef = makeSiteCaptureAssetRef(project.projectId, captureId, 'working', 'markup_aborted');
+    const replacementThumbnailRef = makeSiteCaptureAssetRef(project.projectId, captureId, 'thumbnail', 'markup_aborted');
+    await Promise.all([
+      putSiteCaptureAsset(originalRef, new Blob(['original'])),
+      putSiteCaptureAsset(annotationBaseRef, new Blob(['base'])),
+      putSiteCaptureAsset(oldWorkingRef, new Blob(['durable-working'])),
+      putSiteCaptureAsset(oldThumbnailRef, new Blob(['durable-thumbnail'])),
+      putSiteCaptureAsset(replacementWorkingRef, new Blob(['aborted-working'])),
+      putSiteCaptureAsset(replacementThumbnailRef, new Blob(['aborted-thumbnail'])),
+    ]);
+    const capture = {
+      id: captureId, label: 'Front', originalRef, annotationBaseRef,
+      workingRef: oldWorkingRef, thumbnailRef: oldThumbnailRef,
+      fileName: 'front.jpg', mimeType: 'image/jpeg', byteSize: 8,
+      pixelWidth: 100, pixelHeight: 60, workingPixelWidth: 100, workingPixelHeight: 60,
+      capturedAt: Date.now(), notes: 'Durable', annotations: [], supportingPhotos: [],
+      referenceWall: { wallName: 'Front', planeDepthMm: 0, planeDepthDirection: 'behind' as const, referencePlaneName: 'Front', method: 'laser' as const, notes: '' },
+    };
+    project.siteCaptures = [capture];
+    await StorageService.saveProjectLocal(project);
+    const replacement = {
+      ...project,
+      projectName: 'Must roll back',
+      lastSaved: project.lastSaved + 1,
+      siteCaptures: [{ ...capture, workingRef: replacementWorkingRef, thumbnailRef: replacementThumbnailRef, notes: 'Aborted' }],
+    };
+
+    const originalPut = IDBObjectStore.prototype.put;
+    const putSpy = vi.spyOn(IDBObjectStore.prototype, 'put').mockImplementation(function (this: IDBObjectStore, value: any, key?: IDBValidKey) {
+      const request = key === undefined
+        ? originalPut.call(this, value)
+        : originalPut.call(this, value, key);
+      if (this.name === 'metadata' && value?.id === project.projectId && value?.name === 'Must roll back') {
+        this.transaction.abort();
+      }
+      return request;
+    });
+    try {
+      await expect(StorageService.saveProjectLocal(replacement)).rejects.toThrow();
+    } finally {
+      putSpy.mockRestore();
+    }
+
+    expect(await StorageService.loadProjectLocal(project.projectId)).toEqual(project);
+    expect((await StorageService.listProjectsLocal()).find(item => item.id === project.projectId)?.name).toBe('Durable annotation');
+    expect(await getSiteCaptureAsset(oldWorkingRef)).not.toBeNull();
+    expect(await getSiteCaptureAsset(oldThumbnailRef)).not.toBeNull();
+    expect(await getSiteCaptureAsset(replacementWorkingRef)).not.toBeNull();
+    expect(await getSiteCaptureAsset(replacementThumbnailRef)).not.toBeNull();
+    await StorageService.deleteProjectLocal(project.projectId);
+  });
+
   it('never deletes shared cloud photo paths while saving a newer project revision', async () => {
-    const project = makeProject({ projectId: `capture-delete-cloud-${Date.now()}` });
+    const project = makeProject({ projectId: `capture-delete-cloud-${Date.now()}`, cloudRevision: 1 });
+    const existingStatePath = `users/user-1/projects/${project.projectId}/revisions/1.json.gz`;
     mocks.remoteExists = true;
+    mocks.remoteRevision = 1;
+    mocks.remoteStatePath = existingStatePath;
+    mocks.remoteStateEncoding = 'gzip';
+    mocks.cloudProject = {
+      schemaVersion: 2,
+      userId: 'user-1',
+      projectId: project.projectId,
+      projectName: project.projectName,
+      updatedAt: project.lastSaved - 1,
+      lastSaved: project.lastSaved - 1,
+      cloudRevision: 1,
+      statePath: existingStatePath,
+      stateEncoding: 'gzip',
+      captureObjectPaths: [],
+      previousCaptureObjectPaths: [],
+    };
 
     await expect(StorageService.saveProject('user-1', project)).resolves.toBe('cloud');
 
     expect(mocks.transactionSet).toHaveBeenCalledOnce();
     expect(mocks.listAll).not.toHaveBeenCalled();
     expect(mocks.deleteObject).not.toHaveBeenCalled();
+    await StorageService.deleteProjectLocal(project.projectId);
+  });
+
+  it('retains a capture-backed legacy canvas after its last capture is removed', async () => {
+    const project = makeProject({ projectId: `capture-canvas-only-${Date.now()}` });
+    const legacyCanvasPath = `users/user-1/captures/${project.projectId}/removed-capture/working-markup_legacy`;
+    project.siteCaptures = [];
+    project.canvases[0].backgroundImage = `https://firebasestorage.googleapis.com/v0/b/test/o/${encodeURIComponent(legacyCanvasPath)}?alt=media`;
+    project.canvases[0].siteCaptureLink = undefined;
+
+    await expect(StorageService.saveProject('user-1', project)).resolves.toBe('cloud');
+
+    expect(mocks.transactionSet.mock.calls.at(-1)![1].captureObjectPaths).toEqual([legacyCanvasPath]);
+    await StorageService.deleteProjectLocal(project.projectId);
+  });
+
+  it('deletes cloud annotation objects only after they leave both retained project revisions', async () => {
+    const project = makeProject({ projectId: `annotation-prune-cloud-${Date.now()}`, cloudRevision: 2 });
+    const captureId = 'front';
+    const captureRoot = `users/user-1/captures/${project.projectId}/${captureId}`;
+    const cloudUrl = (path: string) => `https://firebasestorage.googleapis.com/v0/b/test/o/${encodeURIComponent(path)}?alt=media`;
+    const originalPath = `${captureRoot}/original`;
+    const annotationBasePath = `${captureRoot}/annotation-base`;
+    const obsoleteWorkingPath = `${captureRoot}/working-markup_v1`;
+    const obsoleteThumbnailPath = `${captureRoot}/thumbnail-markup_v1`;
+    const retainedLegacyCanvasPath = `${captureRoot}/working-promoted-legacy`;
+    const previousWorkingPath = `${captureRoot}/working-markup_v2`;
+    const previousThumbnailPath = `${captureRoot}/thumbnail-markup_v2`;
+    const currentWorkingPath = `${captureRoot}/working-markup_v3`;
+    const currentThumbnailPath = `${captureRoot}/thumbnail-markup_v3`;
+    const captureWithRefs = (workingRef: string, thumbnailRef: string) => ({
+      id: captureId,
+      label: 'Front',
+      originalRef: cloudUrl(originalPath),
+      annotationBaseRef: cloudUrl(annotationBasePath),
+      workingRef,
+      thumbnailRef,
+      fileName: 'front.jpg',
+      mimeType: 'image/jpeg',
+      byteSize: 15,
+      pixelWidth: 100,
+      pixelHeight: 60,
+      workingPixelWidth: 100,
+      workingPixelHeight: 60,
+      capturedAt: Date.now(),
+      notes: '',
+      annotations: [],
+      supportingPhotos: [],
+      referenceWall: { wallName: 'Front', planeDepthMm: 0, planeDepthDirection: 'behind' as const, referencePlaneName: 'Front', method: 'laser' as const, notes: '' },
+    });
+    const obsoleteState = makeProject({ projectId: project.projectId, cloudRevision: 1 });
+    obsoleteState.siteCaptures = [captureWithRefs(cloudUrl(obsoleteWorkingPath), cloudUrl(obsoleteThumbnailPath))];
+    obsoleteState.canvases[0].backgroundImage = cloudUrl(retainedLegacyCanvasPath);
+    const previousState = makeProject({ projectId: project.projectId, cloudRevision: 2 });
+    previousState.siteCaptures = [captureWithRefs(cloudUrl(previousWorkingPath), cloudUrl(previousThumbnailPath))];
+    const obsoleteStatePath = `users/user-1/projects/${project.projectId}/revisions/1.json.gz`;
+    const previousStatePath = `users/user-1/projects/${project.projectId}/revisions/2.json.gz`;
+    mocks.uploadedObjects.set(obsoleteStatePath, gzipSync(strToU8(JSON.stringify(obsoleteState))));
+    mocks.uploadedObjects.set(previousStatePath, gzipSync(strToU8(JSON.stringify(previousState))));
+    mocks.remoteExists = true;
+    mocks.remoteRevision = 2;
+    mocks.remoteStatePath = previousStatePath;
+    mocks.remoteStateEncoding = 'gzip';
+    mocks.remotePreviousStatePath = obsoleteStatePath;
+    mocks.remotePreviousStateEncoding = 'gzip';
+    mocks.remoteCaptureObjectPaths = [originalPath, annotationBasePath, previousWorkingPath, previousThumbnailPath];
+    mocks.remotePreviousCaptureObjectPaths = [originalPath, annotationBasePath, obsoleteWorkingPath, obsoleteThumbnailPath, retainedLegacyCanvasPath];
+    mocks.cloudProject = {
+      schemaVersion: 2,
+      userId: 'user-1',
+      projectId: project.projectId,
+      projectName: project.projectName,
+      updatedAt: project.lastSaved,
+      cloudRevision: 2,
+      statePath: previousStatePath,
+      stateEncoding: 'gzip',
+      previousStatePath: obsoleteStatePath,
+      previousStateEncoding: 'gzip',
+      captureObjectPaths: mocks.remoteCaptureObjectPaths,
+      previousCaptureObjectPaths: mocks.remotePreviousCaptureObjectPaths,
+    };
+
+    const originalRef = makeSiteCaptureAssetRef(project.projectId, captureId, 'original');
+    const annotationBaseRef = makeSiteCaptureAssetRef(project.projectId, captureId, 'annotation-base');
+    const currentWorkingRef = makeSiteCaptureAssetRef(project.projectId, captureId, 'working', 'markup_v3');
+    const currentThumbnailRef = makeSiteCaptureAssetRef(project.projectId, captureId, 'thumbnail', 'markup_v3');
+    await Promise.all([
+      putSiteCaptureAsset(originalRef, new Blob(['original'], { type: 'image/jpeg' })),
+      putSiteCaptureAsset(annotationBaseRef, new Blob(['base'], { type: 'image/jpeg' })),
+      putSiteCaptureAsset(currentWorkingRef, new Blob(['current-working'], { type: 'image/jpeg' })),
+      putSiteCaptureAsset(currentThumbnailRef, new Blob(['current-thumbnail'], { type: 'image/jpeg' })),
+    ]);
+    project.siteCaptures = [{
+      ...captureWithRefs(currentWorkingRef, currentThumbnailRef),
+      originalRef,
+      annotationBaseRef,
+    }];
+    project.canvases[0].backgroundImage = cloudUrl(retainedLegacyCanvasPath);
+    project.canvases[0].siteCaptureLink = undefined;
+    mocks.getDownloadURL.mockImplementation(async (ref: any) => cloudUrl(ref.path));
+    mocks.transactionSet.mockImplementation((_ref: any, index: any) => { mocks.cloudProject = index; });
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('Use authenticated Storage bytes')));
+
+    try {
+      await expect(StorageService.saveProject('user-1', project)).resolves.toBe('cloud');
+    } finally {
+      vi.unstubAllGlobals();
+    }
+
+    const deletedPaths = mocks.deleteObject.mock.calls.map(([ref]) => ref.path);
+    expect(deletedPaths).toEqual(expect.arrayContaining([
+      obsoleteWorkingPath,
+      obsoleteThumbnailPath,
+      obsoleteStatePath,
+    ]));
+    expect(deletedPaths).not.toEqual(expect.arrayContaining([
+      originalPath,
+      annotationBasePath,
+      previousWorkingPath,
+      previousThumbnailPath,
+      currentWorkingPath,
+      currentThumbnailPath,
+      retainedLegacyCanvasPath,
+    ]));
+    expect(mocks.transactionSet.mock.calls.at(-1)![1].captureObjectPaths).toContain(retainedLegacyCanvasPath);
+    await StorageService.deleteProjectLocal(project.projectId);
+  });
+
+  it('rehomes a forced stale capture URL before committing after the GC retention check', async () => {
+    const project = makeProject({ projectId: `annotation-force-rehome-${Date.now()}`, cloudRevision: 1 });
+    const captureId = 'front';
+    const captureRoot = `users/user-1/captures/${project.projectId}/${captureId}`;
+    const cloudUrl = (path: string) => `https://firebasestorage.googleapis.com/v0/b/test/o/${encodeURIComponent(path)}?alt=media`;
+    const originalPath = `${captureRoot}/original`;
+    const retainedWorkingPath = `${captureRoot}/working-retained`;
+    const staleWorkingPath = `${captureRoot}/working-deleted-by-gc`;
+    const thumbnailPath = `${captureRoot}/thumbnail-retained`;
+    const retainedCapture = {
+      id: captureId, label: 'Front', originalRef: cloudUrl(originalPath),
+      workingRef: cloudUrl(retainedWorkingPath), thumbnailRef: cloudUrl(thumbnailPath),
+      fileName: 'front.jpg', mimeType: 'image/jpeg', byteSize: 8,
+      pixelWidth: 100, pixelHeight: 60, workingPixelWidth: 100, workingPixelHeight: 60,
+      capturedAt: Date.now(), notes: '', annotations: [], supportingPhotos: [],
+      referenceWall: { wallName: 'Front', planeDepthMm: 0, planeDepthDirection: 'behind' as const, referencePlaneName: 'Front', method: 'laser' as const, notes: '' },
+    };
+    const retainedState = makeProject({ projectId: project.projectId, cloudRevision: 1 });
+    retainedState.siteCaptures = [retainedCapture];
+    const retainedStatePath = `users/user-1/projects/${project.projectId}/revisions/1.json.gz`;
+    mocks.uploadedObjects.set(retainedStatePath, gzipSync(strToU8(JSON.stringify(retainedState))));
+    mocks.uploadedObjects.set(staleWorkingPath, strToU8('stale marked photo bytes'));
+    mocks.cloudProject = {
+      schemaVersion: 2, userId: 'user-1', projectId: project.projectId, projectName: project.projectName,
+      updatedAt: project.lastSaved, cloudRevision: 1, statePath: retainedStatePath, stateEncoding: 'gzip',
+    };
+    mocks.remoteExists = true;
+    mocks.remoteRevision = 1;
+    mocks.remoteStatePath = retainedStatePath;
+    mocks.remoteStateEncoding = 'gzip';
+    project.siteCaptures = [{ ...retainedCapture, workingRef: cloudUrl(staleWorkingPath) }];
+    mocks.getDownloadURL.mockImplementation(async (ref: any) => cloudUrl(ref.path));
+    mocks.transactionSet.mockImplementation((_ref: any, index: any) => { mocks.cloudProject = index; });
+    mocks.uploadBytes.mockImplementation(async (ref: any, value: Blob | Uint8Array) => {
+      const bytes = value instanceof Blob ? new Uint8Array(await value.arrayBuffer()) : new Uint8Array(value);
+      mocks.uploadedObjects.set(ref.path, bytes);
+      if (ref.path.includes('/working-restore-')) mocks.uploadedObjects.delete(staleWorkingPath);
+      return { ref };
+    });
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('Use authenticated Storage bytes')));
+
+    try {
+      await expect(StorageService.saveProject('user-1', project, false, true)).resolves.toBe('cloud');
+    } finally {
+      vi.unstubAllGlobals();
+    }
+
+    const committedStateUpload = mocks.uploadBytes.mock.calls.find(([ref]) => ref.path.includes('/projects/') && ref.path !== retainedStatePath)!;
+    const committedState = await readStateUpload(committedStateUpload[1] as Blob);
+    const committedWorkingRef = committedState.siteCaptures[0].workingRef as string;
+    expect(committedWorkingRef).toContain(encodeURIComponent(`${captureRoot}/working-restore-`));
+    expect(committedWorkingRef).not.toBe(cloudUrl(staleWorkingPath));
+    expect(mocks.uploadedObjects.has(staleWorkingPath)).toBe(false);
+    expect([...mocks.uploadedObjects.keys()].some(path => path.startsWith(`${captureRoot}/working-restore-`))).toBe(true);
+    expect(mocks.transactionSet).toHaveBeenCalledOnce();
+    await StorageService.deleteProjectLocal(project.projectId);
+  });
+
+  it('queues a forced stale restore when the cloud revision changes after preflight', async () => {
+    const project = makeProject({ projectId: `annotation-force-revision-race-${Date.now()}`, cloudRevision: 1 });
+    const captureId = 'front';
+    const captureRoot = `users/user-1/captures/${project.projectId}/${captureId}`;
+    const cloudUrl = (path: string) => `https://firebasestorage.googleapis.com/v0/b/test/o/${encodeURIComponent(path)}?alt=media`;
+    const originalPath = `${captureRoot}/original`;
+    const retainedWorkingPath = `${captureRoot}/working-retained`;
+    const staleWorkingPath = `${captureRoot}/working-stale`;
+    const thumbnailPath = `${captureRoot}/thumbnail-retained`;
+    const capture = {
+      id: captureId, label: 'Front', originalRef: cloudUrl(originalPath),
+      workingRef: cloudUrl(retainedWorkingPath), thumbnailRef: cloudUrl(thumbnailPath),
+      fileName: 'front.jpg', mimeType: 'image/jpeg', byteSize: 8,
+      pixelWidth: 100, pixelHeight: 60, workingPixelWidth: 100, workingPixelHeight: 60,
+      capturedAt: Date.now(), notes: '', annotations: [], supportingPhotos: [],
+      referenceWall: { wallName: 'Front', planeDepthMm: 0, planeDepthDirection: 'behind' as const, referencePlaneName: 'Front', method: 'laser' as const, notes: '' },
+    };
+    const retainedState = makeProject({ projectId: project.projectId, cloudRevision: 1 });
+    retainedState.siteCaptures = [capture];
+    const retainedStatePath = `users/user-1/projects/${project.projectId}/revisions/1.json.gz`;
+    mocks.uploadedObjects.set(retainedStatePath, gzipSync(strToU8(JSON.stringify(retainedState))));
+    mocks.uploadedObjects.set(staleWorkingPath, strToU8('stale marked photo bytes'));
+    mocks.cloudProject = {
+      schemaVersion: 2, userId: 'user-1', projectId: project.projectId, projectName: project.projectName,
+      updatedAt: project.lastSaved, cloudRevision: 1, statePath: retainedStatePath, stateEncoding: 'gzip',
+    };
+    mocks.remoteExists = true;
+    mocks.remoteRevision = 1;
+    mocks.remoteStatePath = retainedStatePath;
+    mocks.remoteStateEncoding = 'gzip';
+    project.siteCaptures = [{ ...capture, workingRef: cloudUrl(staleWorkingPath) }];
+    mocks.getDownloadURL.mockImplementation(async (ref: any) => cloudUrl(ref.path));
+    mocks.uploadBytes.mockImplementation(async (ref: any, value: Blob | Uint8Array) => {
+      const bytes = value instanceof Blob ? new Uint8Array(await value.arrayBuffer()) : new Uint8Array(value);
+      mocks.uploadedObjects.set(ref.path, bytes);
+      if (ref.path.includes('/working-restore-')) mocks.remoteRevision = 2;
+      return { ref };
+    });
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('Use authenticated Storage bytes')));
+
+    try {
+      await expect(StorageService.saveProject('user-1', project, false, true)).resolves.toBe('queued');
+    } finally {
+      vi.unstubAllGlobals();
+    }
+
+    expect(mocks.transactionSet).not.toHaveBeenCalled();
+    expect(mocks.deleteObject.mock.calls.map(([ref]) => ref.path).some(path => path.startsWith(`${captureRoot}/working-restore-`))).toBe(true);
+    expect([...mocks.uploadedObjects.keys()].some(path => path.startsWith(`${captureRoot}/working-restore-`))).toBe(false);
+    await StorageService.deleteProjectLocal(project.projectId);
+  });
+
+  it('reuses a promoted capture working object instead of duplicating the canvas background', async () => {
+    const project = makeProject({ projectId: `promoted-capture-cloud-${Date.now()}` });
+    const captureId = 'front';
+    const canvasId = project.canvases[0].id;
+    const originalRef = makeSiteCaptureAssetRef(project.projectId, captureId, 'original');
+    const workingRef = makeSiteCaptureAssetRef(project.projectId, captureId, 'working', 'markup_promoted');
+    const thumbnailRef = makeSiteCaptureAssetRef(project.projectId, captureId, 'thumbnail', 'markup_promoted');
+    await Promise.all([
+      putSiteCaptureAsset(originalRef, new Blob(['original'], { type: 'image/jpeg' })),
+      putSiteCaptureAsset(workingRef, new Blob(['marked-working'], { type: 'image/jpeg' })),
+      putSiteCaptureAsset(thumbnailRef, new Blob(['marked-thumbnail'], { type: 'image/jpeg' })),
+    ]);
+    project.siteCaptures = [{
+      id: captureId, label: 'Front', originalRef, workingRef, thumbnailRef, promotedCanvasId: canvasId,
+      fileName: 'front.jpg', mimeType: 'image/jpeg', byteSize: 8,
+      pixelWidth: 100, pixelHeight: 60, workingPixelWidth: 100, workingPixelHeight: 60,
+      capturedAt: Date.now(), notes: '', annotations: [], supportingPhotos: [],
+      referenceWall: { wallName: 'Front', planeDepthMm: 0, planeDepthDirection: 'behind', referencePlaneName: 'Front', method: 'laser', notes: '' },
+    }];
+    project.canvases[0].backgroundImage = 'data:image/jpeg;base64,bWFya2VkLXdvcmStaW1hZ2U=';
+    project.canvases[0].siteCaptureLink = {
+      captureId,
+      annotationUpdatedAt: project.siteCaptures[0].capturedAt,
+    };
+    mocks.getDownloadURL.mockImplementation(async (ref: any) => {
+      if (!mocks.uploadedObjects.has(ref.path)) throw Object.assign(new Error('not found'), { code: 'storage/object-not-found' });
+      return `https://firebasestorage.googleapis.com/v0/b/test/o/${encodeURIComponent(ref.path)}?alt=media`;
+    });
+
+    await expect(StorageService.saveProject('user-1', project)).resolves.toBe('cloud');
+
+    const stateUpload = mocks.uploadBytes.mock.calls.find(([ref]) => ref.path.includes('/projects/'))!;
+    const storedState = await readStateUpload(stateUpload[1] as Blob);
+    expect(storedState.canvases[0].backgroundImage).toBe(storedState.siteCaptures[0].workingRef);
+    expect(decodeURIComponent(new URL(storedState.canvases[0].backgroundImage).pathname)).toContain('/captures/');
+    expect(mocks.uploadImage).not.toHaveBeenCalled();
+    expect(mocks.uploadBytes.mock.calls.map(([ref]) => ref.path).some(path => path.includes('/images/'))).toBe(false);
+    await StorageService.deleteProjectLocal(project.projectId);
+  });
+
+  it('removes attempt-scoped annotation uploads when the revision changes after preflight', async () => {
+    const project = makeProject({ projectId: `annotation-conflict-cleanup-${Date.now()}`, cloudRevision: 1 });
+    const captureId = 'front';
+    const originalRef = makeSiteCaptureAssetRef(project.projectId, captureId, 'original');
+    const workingRef = makeSiteCaptureAssetRef(project.projectId, captureId, 'working', 'markup_conflict');
+    const thumbnailRef = makeSiteCaptureAssetRef(project.projectId, captureId, 'thumbnail', 'markup_conflict');
+    await Promise.all([
+      putSiteCaptureAsset(originalRef, new Blob(['original'], { type: 'image/jpeg' })),
+      putSiteCaptureAsset(workingRef, new Blob(['working'], { type: 'image/jpeg' })),
+      putSiteCaptureAsset(thumbnailRef, new Blob(['thumbnail'], { type: 'image/jpeg' })),
+    ]);
+    project.siteCaptures = [{
+      id: captureId, label: 'Front', originalRef, workingRef, thumbnailRef,
+      fileName: 'front.jpg', mimeType: 'image/jpeg', byteSize: 8,
+      pixelWidth: 100, pixelHeight: 60, workingPixelWidth: 100, workingPixelHeight: 60,
+      capturedAt: Date.now(), notes: '', annotations: [], supportingPhotos: [],
+      referenceWall: { wallName: 'Front', planeDepthMm: 0, planeDepthDirection: 'behind', referencePlaneName: 'Front', method: 'laser', notes: '' },
+    }];
+    mocks.remoteExists = true;
+    mocks.remoteRevision = 2;
+    mocks.cloudProject = {
+      schemaVersion: 2,
+      userId: 'user-1',
+      projectId: project.projectId,
+      projectName: project.projectName,
+      updatedAt: project.lastSaved,
+      cloudRevision: 1,
+    };
+    mocks.getDownloadURL.mockImplementation(async (ref: any) => {
+      if (!mocks.uploadedObjects.has(ref.path)) {
+        throw Object.assign(new Error('not found'), { code: 'storage/object-not-found' });
+      }
+      return `https://firebasestorage.googleapis.com/v0/b/test/o/${encodeURIComponent(ref.path)}?alt=media`;
+    });
+
+    await expect(StorageService.saveProject('user-1', project)).resolves.toBe('queued');
+
+    const capturePrefix = `users/user-1/captures/${project.projectId}/`;
+    expect([...mocks.uploadedObjects.keys()].filter(path => path.startsWith(capturePrefix))).toEqual([
+      `${capturePrefix}${captureId}/original`,
+    ]);
+    const deletedCapturePaths = mocks.deleteObject.mock.calls.map(([ref]) => ref.path)
+      .filter(path => path.startsWith(capturePrefix));
+    expect(deletedCapturePaths).toHaveLength(2);
+    expect(deletedCapturePaths.some(path => path.startsWith(`${capturePrefix}${captureId}/working-markup_conflict-`))).toBe(true);
+    expect(deletedCapturePaths.some(path => path.startsWith(`${capturePrefix}${captureId}/thumbnail-markup_conflict-`))).toBe(true);
+    expect(deletedCapturePaths).not.toContain(`${capturePrefix}${captureId}/original`);
+    await StorageService.deleteProjectLocal(project.projectId);
+  });
+
+  it('removes successful partial capture uploads when a later capture upload fails', async () => {
+    const project = makeProject({ projectId: `annotation-upload-failure-${Date.now()}` });
+    const captureId = 'front';
+    const originalRef = makeSiteCaptureAssetRef(project.projectId, captureId, 'original');
+    const workingRef = makeSiteCaptureAssetRef(project.projectId, captureId, 'working', 'markup_failure');
+    const thumbnailRef = makeSiteCaptureAssetRef(project.projectId, captureId, 'thumbnail', 'markup_failure');
+    await Promise.all([
+      putSiteCaptureAsset(originalRef, new Blob(['original'], { type: 'image/jpeg' })),
+      putSiteCaptureAsset(workingRef, new Blob(['working'], { type: 'image/jpeg' })),
+      putSiteCaptureAsset(thumbnailRef, new Blob(['thumbnail'], { type: 'image/jpeg' })),
+    ]);
+    project.siteCaptures = [{
+      id: captureId, label: 'Front', originalRef, workingRef, thumbnailRef,
+      fileName: 'front.jpg', mimeType: 'image/jpeg', byteSize: 8,
+      pixelWidth: 100, pixelHeight: 60, workingPixelWidth: 100, workingPixelHeight: 60,
+      capturedAt: Date.now(), notes: '', annotations: [], supportingPhotos: [],
+      referenceWall: { wallName: 'Front', planeDepthMm: 0, planeDepthDirection: 'behind', referencePlaneName: 'Front', method: 'laser', notes: '' },
+    }];
+    const capturePrefix = `users/user-1/captures/${project.projectId}/`;
+    mocks.getDownloadURL.mockImplementation(async (ref: any) => {
+      if (!mocks.uploadedObjects.has(ref.path)) {
+        throw Object.assign(new Error('not found'), { code: 'storage/object-not-found' });
+      }
+      return `https://firebasestorage.googleapis.com/v0/b/test/o/${encodeURIComponent(ref.path)}?alt=media`;
+    });
+    mocks.uploadBytes.mockImplementation(async (ref: any, value: Blob | Uint8Array) => {
+      if (ref.path.startsWith(`${capturePrefix}${captureId}/working-markup_failure-`)) {
+        throw new Error('capture upload interrupted');
+      }
+      const bytes = value instanceof Blob ? new Uint8Array(await value.arrayBuffer()) : new Uint8Array(value);
+      mocks.uploadedObjects.set(ref.path, bytes);
+      return { ref };
+    });
+
+    await expect(StorageService.saveProject('user-1', project)).resolves.toBe('queued');
+
+    expect([...mocks.uploadedObjects.keys()].filter(path => path.startsWith(capturePrefix))).toEqual([
+      `${capturePrefix}${captureId}/original`,
+    ]);
+    expect(mocks.deleteObject.mock.calls.map(([ref]) => ref.path)).not.toContain(`${capturePrefix}${captureId}/original`);
+    expect(mocks.transactionSet).not.toHaveBeenCalled();
+    await StorageService.deleteProjectLocal(project.projectId);
+  });
+
+  it('reuses committed capture mappings without reuploading unchanged marked photos', async () => {
+    const project = makeProject({ projectId: `capture-mapping-${Date.now()}` });
+    const captureId = 'front';
+    const originalRef = makeSiteCaptureAssetRef(project.projectId, captureId, 'original');
+    const workingRef = makeSiteCaptureAssetRef(project.projectId, captureId, 'working', 'markup_reuse');
+    const thumbnailRef = makeSiteCaptureAssetRef(project.projectId, captureId, 'thumbnail', 'markup_reuse');
+    await Promise.all([
+      putSiteCaptureAsset(originalRef, new Blob(['original'], { type: 'image/jpeg' })),
+      putSiteCaptureAsset(workingRef, new Blob(['working'], { type: 'image/jpeg' })),
+      putSiteCaptureAsset(thumbnailRef, new Blob(['thumbnail'], { type: 'image/jpeg' })),
+    ]);
+    project.siteCaptures = [{
+      id: captureId, label: 'Front', originalRef, workingRef, thumbnailRef,
+      fileName: 'front.jpg', mimeType: 'image/jpeg', byteSize: 8,
+      pixelWidth: 100, pixelHeight: 60, workingPixelWidth: 100, workingPixelHeight: 60,
+      capturedAt: Date.now(), notes: '', annotations: [], supportingPhotos: [],
+      referenceWall: { wallName: 'Front', planeDepthMm: 0, planeDepthDirection: 'behind', referencePlaneName: 'Front', method: 'laser', notes: '' },
+    }];
+    const cloudUrl = (path: string) => `https://firebasestorage.googleapis.com/v0/b/test/o/${encodeURIComponent(path)}?alt=media`;
+    mocks.getDownloadURL.mockImplementation(async (ref: any) => {
+      if (!mocks.uploadedObjects.has(ref.path)) throw Object.assign(new Error('not found'), { code: 'storage/object-not-found' });
+      return cloudUrl(ref.path);
+    });
+
+    await expect(StorageService.saveProject('user-1', project)).resolves.toBe('cloud');
+    const firstIndex = mocks.transactionSet.mock.calls.at(-1)![1];
+    expect(firstIndex.captureObjectPaths).toHaveLength(3);
+
+    mocks.cloudProject = firstIndex;
+    mocks.remoteExists = true;
+    mocks.remoteRevision = firstIndex.cloudRevision;
+    mocks.remoteStatePath = firstIndex.statePath;
+    mocks.remoteStateUrl = firstIndex.stateUrl;
+    mocks.remoteStateEncoding = firstIndex.stateEncoding;
+    mocks.remoteCaptureObjectPaths = firstIndex.captureObjectPaths;
+    project.cloudRevision = firstIndex.cloudRevision;
+    project.lastSaved += 10;
+    mocks.uploadBytes.mockClear();
+    mocks.transactionSet.mockClear();
+
+    await expect(StorageService.saveProject('user-1', project)).resolves.toBe('cloud');
+
+    const uploadedPaths = mocks.uploadBytes.mock.calls.map(([ref]) => ref.path as string);
+    expect(uploadedPaths.filter(path => path.includes('/captures/'))).toEqual([]);
+    expect(uploadedPaths.filter(path => path.includes('/projects/'))).toHaveLength(1);
+    await StorageService.deleteProjectLocal(project.projectId);
+  });
+
+  it('rehomes deleted hosted capture URLs from the durable device cache', async () => {
+    const project = makeProject({ projectId: `capture-cache-restore-${Date.now()}`, cloudRevision: 1 });
+    const captureId = 'front';
+    const root = `users/user-1/captures/${project.projectId}/${captureId}`;
+    const originalPath = `${root}/original`;
+    const workingPath = `${root}/working-markup_old`;
+    const thumbnailPath = `${root}/thumbnail-markup_old`;
+    const cloudUrl = (path: string) => `https://firebasestorage.googleapis.com/v0/b/test/o/${encodeURIComponent(path)}?alt=media`;
+    project.siteCaptures = [{
+      id: captureId, label: 'Front', originalRef: cloudUrl(originalPath), workingRef: cloudUrl(workingPath), thumbnailRef: cloudUrl(thumbnailPath),
+      fileName: 'front.jpg', mimeType: 'image/jpeg', byteSize: 8,
+      pixelWidth: 100, pixelHeight: 60, workingPixelWidth: 100, workingPixelHeight: 60,
+      capturedAt: Date.now(), notes: '', annotations: [], supportingPhotos: [],
+      referenceWall: { wallName: 'Front', planeDepthMm: 0, planeDepthDirection: 'behind', referencePlaneName: 'Front', method: 'laser', notes: '' },
+    }];
+    const statePath = `users/user-1/projects/${project.projectId}/revisions/1.json.gz`;
+    mocks.uploadedObjects.set(statePath, gzipSync(strToU8(JSON.stringify(project))));
+    mocks.uploadedObjects.set(originalPath, strToU8('original'));
+    mocks.uploadedObjects.set(workingPath, strToU8('working'));
+    mocks.uploadedObjects.set(thumbnailPath, strToU8('thumbnail'));
+    mocks.cloudProject = {
+      schemaVersion: 2, userId: 'user-1', projectId: project.projectId, projectName: project.projectName,
+      updatedAt: project.lastSaved, cloudRevision: 1, statePath, stateEncoding: 'gzip',
+      captureObjectPaths: [originalPath, workingPath, thumbnailPath], previousCaptureObjectPaths: [],
+    };
+    const fetchMock = vi.fn().mockRejectedValue(new Error('Use authenticated Storage bytes'));
+    vi.stubGlobal('fetch', fetchMock);
+    mocks.getDownloadURL.mockImplementation(async (ref: any) => {
+      if (!mocks.uploadedObjects.has(ref.path)) throw Object.assign(new Error('not found'), { code: 'storage/object-not-found' });
+      return cloudUrl(ref.path);
+    });
+
+    try {
+      const cached = await StorageService.loadProjectCloud('user-1', project.projectId, undefined, true, true);
+      expect(cached?.siteCaptures[0].workingRef).toBe(cloudUrl(workingPath));
+      [originalPath, workingPath, thumbnailPath].forEach(path => mocks.uploadedObjects.delete(path));
+      fetchMock.mockClear();
+
+      mocks.cloudProject = {
+        schemaVersion: 2, userId: 'user-1', projectId: project.projectId, projectName: project.projectName,
+        updatedAt: project.lastSaved + 1, cloudRevision: 2,
+        captureObjectPaths: [], previousCaptureObjectPaths: [],
+      };
+      mocks.remoteExists = true;
+      mocks.remoteRevision = 2;
+      mocks.remoteCaptureObjectPaths = [];
+      mocks.remotePreviousCaptureObjectPaths = [];
+      await expect(StorageService.saveProject('user-1', cached!, false, true)).resolves.toBe('cloud');
+
+      expect(fetchMock).not.toHaveBeenCalled();
+      const stateUpload = mocks.uploadBytes.mock.calls.filter(([ref]) => ref.path.includes('/projects/')).at(-1)!;
+      const storedState = await readStateUpload(stateUpload[1] as Blob);
+      expect(decodeURIComponent(new URL(storedState.siteCaptures[0].workingRef).pathname)).toContain('/working-restore-');
+    } finally {
+      vi.unstubAllGlobals();
+      await StorageService.deleteProjectLocal(project.projectId);
+    }
+  });
+
+  it('does not report a cloud capture project loaded when durable asset caching fails', async () => {
+    const project = makeProject({ projectId: `capture-cache-failure-${Date.now()}`, cloudRevision: 1 });
+    const missingPath = `users/user-1/captures/${project.projectId}/front/working`;
+    const missingUrl = `https://firebasestorage.googleapis.com/v0/b/test/o/${encodeURIComponent(missingPath)}?alt=media`;
+    project.siteCaptures = [{
+      id: 'front', label: 'Front', originalRef: missingUrl, workingRef: missingUrl, thumbnailRef: missingUrl,
+      fileName: 'front.jpg', mimeType: 'image/jpeg', byteSize: 8,
+      pixelWidth: 100, pixelHeight: 60, workingPixelWidth: 100, workingPixelHeight: 60,
+      capturedAt: Date.now(), notes: '', annotations: [], supportingPhotos: [],
+      referenceWall: { wallName: 'Front', planeDepthMm: 0, planeDepthDirection: 'behind', referencePlaneName: 'Front', method: 'laser', notes: '' },
+    }];
+    const statePath = `users/user-1/projects/${project.projectId}/revisions/1.json.gz`;
+    mocks.uploadedObjects.set(statePath, gzipSync(strToU8(JSON.stringify(project))));
+    mocks.cloudProject = {
+      schemaVersion: 2, userId: 'user-1', projectId: project.projectId, projectName: project.projectName,
+      updatedAt: project.lastSaved, cloudRevision: 1, statePath, stateEncoding: 'gzip',
+    };
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('download unavailable')));
+    try {
+      await expect(StorageService.loadProjectCloud('user-1', project.projectId, undefined, true, true))
+        .rejects.toThrow('could not be cached safely');
+    } finally {
+      vi.unstubAllGlobals();
+      await StorageService.deleteProjectLocal(project.projectId);
+    }
+  });
+
+  it('preserves a detached promoted canvas background instead of restoring the raw capture', async () => {
+    const project = makeProject({ projectId: `promoted-detached-${Date.now()}` });
+    const captureId = 'front';
+    const canvasId = project.canvases[0].id;
+    const originalRef = makeSiteCaptureAssetRef(project.projectId, captureId, 'original');
+    const workingRef = makeSiteCaptureAssetRef(project.projectId, captureId, 'working', 'markup_detached');
+    const thumbnailRef = makeSiteCaptureAssetRef(project.projectId, captureId, 'thumbnail', 'markup_detached');
+    await Promise.all([
+      putSiteCaptureAsset(originalRef, new Blob(['original'], { type: 'image/jpeg' })),
+      putSiteCaptureAsset(workingRef, new Blob(['working'], { type: 'image/jpeg' })),
+      putSiteCaptureAsset(thumbnailRef, new Blob(['thumbnail'], { type: 'image/jpeg' })),
+    ]);
+    const capturedAt = Date.now();
+    project.siteCaptures = [{
+      id: captureId, label: 'Front', originalRef, workingRef, thumbnailRef, promotedCanvasId: canvasId,
+      fileName: 'front.jpg', mimeType: 'image/jpeg', byteSize: 8,
+      pixelWidth: 100, pixelHeight: 60, workingPixelWidth: 100, workingPixelHeight: 60,
+      capturedAt, annotationUpdatedAt: capturedAt, notes: '', annotations: [], supportingPhotos: [],
+      referenceWall: { wallName: 'Front', planeDepthMm: 0, planeDepthDirection: 'behind', referencePlaneName: 'Front', method: 'laser', notes: '' },
+    }];
+    project.canvases[0].backgroundImage = 'data:image/jpeg;base64,Y3JvcHBlZC1lZGl0';
+    project.canvases[0].siteCaptureLink = undefined;
+    mocks.uploadImage.mockResolvedValue('gdrive://cropped-editor-background');
+    mocks.getDownloadURL.mockImplementation(async (ref: any) => {
+      if (!mocks.uploadedObjects.has(ref.path)) throw Object.assign(new Error('not found'), { code: 'storage/object-not-found' });
+      return `https://firebasestorage.googleapis.com/v0/b/test/o/${encodeURIComponent(ref.path)}?alt=media`;
+    });
+
+    await expect(StorageService.saveProject('user-1', project)).resolves.toBe('cloud');
+
+    const stateUpload = mocks.uploadBytes.mock.calls.find(([ref]) => ref.path.includes('/projects/'))!;
+    const storedState = await readStateUpload(stateUpload[1] as Blob);
+    expect(storedState.canvases[0].backgroundImage).toBe('gdrive://cropped-editor-background');
+    expect(storedState.canvases[0].backgroundImage).not.toBe(storedState.siteCaptures[0].workingRef);
+    expect(mocks.uploadImage).toHaveBeenCalledOnce();
     await StorageService.deleteProjectLocal(project.projectId);
   });
 });
