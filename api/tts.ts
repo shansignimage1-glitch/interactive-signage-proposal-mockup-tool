@@ -14,8 +14,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       contents: [{ parts: [{ text }] }],
       config: { responseModalities: [Modality.AUDIO], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Aoede' } } } },
     });
-    const audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-    if (!audio) throw new Error('EMPTY_RESPONSE');
-    return res.status(200).json({ audio });
+    const inline = response.candidates?.[0]?.content?.parts?.[0]?.inlineData;
+    if (!inline?.data) throw new Error('EMPTY_RESPONSE');
+    // Gemini TTS returns headerless PCM (e.g. "audio/L16;codec=pcm;rate=24000").
+    // The client needs the format to decode it — decodeAudioData cannot.
+    return res.status(200).json({ audio: inline.data, mimeType: inline.mimeType ?? 'audio/L16;codec=pcm;rate=24000' });
   } catch (error) { sendApiError(res, error); }
 }

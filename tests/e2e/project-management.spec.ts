@@ -28,7 +28,7 @@ test('projects can be explicitly saved, renamed, and permanently deleted', async
   await expect(page.locator('[data-testid^="dimension-label-"]')).toHaveCount(0);
   const cleanState = await page.evaluate(async () => {
     const id = localStorage.getItem('signagepro_guest_project_id');
-    const request = indexedDB.open('SignageProDB', 4);
+    const request = indexedDB.open('SignageProDB');
     const db = await new Promise<IDBDatabase>((resolve, reject) => { request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error); });
     const get = db.transaction('projects', 'readonly').objectStore('projects').get(id!);
     const project = await new Promise<any>((resolve, reject) => { get.onsuccess = () => resolve(get.result); get.onerror = () => reject(get.error); });
@@ -50,7 +50,7 @@ test('projects can be explicitly saved, renamed, and permanently deleted', async
   await page.waitForTimeout(3_500);
   const newView = await page.evaluate(async () => {
     const id = localStorage.getItem('signagepro_guest_project_id');
-    const request = indexedDB.open('SignageProDB', 4);
+    const request = indexedDB.open('SignageProDB');
     const db = await new Promise<IDBDatabase>((resolve, reject) => { request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error); });
     const get = db.transaction('projects', 'readonly').objectStore('projects').get(id!);
     const project = await new Promise<any>((resolve, reject) => { get.onsuccess = () => resolve(get.result); get.onerror = () => reject(get.error); });
@@ -69,7 +69,7 @@ test('projects can be explicitly saved, renamed, and permanently deleted', async
   await page.waitForTimeout(3_500);
   const viewsAfterDelete = await page.evaluate(async () => {
     const id = localStorage.getItem('signagepro_guest_project_id');
-    const request = indexedDB.open('SignageProDB', 4);
+    const request = indexedDB.open('SignageProDB');
     const db = await new Promise<IDBDatabase>((resolve, reject) => { request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error); });
     const get = db.transaction('projects', 'readonly').objectStore('projects').get(id!);
     const project = await new Promise<any>((resolve, reject) => { get.onsuccess = () => resolve(get.result); get.onerror = () => reject(get.error); });

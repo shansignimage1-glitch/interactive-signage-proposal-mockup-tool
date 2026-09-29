@@ -42,8 +42,13 @@ service cloud.firestore {
 
     // Personal sign libraries: each user manages only their own templates.
     match /userLibrary/{templateId} {
-      allow read, update, delete: if request.auth != null
-                                  && resource.data.ownerUid == request.auth.uid;
+      allow read, delete: if request.auth != null
+                          && resource.data.ownerUid == request.auth.uid;
+      // An update may not change ownerUid: otherwise an owner could rewrite
+      // it and push a template into another user's personal library.
+      allow update: if request.auth != null
+                    && resource.data.ownerUid == request.auth.uid
+                    && request.resource.data.ownerUid == resource.data.ownerUid;
       allow create: if request.auth != null
                     && request.resource.data.ownerUid == request.auth.uid;
     }

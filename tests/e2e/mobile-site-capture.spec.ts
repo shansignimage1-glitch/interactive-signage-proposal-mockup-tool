@@ -465,7 +465,12 @@ test('guest resume never opens a project that is now owned by an account', async
     return projectId;
   });
 
-  await savedProjects.getByRole('button', { name: /Private account project/ }).click();
+  // Close the picker via its backdrop, then reopen it: a guest must no longer
+  // be offered the account-owned project at all.
+  await page.mouse.click(10, 10);
+  await mobile.getByRole('button', { name: 'Choose project' }).click();
+  await expect(savedProjects.getByRole('button', { name: /Private account project/ })).toHaveCount(0);
+  await page.mouse.click(10, 10);
   await mobile.getByRole('button', { name: 'Sign out' }).click();
   await page.getByRole('button', { name: 'Continue as Guest' }).click();
 
@@ -865,7 +870,7 @@ test('phone user explicitly saves a named project and stays on the saved-project
 
   const storedName = await page.evaluate(async () => {
     const projectId = localStorage.getItem('signagepro_guest_project_id');
-    const request = indexedDB.open('SignageProDB', 4);
+    const request = indexedDB.open('SignageProDB');
     const db = await new Promise<IDBDatabase>((resolve, reject) => { request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error); });
     const tx = db.transaction('projects', 'readonly');
     const get = tx.objectStore('projects').get(projectId!);

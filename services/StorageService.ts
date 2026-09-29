@@ -1,11 +1,11 @@
 
 import { db, storage } from '../firebase';
-import { collection, deleteDoc, doc, getDoc, getDocFromServer, getDocs, getDocsFromServer, limit, query, runTransaction, setDoc, where } from 'firebase/firestore';
+import { collection, deleteDoc, doc, getDoc, getDocFromServer, getDocs, getDocsFromServer, query, runTransaction, setDoc, where } from 'firebase/firestore';
 import { deleteObject, getBytes, getDownloadURL, listAll, ref as storageRef, uploadBytes, type StorageReference } from 'firebase/storage';
 import { MockupState, ProjectMetadata } from '../types';
 import { hashDataUri, dataUriToBlob } from './imageHash';
 import { connectors, getActiveConnector, getConnectorForRef } from './driveConnectors';
-import { getKnownRef, recordKnownRef, resolveProjectImages, ResolveResult, isDriveRef } from './AssetResolver';
+import { forgetKnownRef, getKnownRef, recordKnownRef, resolveProjectImages, ResolveResult, isDriveRef } from './AssetResolver';
 import { reportError, reportWarning } from './monitoring';
 import { assertStorageCapacity, optimizeDataUri } from './imageProcessing';
 import { decodeProjectFromFirestore, withoutUndefined } from '../utils/firestorePayload';
@@ -42,6 +42,17 @@ const canUseLocalProject = (state: MockupState | null, userId: string): state is
     if (!state) return false;
     const ownerUid = state.user?.uid;
     return !ownerUid || ownerUid.startsWith('guest_') || ownerUid === userId;
+};
+
+// Stricter than canUseLocalProject (which lets a signed-in account adopt legacy
+// guest work): a device can be shared, so guests must never see a signed-in
+// account's cached projects, and one account's export/delete-all must never
+// include or destroy another account's local (possibly unsynced) work.
+const isOwnedLocalProject = (state: MockupState | null, userId: string): state is MockupState => {
+    if (!state) return false;
+    const ownerUid = state.user?.uid;
+    if (userId.startsWith('guest_')) return !ownerUid || ownerUid.startsWith('guest_');
+    return !ownerUid || ownerUid === userId;
 };
 
 type CloudProjectIndex = {
@@ -815,13 +826,22 @@ export const StorageService = {
       return await idbOperation<ProjectMetadata[]>(STORE_METADATA, 'readonly', (store) => store.getAll());
   },
 
-  /** Returns one cross-device project list, keeping the newest metadata per id. */
-  listProjects: async (userId: string): Promise<ProjectMetadata[]> => {
+  /** Returns one cross-device project list, keeping the newest metadata per id.
+   *  `onLocal` receives this device's projects before the (possibly slow)
+   *  cloud read, so callers can render them immediately. */
+  listProjects: async (userId: string, onLocal?: (local: ProjectMetadata[]) => void): Promise<ProjectMetadata[]> => {
       const localCandidates = await StorageService.listProjectsLocal();
-      if (userId.startsWith('guest_')) return localCandidates.sort((a, b) => b.lastModified - a.lastModified);
+      if (userId.startsWith('guest_')) {
+          const guestOwned = await Promise.all(localCandidates.map(async project =>
+              isOwnedLocalProject(await StorageService.loadProjectLocal(project.id), userId)));
+          return localCandidates
+              .filter((_, index) => guestOwned[index])
+              .sort((a, b) => b.lastModified - a.lastModified);
+      }
       const localOwnership = await Promise.all(localCandidates.map(async project =>
           canUseLocalProject(await StorageService.loadProjectLocal(project.id), userId)));
       const local = localCandidates.filter((_, index) => localOwnership[index]);
+      onLocal?.([...local].sort((a, b) => b.lastModified - a.lastModified));
       // Auth bootstrap just fetched and cached this user's complete list. Reuse
       // that fresh result when Project Manager opens instead of starting a
       // second WebKit Firestore channel that can stall for tens of seconds.
@@ -845,7 +865,7 @@ export const StorageService = {
       throwOnCloudError = false,
   ): Promise<MockupState | null> => {
       const localCandidate = await StorageService.loadProjectLocal(projectId);
-      if (userId.startsWith('guest_')) return localCandidate;
+      if (userId.startsWith('guest_')) return isOwnedLocalProject(localCandidate, userId) ? localCandidate : null;
       const local = canUseLocalProject(localCandidate, userId) ? localCandidate : null;
       // A zero revision is an explicitly local-only project. Open it
       // immediately instead of blocking iPhone Safari on a cloud get for a
@@ -874,8 +894,17 @@ export const StorageService = {
           return local;
       }
       await StorageService.saveProjectLocal(cloud);
-      projectSyncConflicts.delete(revisionKey(userId, projectId));
+      StorageService.adoptCloudRevision(userId, projectId, cloud.cloudRevision ?? 0);
       return cloud;
+  },
+
+  /** Record that the editor now holds this cloud revision, so the next save
+   *  uses it as its base. Only call when the cloud copy actually replaces the
+   *  local one — see loadProjectCloud. */
+  adoptCloudRevision: (userId: string, projectId: string, revision: number): void => {
+      const key = revisionKey(userId, projectId);
+      knownCloudRevisions.set(key, revision);
+      projectSyncConflicts.delete(key);
   },
 
   deleteProjectLocal: async (projectId: string): Promise<void> => {
@@ -1012,7 +1041,7 @@ export const StorageService = {
       const local = await StorageService.listProjectsLocal();
       for (const meta of local) {
           const project = await StorageService.loadProjectLocal(meta.id);
-          if (project) byId.set(project.projectId, project);
+          if (isOwnedLocalProject(project, userId)) byId.set(project.projectId, project);
       }
       if (!userId.startsWith('guest_')) {
           const cloud = await getDocs(query(collection(db, FIRESTORE_COLLECTION), where('userId', '==', userId)));
@@ -1028,9 +1057,25 @@ export const StorageService = {
   },
 
   deleteAllUserData: async (userId: string): Promise<void> => {
+      // Only this account's local projects. The device may be shared, and
+      // another account's copies (possibly with unsynced phone photos whose
+      // only copy is in the asset store) must survive this account's wipe.
       const local = await StorageService.listProjectsLocal();
-      await Promise.all(local.map(project => StorageService.deleteProjectLocal(project.id)));
-      await idbOperation(STORE_ASSETS, 'readwrite', store => store.clear());
+      const localProjects = await Promise.all(local.map(meta => StorageService.loadProjectLocal(meta.id)));
+      const owned = localProjects.filter((project): project is MockupState => isOwnedLocalProject(project, userId));
+      const kept = localProjects.filter((project): project is MockupState => !!project && !isOwnedLocalProject(project, userId));
+      await Promise.all(owned.map(project => StorageService.deleteProjectLocal(project.projectId)));
+      // deleteProjectLocal removes each project's own capture blobs. Sweep the
+      // rest of the asset cache (e.g. cached cloud-drive images) except blobs
+      // a remaining project still references.
+      const stillReferenced = new Set(kept.flatMap(project => [
+          ...collectSiteCaptureAssetRefs(project),
+          ...collectHostedSiteCaptureRefs(project),
+      ]));
+      const assetKeys = await idbOperation<IDBValidKey[]>(STORE_ASSETS, 'readonly', store => store.getAllKeys());
+      await Promise.all(assetKeys
+          .filter(ref => !stillReferenced.has(String(ref)))
+          .map(ref => idbOperation(STORE_ASSETS, 'readwrite', store => store.delete(ref))));
       if (userId.startsWith('guest_')) return;
 
       const cloud = await getDocs(query(collection(db, FIRESTORE_COLLECTION), where('userId', '==', userId)));
@@ -1114,7 +1159,10 @@ export const StorageService = {
               }
               await Promise.all(deletedRefs.filter(ref => !stillReferenced.has(ref)).map(async ref => {
                   const connector = getConnectorForRef(ref);
-                  if (connector && await connector.ensureReady(false).catch(() => false)) await connector.deleteImage(ref);
+                  if (connector && await connector.ensureReady(false).catch(() => false)) {
+                      await connector.deleteImage(ref);
+                      forgetKnownRef(ref);
+                  }
               }));
           } catch (e) {
               console.warn("Drive image cleanup skipped:", e);
@@ -1168,6 +1216,19 @@ export const StorageService = {
           await localReservation.waitForTurn;
           if (deletedProjectKeys.has(key) || (projectDeletionEpochs.get(key) ?? 0) !== deletionEpoch) return 'error';
           try {
+              if (userId.startsWith('guest_')) {
+                  // A guest session must never overwrite a local project that a
+                  // signed-in account now owns (e.g. a stale guest tab, or its
+                  // sign-out flush, after the project was adopted by an account).
+                  const existing = await StorageService.loadProjectLocal(state.projectId);
+                  if (existing && !isOwnedLocalProject(existing, userId)) {
+                      reportWarning('sync-owner', 'Blocked a guest save over an account-owned local project', {
+                          projectId: state.projectId,
+                          localOwnerUid: (existing as MockupState).user?.uid ?? null,
+                      });
+                      return 'error';
+                  }
+              }
               await StorageService.saveProjectLocal(state);
               latestPersistedProjectSaveSequences.set(key, saveSequence);
           } catch (e) {
@@ -1438,14 +1499,26 @@ export const StorageService = {
            // A newer invocation may already have written a fresher local
            // snapshot while this upload was running. Never overwrite it with
            // this older state just to record the cloud revision.
-           if (latestPersistedProjectSaveSequences.get(key) === saveSequence) {
+           {
                const revisionReservation = reserveProjectLock(projectLocalSaveTails, key);
                await revisionReservation.waitForTurn;
                try {
-                   if (latestPersistedProjectSaveSequences.get(key) === saveSequence
-                       && !deletedProjectKeys.has(key)
-                       && (projectDeletionEpochs.get(key) ?? 0) === deletionEpoch) {
+                   const stillCurrentProject = !deletedProjectKeys.has(key)
+                       && (projectDeletionEpochs.get(key) ?? 0) === deletionEpoch;
+                   if (stillCurrentProject && latestPersistedProjectSaveSequences.get(key) === saveSequence) {
                        await StorageService.saveProjectLocal({ ...state, cloudRevision: transactionResult.revision });
+                   } else if (stillCurrentProject) {
+                       // A newer snapshot of the same editor session reached
+                       // IndexedDB while this upload ran. Its content descends
+                       // from the revision just committed, so record that
+                       // revision as its base. Otherwise it keeps the old base:
+                       // after an app kill, reload would see "local older than
+                       // cloud" and replace the newer edits with this commit.
+                       const newer = await StorageService.loadProjectLocal(state.projectId);
+                       if (newer && newer.user?.uid === userId
+                           && (newer.cloudRevision ?? 0) < transactionResult.revision) {
+                           await StorageService.saveProjectLocal({ ...newer, cloudRevision: transactionResult.revision });
+                       }
                    }
                } finally {
                    revisionReservation.release();
@@ -1505,8 +1578,13 @@ export const StorageService = {
           // Strict auth/discovery reads must never interpret an offline cache
           // miss as an authoritative empty account. Ordinary project-manager
           // reads may still use Firestore's normal cache-first fallback.
+          // No limit either: without orderBy, Firestore returns documents in
+          // document-id order, and ids end in a creation timestamp — so a
+          // limit kept the OLDEST projects and hid all recent work once an
+          // account passed it. Index documents are tiny (the full state lives
+          // in Storage), so reading all of them is cheap.
           const readProjects = throwOnError ? getDocsFromServer : getDocs;
-          const snapshot = await readProjects(query(collection(db, FIRESTORE_COLLECTION), where('userId', '==', userId), limit(50)));
+          const snapshot = await readProjects(query(collection(db, FIRESTORE_COLLECTION), where('userId', '==', userId)));
 
           const seen = new Set<string>();
           const projects = snapshot.docs.map(doc => {
@@ -1588,7 +1666,12 @@ export const StorageService = {
            // Cache every hosted capture blob before treating the cloud load as
            // successful; stale-ref rehoming reads this durable cache first.
            await cacheHostedSiteCaptureAssets(projectState);
-           knownCloudRevisions.set(revisionKey(userId, projectId), projectState.cloudRevision ?? 0);
+           // Deliberately do NOT advance knownCloudRevisions here. Reading the
+           // cloud copy is not adopting it: callers that keep the local copy
+           // (queued edits, conflict checks, exports) must still save against
+           // their own base so a newer remote revision surfaces as a conflict
+           // instead of being silently overwritten. Adopting callers use
+           // adoptCloudRevision().
 
           // Materialize any cloud-drive refs into displayable data URIs
           const resolved = await resolveProjectImages(projectState);

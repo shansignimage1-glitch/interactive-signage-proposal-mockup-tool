@@ -689,7 +689,23 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
                 x: Math.min(Math.max(0, r.x + dx), containerSize.width - r.w),
                 y: Math.min(Math.max(0, r.y + dy), containerSize.height - r.h)
             }) : null);
-        } 
+        } else if (cropDragMode) {
+            // Corner handles resize: the dragged corner follows the pointer
+            // (clamped to the image) while the opposite corner stays put.
+            // Without this the rect stayed full-frame and crop was a no-op.
+            const minSize = Math.max(8, Math.min(containerSize.width, containerSize.height) * 0.02);
+            const px = Math.min(Math.max(0, m.x), containerSize.width);
+            const py = Math.min(Math.max(0, m.y), containerSize.height);
+            setCropRect(r => {
+                if (!r) return r;
+                let left = r.x, top = r.y, right = r.x + r.w, bottom = r.y + r.h;
+                if (cropDragMode === 'nw' || cropDragMode === 'sw') left = Math.min(px, right - minSize);
+                if (cropDragMode === 'ne' || cropDragMode === 'se') right = Math.max(px, left + minSize);
+                if (cropDragMode === 'nw' || cropDragMode === 'ne') top = Math.min(py, bottom - minSize);
+                if (cropDragMode === 'sw' || cropDragMode === 'se') bottom = Math.max(py, top + minSize);
+                return { x: left, y: top, w: right - left, h: bottom - top };
+            });
+        }
     }
   };
 

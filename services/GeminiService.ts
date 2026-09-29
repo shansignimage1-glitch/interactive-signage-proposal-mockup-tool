@@ -20,8 +20,9 @@ export async function askSignageAssistant(messages: GeminiMessage[]): Promise<st
   return (await authenticatedPost<{ text: string }>('/api/assistant', { messages })).text;
 }
 
-export async function generateSpeech(text: string): Promise<string> {
-  return (await authenticatedPost<{ audio: string }>('/api/tts', { text })).audio;
+export async function generateSpeech(text: string): Promise<{ audio: string; mimeType: string }> {
+  const result = await authenticatedPost<{ audio: string; mimeType?: string }>('/api/tts', { text });
+  return { audio: result.audio, mimeType: result.mimeType ?? 'audio/L16;codec=pcm;rate=24000' };
 }
 
 export async function cleanupImage(image: string, mimeType: string, prompt: string): Promise<string> {

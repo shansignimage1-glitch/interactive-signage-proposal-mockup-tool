@@ -214,7 +214,20 @@ export const googleDriveConnector: DriveConnector = {
 
     uploadImage: async (dataUri, hash) => {
         const map = readFileMap();
-        if (map[hash]) return `${GDRIVE_REF_PREFIX}${map[hash]}`;
+        if (map[hash]) {
+            // The cached file may since have been trashed (a project delete on
+            // this or another device). Reusing it would persist a reference
+            // that breaks once Drive empties its trash.
+            try {
+                const meta = await (await driveFetch(`${API}/files/${map[hash]}?fields=id,trashed`)).json();
+                if (meta?.id && !meta.trashed) return `${GDRIVE_REF_PREFIX}${map[hash]}`;
+            } catch (e) {
+                if (e instanceof DriveAuthError) throw e;
+                // 404 etc — fall through and re-resolve/re-upload
+            }
+            delete map[hash];
+            writeFileMap(map);
+        }
 
         // Cache miss — the file may still exist in Drive (cleared localStorage,
         // other device): appProperties carries the content hash.
@@ -262,12 +275,20 @@ export const googleDriveConnector: DriveConnector = {
     },
 
     deleteImage: async (ref) => {
+        const fileId = refToFileId(ref);
         try {
-            await driveFetch(`${API}/files/${refToFileId(ref)}`, {
+            await driveFetch(`${API}/files/${fileId}`, {
                 method: 'PATCH',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ trashed: true }),
             });
+            // Forget the trashed file so the same image re-uploads next time
+            const map = readFileMap();
+            let changed = false;
+            for (const [hash, id] of Object.entries(map)) {
+                if (id === fileId) { delete map[hash]; changed = true; }
+            }
+            if (changed) writeFileMap(map);
         } catch (e) {
             console.warn('Could not trash Drive file (skipping):', e);
         }

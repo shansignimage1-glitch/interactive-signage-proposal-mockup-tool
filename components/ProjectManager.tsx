@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { StorageService } from '../services/StorageService';
 import { ProjectMetadata, MockupState } from '../types';
 import { Save, FolderOpen, Trash2, X, Clock, FileImage, Layout, Loader2, Pencil, Check, AlertTriangle, Plus } from 'lucide-react';
@@ -36,16 +36,25 @@ const ProjectManager: React.FC<ProjectManagerProps> = ({ isOpen, onClose, curren
         }
     }, [isOpen]);
 
+    // Overlapping loads (open, then save) must not let an older response win.
+    const loadRequestRef = useRef(0);
     const loadProjects = async () => {
+        const request = ++loadRequestRef.current;
         setIsLoading(true);
         try {
-            const list = await StorageService.listProjects(currentState.user?.uid ?? 'guest_unknown');
+            const list = await StorageService.listProjects(
+                currentState.user?.uid ?? 'guest_unknown',
+                // Show this device's projects right away; the cloud list can
+                // stall for tens of seconds on iOS WebKit and merges in after.
+                local => { if (request === loadRequestRef.current) setProjects(local); },
+            );
+            if (request !== loadRequestRef.current) return;
             // Sort by newest first
             setProjects(list.sort((a, b) => b.lastModified - a.lastModified));
         } catch (e) {
             console.error(e);
         } finally {
-            setIsLoading(false);
+            if (request === loadRequestRef.current) setIsLoading(false);
         }
     };
 
@@ -223,7 +232,12 @@ const ProjectManager: React.FC<ProjectManagerProps> = ({ isOpen, onClose, curren
                                 </div>
                             </div>
 
-                            {isLoading ? (
+                            {isLoading && projects.length > 0 && (
+                                <p className="flex items-center gap-2 text-xs text-gray-500" role="status">
+                                    <Loader2 className="w-3 h-3 animate-spin" /> Checking the cloud for more projects…
+                                </p>
+                            )}
+                            {isLoading && projects.length === 0 ? (
                                 <div className="flex justify-center py-10">
                                     <Loader2 className="w-8 h-8 text-blue-500 animate-spin" />
                                 </div>

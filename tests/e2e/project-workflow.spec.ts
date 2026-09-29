@@ -24,7 +24,7 @@ test('guest can upload, autosave, reopen, browse library, measure, and export', 
   await page.waitForTimeout(3_500);
   const projectId = await page.evaluate(() => localStorage.getItem('signagepro_guest_project_id'));
   const storedBackground = await page.evaluate(async id => {
-    const request = indexedDB.open('SignageProDB', 4);
+    const request = indexedDB.open('SignageProDB');
     const db = await new Promise<IDBDatabase>((resolve, reject) => {
       request.onsuccess = () => resolve(request.result);
       request.onerror = () => reject(request.error);

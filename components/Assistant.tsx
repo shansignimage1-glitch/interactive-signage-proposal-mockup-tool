@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { MessageCircle, X, Send, Mic, Volume2, VolumeX, Loader2, Sparkles, Bot, ChevronDown, User as UserIcon } from 'lucide-react';
 import { askSignageAssistant, generateSpeech } from '../services/GeminiService';
+import { isRawPcm, pcm16ToFloat32, pcmSampleRate } from '../utils/pcmAudio';
 import { notify } from '../services/toast';
 
 interface Message {
@@ -81,11 +82,11 @@ const Assistant: React.FC<AssistantProps> = ({ isOpen: propIsOpen, setIsOpen: pr
 
   const speakResponse = async (text: string) => {
      try {
-        const base64Audio = await generateSpeech(text);
+        const { audio: base64Audio, mimeType } = await generateSpeech(text);
         if (base64Audio) {
             ensureAudioContext();
             if (audioContextRef.current) {
-                const audioBuffer = await decodeAudioData(decode(base64Audio), audioContextRef.current);
+                const audioBuffer = await decodeAudioData(decode(base64Audio), mimeType, audioContextRef.current);
                 const source = audioContextRef.current.createBufferSource();
                 source.buffer = audioBuffer;
                 source.connect(audioContextRef.current.destination);
@@ -141,7 +142,15 @@ const Assistant: React.FC<AssistantProps> = ({ isOpen: propIsOpen, setIsOpen: pr
     return bytes;
   }
 
-  async function decodeAudioData(data: Uint8Array, ctx: AudioContext): Promise<AudioBuffer> {
+  async function decodeAudioData(data: Uint8Array, mimeType: string, ctx: AudioContext): Promise<AudioBuffer> {
+     if (isRawPcm(mimeType)) {
+         // Raw PCM has no container for decodeAudioData to parse; build the
+         // buffer from the samples directly (the context resamples on play).
+         const samples = pcm16ToFloat32(data);
+         const buffer = ctx.createBuffer(1, Math.max(1, samples.length), pcmSampleRate(mimeType));
+         buffer.copyToChannel(samples, 0);
+         return buffer;
+     }
      // Copy into a guaranteed ArrayBuffer. Newer TypeScript versions model a
      // Uint8Array's backing store as ArrayBufferLike (which may be shared),
      // while Web Audio deliberately accepts only a transferable ArrayBuffer.

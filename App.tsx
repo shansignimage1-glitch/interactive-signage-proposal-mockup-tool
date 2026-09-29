@@ -32,6 +32,8 @@ import { reportError, reportWarning } from './services/monitoring';
 import { captureElement } from './utils/exportCapture';
 import { optimizeImageFile } from './services/imageProcessing';
 import { blobToDataUri } from './services/imageHash';
+import { resolveProjectImages } from './services/AssetResolver';
+import { hasSameEditableContent } from './utils/historyContent';
 
 const GUEST_PROJECT_ID_KEY = 'signagepro_guest_project_id';
 // Large Storage-backed projects (dense sign contours plus site captures) can
@@ -290,6 +292,10 @@ const App: React.FC = () => {
   const startSession = useCallback((state: MockupState, suppressAutosave = true) => {
       const newState = normalizeProjectState(state);
       syncAttemptRef.current += 1;
+      // A debounced edit belongs to the session being replaced. Callers that
+      // must keep it flush first (flushPendingAutosave); any left here was
+      // intentionally discarded and must never be saved later.
+      pendingAutosaveRef.current = null;
       suppressNextAutosaveRef.current = suppressAutosave;
       stateRef.current = newState;
       setState(newState);
@@ -631,8 +637,10 @@ const App: React.FC = () => {
     return () => window.clearTimeout(timer);
   }, [bootstrapFirebaseUser]);
 
-  // Re-open the current project after the user reconnects their drive, so
-  // unresolved gdrive:// refs get another chance to materialize.
+  // After the user reconnects their drive, give the unresolved drive refs still
+  // held in the editor another chance to materialize. Resolve them in place —
+  // reloading the cloud copy here used to replace the editor and discard any
+  // edits made (and queued) while the drive was disconnected.
   const handleDriveReconnect = async () => {
     const connector = connectors.find(c => c.id === (driveReconnectProvider ?? getPreferredProvider()));
     if (!connector) return;
@@ -643,9 +651,18 @@ const App: React.FC = () => {
       setDriveReconnectProvider(null);
       const current = stateRef.current;
       if (current.user && !current.user.uid.startsWith('guest_')) {
-        const reloaded = await StorageService.loadProjectCloud(current.user.uid, current.projectId);
-        if (reloaded) {
-          startSession({ ...reloaded, user: current.user, isOnline: navigator.onLine, isSyncing: false });
+        const { state: resolved, failedRefs } = await resolveProjectImages(current);
+        // Only apply if nothing changed while images were fetched; otherwise
+        // the edits win and the refs resolve on the next project open.
+        if (stateRef.current === current) {
+          updateState({
+            canvases: resolved.canvases,
+            titleBlock: resolved.titleBlock,
+            referenceImages: resolved.referenceImages,
+          });
+        }
+        if (failedRefs.length > 0) {
+          notify(`${failedRefs.length} image${failedRefs.length === 1 ? '' : 's'} could not be loaded from ${connector.label}.`, 'warning');
         }
       }
     } catch (e) {
@@ -683,6 +700,14 @@ const App: React.FC = () => {
   };
 
   const handleLogout = async () => {
+    // Persist the last few seconds of edits while still signed in. The local
+    // write lands almost immediately; cap the wait so a slow cloud upload
+    // can't hold sign-out hostage (an unfinished upload re-queues on next
+    // sign-in because the local copy is then newer than the cloud one).
+    await Promise.race([
+      flushPendingAutosave(),
+      new Promise(resolve => setTimeout(resolve, 10_000)),
+    ]);
     authAttemptInProgressRef.current = false;
     setIsLoginPending(false);
     selectAuthUser(null);
@@ -786,10 +811,13 @@ const App: React.FC = () => {
 
   const loadCloudConflictCopy = async () => {
       if (!state.user) return;
+      // The user chose the cloud copy; the local pending edit is discarded.
+      discardPendingAutosave();
       const remote = await StorageService.loadProjectCloud(state.user.uid, state.projectId, undefined, true);
       if (remote) {
           await StorageService.saveProjectLocal(remote);
           await StorageService.discardQueuedProjectSync(state.user.uid, state.projectId);
+          StorageService.adoptCloudRevision(state.user.uid, state.projectId, remote.cloudRevision ?? 0);
           startSession({ ...remote, user: state.user, isOnline: navigator.onLine, isSyncing: false });
           setSyncConflict(false); setSyncStatus('synced');
           notify('Loaded the newer cloud version.', 'success');
@@ -973,6 +1001,11 @@ const App: React.FC = () => {
 
   // Auto-save debounce
   const syncTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // The edit waiting out the debounce. The local IndexedDB write happens only
+  // inside the save, so a pending edit that is merely cancelled (project
+  // switch, new project, sign-out, iOS killing a backgrounded tab) is lost
+  // everywhere. Those paths flush it instead.
+  const pendingAutosaveRef = useRef<MockupState | null>(null);
   useEffect(() => {
       if (suppressNextAutosaveRef.current) {
           suppressNextAutosaveRef.current = false;
@@ -980,7 +1013,9 @@ const App: React.FC = () => {
       }
       if (state.user) {
           if (syncTimeoutRef.current) clearTimeout(syncTimeoutRef.current);
+          pendingAutosaveRef.current = state;
           syncTimeoutRef.current = setTimeout(() => {
+              pendingAutosaveRef.current = null;
               triggerBackendSync(state);
           }, 3000); // 3s debounce
       }
@@ -988,6 +1023,34 @@ const App: React.FC = () => {
           if (syncTimeoutRef.current) clearTimeout(syncTimeoutRef.current);
       };
   }, [state.canvases, state.titleBlock, state.notes, state.referenceImages, state.siteCaptures, triggerBackendSync, state.user, state.projectName]);
+
+  /** Save the debounced edit now (if any). Call before leaving a session. */
+  const flushPendingAutosave = useCallback((): Promise<unknown> => {
+      const pending = pendingAutosaveRef.current;
+      pendingAutosaveRef.current = null;
+      if (syncTimeoutRef.current) clearTimeout(syncTimeoutRef.current);
+      return pending ? triggerBackendSync(pending) : Promise.resolve();
+  }, [triggerBackendSync]);
+
+  /** Drop the debounced edit without saving (the user discarded it). */
+  const discardPendingAutosave = useCallback(() => {
+      pendingAutosaveRef.current = null;
+      if (syncTimeoutRef.current) clearTimeout(syncTimeoutRef.current);
+  }, []);
+
+  // iOS can kill a backgrounded tab without further events; persist promptly.
+  useEffect(() => {
+      const flushWhenHidden = () => {
+          if (document.visibilityState === 'hidden') void flushPendingAutosave();
+      };
+      const flushOnPageHide = () => { void flushPendingAutosave(); };
+      document.addEventListener('visibilitychange', flushWhenHidden);
+      window.addEventListener('pagehide', flushOnPageHide);
+      return () => {
+          document.removeEventListener('visibilitychange', flushWhenHidden);
+          window.removeEventListener('pagehide', flushOnPageHide);
+      };
+  }, [flushPendingAutosave]);
 
   // `navigator.onLine` only reports network attachment, not whether Firebase
   // was temporarily reachable. Check the entire user's durable queue after
@@ -1021,6 +1084,12 @@ const App: React.FC = () => {
 
 
   const activeCanvas = state.canvases.find(c => c.id === state.activeCanvasId) || state.canvases[0];
+
+  // Untracked edits (see recordUntrackedEdits) are undoable too, and they make
+  // any redo branch stale.
+  const hasUntrackedEdits = !!history[historyIndex] && !hasSameEditableContent(state, history[historyIndex]);
+  const canUndo = historyIndex > 0 || hasUntrackedEdits;
+  const canRedo = historyIndex < history.length - 1 && !hasUntrackedEdits;
 
   const addToHistory = useCallback((newState: MockupState) => {
       const currentIndex = historyIndexRef.current;
@@ -1058,22 +1127,68 @@ const App: React.FC = () => {
       addHistoryTransaction(before, stateRef.current);
   }, [addHistoryTransaction]);
 
+  // Restore a history snapshot's CONTENT while keeping the live session: the
+  // signed-in user (a snapshot must never log the user out) and sync
+  // bookkeeping. A snapshot's stale cloudRevision/isOnline/isSyncing used to
+  // come back too, causing false sync conflicts and a stuck retry loop.
+  const restoreHistorySnapshot = useCallback((snapshot: MockupState) => {
+      const live = stateRef.current;
+      const next: MockupState = {
+          ...snapshot,
+          user: live.user,
+          isOnline: live.isOnline,
+          isSyncing: live.isSyncing,
+          lastSaved: live.lastSaved,
+          cloudRevision: live.cloudRevision,
+      };
+      stateRef.current = next;
+      setState(next);
+  }, []);
+
+  // Many edits (dimension drags, property sliders, library inserts, …) update
+  // state without a history entry, leaving the live state ahead of
+  // history[index]. Undo must revert THOSE edits first; jumping straight to
+  // history[index - 1] reverted two steps at once and the skipped edit could
+  // not be recovered with redo. Record the live state, then step back to it.
+  // Returns the recorded snapshot the live state diverged from, or null.
+  const recordUntrackedEdits = useCallback((): MockupState | null => {
+      const recorded = history[historyIndexRef.current];
+      if (!recorded || hasSameEditableContent(stateRef.current, recorded)) return null;
+      addToHistory(stateRef.current);
+      return recorded;
+  }, [history, addToHistory]);
+
   const undo = useCallback(() => {
-      if (historyIndex > 0) {
-          const prevState = history[historyIndex - 1];
-          // Keep the live session user — history snapshots must never log the user out
-          setState(s => ({ ...prevState, user: s.user }));
-          setHistoryIndex(prev => prev - 1);
+      const recorded = recordUntrackedEdits();
+      if (recorded) {
+          // addToHistory put the live state on top, so the recorded snapshot
+          // sits directly beneath it — also when the 20-entry cap trimmed one.
+          const recordedIndex = historyIndexRef.current - 1;
+          restoreHistorySnapshot(recorded);
+          historyIndexRef.current = recordedIndex;
+          setHistoryIndex(recordedIndex);
+          return;
       }
-  }, [history, historyIndex]);
+      const index = historyIndexRef.current;
+      if (index > 0) {
+          restoreHistorySnapshot(history[index - 1]);
+          historyIndexRef.current = index - 1;
+          setHistoryIndex(index - 1);
+      }
+  }, [history, recordUntrackedEdits, restoreHistorySnapshot]);
 
   const redo = useCallback(() => {
-      if (historyIndex < history.length - 1) {
-          const nextState = history[historyIndex + 1];
-          setState(s => ({ ...nextState, user: s.user }));
-          setHistoryIndex(prev => prev + 1);
+      // A new (untracked) edit after an undo starts a new branch: record it,
+      // which discards the redo branch, instead of overwriting it.
+      if (recordUntrackedEdits()) return;
+
+      const index = historyIndexRef.current;
+      if (index < history.length - 1) {
+          restoreHistorySnapshot(history[index + 1]);
+          historyIndexRef.current = index + 1;
+          setHistoryIndex(index + 1);
       }
-  }, [history, historyIndex]);
+  }, [history, recordUntrackedEdits, restoreHistorySnapshot]);
 
   // Compute the new state eagerly (from stateRef) instead of inside the setState
   // updater — updaters must be pure, and StrictMode double-invokes them, which
@@ -1261,6 +1376,13 @@ const App: React.FC = () => {
           notify('Enter a wall width and height greater than zero before calibrating.', 'warning');
           return;
       }
+      // One draft `unit` serves both plane modes: wall width/height defaults are
+      // in metres ('0.813' × '2.032' = door) and the parallel-offset default is
+      // in millimetres ('500'). A mismatch read a new wall as 0.8 mm wide, or an
+      // offset as 500 m — a silent 1000x error in every measurement on it.
+      const initialPlaneMode: CalibrationDraft['planeMode'] =
+          activeExistingPlane?.calibrationKind === 'parallel-offset' ? 'parallel-offset' : 'known-size';
+      const planeModeUnit = initialPlaneMode === 'parallel-offset' ? 'mm' : 'm';
       setCalibrationDraft({
           stage: 'choose',
           method: options?.addPlane || hasSurveyPlane ? 'plane' : isPlane ? 'plane' : existing ? 'line' : null,
@@ -1269,12 +1391,12 @@ const App: React.FC = () => {
           value: existing && !isPlane ? String(existing.realValue) : '',
           width: hasSurveyPlane ? String(Number(options?.widthMm) / 1000) : options?.addPlane ? '0.813' : activeExistingPlane ? String(activeExistingPlane.widthMm / 1000) : '0.813',
           height: hasSurveyPlane ? String(Number(options?.heightMm) / 1000) : options?.addPlane ? '2.032' : activeExistingPlane ? String(activeExistingPlane.heightMm / 1000) : '2.032',
-          unit: hasSurveyPlane ? 'm' : options?.addPlane ? 'mm' : isPlane ? 'm' : existing?.unit ?? 'm',
+          unit: hasSurveyPlane ? 'm' : (options?.addPlane || isPlane) ? planeModeUnit : existing?.unit ?? 'm',
           reapply: false,
           planeName: options?.planeName || (options?.addPlane ? `Wall ${existingPlanes.length + 1}` : (activeExistingPlane?.name ?? 'Wall 1')),
           addPlane: !!options?.addPlane,
           editingPlaneId: options?.addPlane ? null : activeExistingPlane?.id ?? null,
-          planeMode: activeExistingPlane?.calibrationKind === 'parallel-offset' ? 'parallel-offset' : 'known-size',
+          planeMode: initialPlaneMode,
           referencePlaneId: activeExistingPlane?.referencePlaneId ?? existingPlanes.find(plane => plane.calibrationKind !== 'parallel-offset')?.id ?? '',
           offset: activeExistingPlane?.offsetMm !== undefined ? String(Math.abs(activeExistingPlane.offsetMm)) : '500',
           offsetDirection: (activeExistingPlane?.offsetMm ?? 0) < 0 ? 'forward' : 'behind',
@@ -1476,14 +1598,29 @@ const App: React.FC = () => {
   const handleCleanupSave = (newImageUrl: string) => {
       const img = new Image();
       img.onload = () => {
-          // The AI cleanup pipeline can resize the image (max-dim cap), so the
-          // old pixel scale is no longer trustworthy — require recalibration
-          updateActiveCanvas({
+          const canvas = stateRef.current.canvases.find(c => c.id === stateRef.current.activeCanvasId);
+          if (!canvas) return;
+          // The AI cleanup pipeline resizes the photo (1536px cap, and the model
+          // may return another size). Signs, dimensions and annotations are in
+          // image pixels, so map them into the new pixel space — otherwise a
+          // sign on a 4032px photo lands ~2.6x off-image after cleanup.
+          const sx = img.width / (canvas.backgroundSize.width || img.width);
+          const sy = img.height / (canvas.backgroundSize.height || img.height);
+          const scalePoint = (p: Point): Point => ({ x: p.x * sx, y: p.y * sy });
+          // The old pixel scale is no longer trustworthy — require recalibration.
+          // Undoable, so an unwanted cleanup can be reverted with the original photo.
+          updateActiveCanvasWithHistory({
               backgroundImage: newImageUrl,
               backgroundSize: { width: img.width, height: img.height },
+              signs: canvas.signs.map(sign => ({
+                  ...sign,
+                  corners: sign.corners.map(scalePoint) as [Point, Point, Point, Point],
+              })),
+              dimensions: canvas.dimensions.map(dim => ({ ...dim, start: scalePoint(dim.start), end: scalePoint(dim.end) })),
+              annotations: (canvas.annotations ?? []).map(annotation => ({ ...annotation, points: annotation.points.map(scalePoint) })),
               siteCaptureLink: undefined,
               calibration: null,
-              placement: activeCanvas ? { ...(activeCanvas.placement ?? { snapEnabled: true, showVanishingGuides: false, lens: { enabled: false, k1: 0, k2: 0 }, camera: { enabled: false, fieldOfViewDeg: 60, estimated: true } }), lens: { enabled: false, k1: 0, k2: 0 }, camera: { enabled: false, fieldOfViewDeg: 60, estimated: true } } : undefined,
+              placement: { ...(canvas.placement ?? { snapEnabled: true, showVanishingGuides: false, lens: { enabled: false, k1: 0, k2: 0 }, camera: { enabled: false, fieldOfViewDeg: 60, estimated: true } }), lens: { enabled: false, k1: 0, k2: 0 }, camera: { enabled: false, fieldOfViewDeg: 60, estimated: true } },
           });
           setShowCleanupTool(false);
       };
@@ -1545,6 +1682,8 @@ const App: React.FC = () => {
   };
 
   const handleProjectLoad = async (loadedState: MockupState) => {
+      // Persist the outgoing project's last few seconds of edits first.
+      void flushPendingAutosave();
       // Treat project switching as a full session boundary. Updating React
       // state alone left stateRef/history on the previous Untitled project,
       // allowing an in-flight autosave to switch the phone back immediately.
@@ -1605,7 +1744,8 @@ const App: React.FC = () => {
 
   const handleProjectDelete = async (projectId: string) => {
       if (projectId === stateRef.current.projectId) {
-          if (syncTimeoutRef.current) clearTimeout(syncTimeoutRef.current);
+          // Pending edits to a project being deleted must not recreate it.
+          discardPendingAutosave();
           syncAttemptRef.current += 1;
       }
       if (state.user && !state.user.uid.startsWith('guest_')) {
@@ -1628,7 +1768,8 @@ const App: React.FC = () => {
   };
 
   const handleNewProject = async () => {
-      if (syncTimeoutRef.current) clearTimeout(syncTimeoutRef.current);
+      // Save (don't cancel) the outgoing project's pending edits.
+      void flushPendingAutosave();
       setCalibrationDraft(null);
       setShowCalibrationReference(false);
       setIsCropping(false);
@@ -1891,8 +2032,8 @@ const App: React.FC = () => {
 
         undo={undo}
         redo={redo}
-        canUndo={historyIndex > 0}
-        canRedo={historyIndex < history.length - 1}
+        canUndo={canUndo}
+        canRedo={canRedo}
         
         showAssistant={showAssistant}
         setShowAssistant={setShowAssistant}
@@ -1930,8 +2071,8 @@ const App: React.FC = () => {
            updateSignById={updateSignById}
            undo={undo}
            redo={redo}
-           canUndo={historyIndex > 0}
-           canRedo={historyIndex < history.length - 1}
+           canUndo={canUndo}
+           canRedo={canRedo}
            onSignPlacementStart={beginSignPlacement}
            onSignPlacementEnd={finishSignPlacement}
            setActiveSign={setActiveSign}

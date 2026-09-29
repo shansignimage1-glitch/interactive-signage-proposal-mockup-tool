@@ -437,7 +437,6 @@ const expectSurveyField = async (panel: Locator, testId: string, expected: RegEx
 };
 
 test('iPhone capture stores photo GPS and prefers it to a different live device position', async () => {
-  test.setTimeout(90_000);
   const browser = await webkit.launch();
   const context = await browser.newContext({
     ...devices['iPhone 13'],
@@ -501,7 +500,6 @@ test('iPhone capture stores photo GPS and prefers it to a different live device 
 });
 
 test('denied geolocation prevents embedded photo GPS from being persisted', async () => {
-  test.setTimeout(90_000);
   const browser = await webkit.launch();
   const context = await browser.newContext({
     ...devices['iPhone 13'],

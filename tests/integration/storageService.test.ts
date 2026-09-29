@@ -94,11 +94,13 @@ vi.mock('../../services/driveConnectors', () => ({
 vi.mock('../../services/AssetResolver', () => ({
   getKnownRef: () => undefined,
   recordKnownRef: vi.fn(),
+  forgetKnownRef: vi.fn(),
   isDriveRef: (value?: string) => value?.startsWith('gdrive://') ?? false,
   resolveProjectImages: async (state: unknown) => ({ state, failedRefs: [], needsReconnect: false }),
 }));
 
 import { getSiteCaptureAsset, makeSiteCaptureAssetRef, putSiteCaptureAsset, StorageService } from '../../services/StorageService';
+import { query, runTransaction } from 'firebase/firestore';
 
 describe('StorageService save/load', () => {
   beforeEach(() => {
@@ -373,6 +375,137 @@ describe('StorageService save/load', () => {
 
     await StorageService.deleteProjectLocal(otherAccount.projectId);
     await StorageService.deleteProjectLocal(legacyGuest.projectId);
+  });
+
+  it('keeps queued local edits in conflict with a newer cloud revision it only read', async () => {
+    // Regression: loadProject reading (but not adopting) the cloud copy used to
+    // advance the save base, so the next save silently overwrote the iPad's
+    // newer revision with this phone's stale content.
+    const local = makeProject({ projectId: `peek-conflict-${Date.now()}`, notes: 'phone edit', cloudRevision: 5 });
+    await StorageService.saveProjectLocal(local);
+    await StorageService.queueProjectSync('user-1', local.projectId);
+    mocks.cloudProject = { ...local, notes: 'iPad edit', userId: 'user-1', updatedAt: local.lastSaved + 10, cloudRevision: 6 };
+    mocks.remoteExists = true;
+    mocks.remoteRevision = 6;
+
+    const opened = await StorageService.loadProject('user-1', local.projectId);
+    expect(opened?.notes).toBe('phone edit');
+
+    await expect(StorageService.saveProject('user-1', opened!)).resolves.toBe('conflict');
+    expect(mocks.transactionSet).not.toHaveBeenCalled();
+    await StorageService.deleteProjectLocal(local.projectId);
+  });
+
+  it('saves on top of a newer cloud revision once loadProject adopts it', async () => {
+    const project = makeProject({ projectId: `adopt-${Date.now()}`, cloudRevision: 0 });
+    await expect(StorageService.saveProject('user-1', project)).resolves.toBe('cloud'); // own revision 1
+    mocks.transactionSet.mockClear();
+    // Another device commits revision 2; this device opens it.
+    mocks.cloudProject = { ...project, notes: 'from iPad', userId: 'user-1', updatedAt: Date.now() + 60_000, cloudRevision: 2 };
+    mocks.remoteExists = true;
+    mocks.remoteRevision = 2;
+    // The user browses the project list (refreshing the index), then opens it.
+    mocks.cloudDocs = [{ data: () => mocks.cloudProject }];
+    await StorageService.listProjectsCloud('user-1');
+
+    const opened = await StorageService.loadProject('user-1', project.projectId);
+    expect(opened?.notes).toBe('from iPad');
+
+    await expect(StorageService.saveProject('user-1', { ...opened!, notes: 'edited after opening' })).resolves.toBe('cloud');
+    expect(mocks.transactionSet).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ cloudRevision: 3 }));
+    await StorageService.deleteProjectLocal(project.projectId);
+  });
+
+  it('records a commit as the base of a newer local snapshot persisted during its transaction', async () => {
+    // Regression: the newer snapshot kept the old base revision, so after an
+    // app kill the reload judged it older than the cloud and overwrote it.
+    const project = makeProject({ projectId: `mid-commit-${Date.now()}`, cloudRevision: 0 });
+    const passThrough = vi.mocked(runTransaction).getMockImplementation()!;
+    let releaseFirstCommit!: () => void;
+    const firstCommitEntered = new Promise<void>(entered => {
+      vi.mocked(runTransaction).mockImplementationOnce(async (database, update) => {
+        entered();
+        await new Promise<void>(release => { releaseFirstCommit = release; });
+        return passThrough(database, update);
+      });
+    });
+
+    const first = StorageService.saveProject('user-1', project);
+    await firstCommitEntered;
+    const second = StorageService.saveProject('user-1', { ...project, notes: 'typed during the commit' });
+    await vi.waitFor(async () =>
+      expect((await StorageService.loadProjectLocal(project.projectId))?.notes).toBe('typed during the commit'));
+    releaseFirstCommit();
+    await expect(first).resolves.toBe('cloud');
+
+    // Simulated app kill before the second save commits: the device copy must
+    // keep the newer notes AND know it already builds on revision 1.
+    const survivor = await StorageService.loadProjectLocal(project.projectId);
+    expect(survivor?.notes).toBe('typed during the commit');
+    expect(survivor?.cloudRevision).toBe(1);
+
+    await second;
+    await StorageService.deleteProjectLocal(project.projectId);
+  });
+
+  it('lists every cloud project rather than a limited oldest-first page', async () => {
+    mocks.cloudDocs = Array.from({ length: 60 }, (_, index) => ({
+      data: () => ({ projectId: `proj_${1000 + index}`, projectName: `Project ${index}`, updatedAt: index, userId: 'user-1' }),
+    }));
+
+    const projects = await StorageService.listProjectsCloud('user-1');
+
+    expect(projects).toHaveLength(60);
+    expect(projects[0].name).toBe('Project 59');
+    // collection + where only: no limit() clause narrowing the result
+    expect(vi.mocked(query).mock.calls.at(-1)).toHaveLength(2);
+  });
+
+  it('never shows a guest another account\'s cached projects', async () => {
+    const signedIn = makeProject({ projectId: `private-${Date.now()}`, projectName: 'Private account project' });
+    const guestOwned = makeProject({
+      projectId: `guest-own-${Date.now()}`,
+      projectName: 'Guest draft',
+      user: { uid: 'guest_this_phone', displayName: 'Guest', email: null, photoURL: null },
+    });
+    await StorageService.saveProjectLocal(signedIn);
+    await StorageService.saveProjectLocal(guestOwned);
+
+    const listed = (await StorageService.listProjects('guest_this_phone')).map(project => project.id);
+    expect(listed).toContain(guestOwned.projectId);
+    expect(listed).not.toContain(signedIn.projectId);
+    await expect(StorageService.loadProject('guest_this_phone', signedIn.projectId)).resolves.toBeNull();
+
+    await StorageService.deleteProjectLocal(signedIn.projectId);
+    await StorageService.deleteProjectLocal(guestOwned.projectId);
+  });
+
+  it('delete-all keeps another account\'s local project and its unsynced photos', async () => {
+    const otherAccount = makeProject({
+      projectId: `other-photos-${Date.now()}`,
+      user: { uid: 'user-a', displayName: 'A', email: null, photoURL: null },
+    });
+    const originalRef = makeSiteCaptureAssetRef(otherAccount.projectId, 'capture-1', 'original');
+    await putSiteCaptureAsset(originalRef, new Blob(['only-copy'], { type: 'image/jpeg' }));
+    otherAccount.siteCaptures = [{
+      id: 'capture-1', label: 'Front', originalRef, workingRef: originalRef, thumbnailRef: originalRef,
+      fileName: 'front.jpg', mimeType: 'image/jpeg', byteSize: 9,
+      pixelWidth: 10, pixelHeight: 10, workingPixelWidth: 10, workingPixelHeight: 10,
+      capturedAt: Date.now(), notes: '',
+    } as any];
+    const guestOwned = makeProject({
+      projectId: `guest-wipe-${Date.now()}`,
+      user: { uid: 'guest_wiper', displayName: 'Guest', email: null, photoURL: null },
+    });
+    await StorageService.saveProjectLocal(otherAccount);
+    await StorageService.saveProjectLocal(guestOwned);
+
+    await StorageService.deleteAllUserData('guest_wiper');
+
+    expect(await StorageService.loadProjectLocal(guestOwned.projectId)).toBeUndefined();
+    expect(await StorageService.loadProjectLocal(otherAccount.projectId)).toBeTruthy();
+    expect(await getSiteCaptureAsset(originalRef)).toBeTruthy();
+    await StorageService.deleteProjectLocal(otherAccount.projectId);
   });
 
   it('round-trips an Xplore-sized project through Storage while Firestore stays a small index', async () => {

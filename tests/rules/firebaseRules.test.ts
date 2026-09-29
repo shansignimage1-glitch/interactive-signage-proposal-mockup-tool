@@ -85,6 +85,33 @@ describe('Firestore project rules', () => {
   });
 });
 
+describe('Firestore personal library rules', () => {
+  it('lets owners manage their own templates and hides them from other users', async () => {
+    const ownerDb = env.authenticatedContext('owner').firestore();
+    const strangerDb = env.authenticatedContext('stranger').firestore();
+    const template = doc(ownerDb, 'userLibrary/owner_hash');
+    await assertSucceeds(setDoc(template, { ownerUid: 'owner', name: 'Fascia' }));
+    await assertSucceeds(getDoc(template));
+    await assertSucceeds(setDoc(template, { ownerUid: 'owner', name: 'Renamed' }));
+    await assertFails(getDoc(doc(strangerDb, 'userLibrary/owner_hash')));
+    await assertFails(setDoc(doc(strangerDb, 'userLibrary/owner_hash'), { ownerUid: 'stranger', name: 'Hijack' }));
+    await assertFails(deleteDoc(doc(strangerDb, 'userLibrary/owner_hash')));
+    await assertSucceeds(deleteDoc(template));
+  });
+
+  it('rejects creating a template for someone else', async () => {
+    const userDb = env.authenticatedContext('user-a').firestore();
+    await assertFails(setDoc(doc(userDb, 'userLibrary/forged'), { ownerUid: 'user-b', name: 'Forged' }));
+  });
+
+  it('does not let an owner transfer a template into another user\'s library', async () => {
+    const ownerDb = env.authenticatedContext('owner').firestore();
+    const template = doc(ownerDb, 'userLibrary/owner_transfer');
+    await assertSucceeds(setDoc(template, { ownerUid: 'owner', name: 'Mine' }));
+    await assertFails(setDoc(template, { ownerUid: 'victim', name: 'Planted' }));
+  });
+});
+
 describe('Storage rules', () => {
   it('isolates every user folder', async () => {
     const ownerStorage = env.authenticatedContext('owner').storage();

@@ -29,17 +29,27 @@ const ElementStudio: React.FC<ElementStudioProps> = ({ sign, quadWidthMm, unitSy
   const [error, setError] = useState<string | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const seededRef = useRef(false);
+  // Slider changes launch overlapping detections; only the newest may apply.
+  const detectionRequestRef = useRef(0);
 
   const defaultDepth = (size: Size) => Math.min(60, Math.max(4, Math.round(size.height * 0.06)));
 
   const runDetection = useCallback(async (sens: number, minArea: number) => {
+    const request = ++detectionRequestRef.current;
     setIsDetecting(true);
     setError(null);
     try {
       const detected = await classicalDetector.detect(sign.image, { sensitivity: sens, minAreaPct: minArea });
+      if (request !== detectionRequestRef.current) return;
       const img = new Image();
       img.crossOrigin = 'anonymous';
+      img.onerror = () => {
+        if (request !== detectionRequestRef.current) return;
+        setError('The sign image could not be loaded.');
+        setIsDetecting(false);
+      };
       img.onload = () => {
+        if (request !== detectionRequestRef.current) return;
         const size = { width: img.naturalWidth, height: img.naturalHeight };
         setImgSize(size);
         setElements(detected.map((d, i) => ({
@@ -54,6 +64,7 @@ const ElementStudio: React.FC<ElementStudioProps> = ({ sign, quadWidthMm, unitSy
       };
       img.src = sign.image;
     } catch (e: any) {
+      if (request !== detectionRequestRef.current) return;
       setError(e.message ?? 'Detection failed');
       setIsDetecting(false);
     }

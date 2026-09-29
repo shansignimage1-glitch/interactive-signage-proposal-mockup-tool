@@ -255,7 +255,6 @@ test('a new authenticated iPhone project uploads immediately and opens on a clea
 });
 
 test('drains a queued edit for inactive Project A after synced Project B opens', async ({ page }) => {
-  test.setTimeout(180_000);
   const projectAId = 'proj_inactive_queue_a';
   const projectBId = 'proj_active_synced_b';
   const queuedNote = 'Project A phone edit queued while offline.';
@@ -359,7 +358,6 @@ test('drains a queued edit for inactive Project A after synced Project B opens',
 });
 
 test('cloud discovery never replaces a fallback after editor interaction starts', async ({ browser, page }) => {
-  test.setTimeout(180_000);
   const remoteProjectId = 'proj_discovery_cancellation_remote';
   const remoteProjectName = 'Remote discovery source';
   const remoteNote = 'This note belongs only to the previously synced cloud project.';

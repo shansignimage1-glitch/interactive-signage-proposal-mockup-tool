@@ -27,6 +27,14 @@ export const recordKnownRef = (dataUriHash: string, ref: string): void => {
 export const getKnownRef = (dataUriHash: string): string | undefined =>
     knownRefs.get(dataUriHash);
 
+/** Drop a ref whose provider file was deleted/trashed, so a later save of the
+ *  same image re-uploads instead of persisting a dead reference. */
+export const forgetKnownRef = (ref: string): void => {
+    for (const [hash, knownRef] of knownRefs) {
+        if (knownRef === ref) knownRefs.delete(hash);
+    }
+};
+
 export const resolveRef = async (ref: string): Promise<string> => {
     const cached = await getCachedAsset(ref).catch(() => null);
     let blob = cached?.blob ?? null;

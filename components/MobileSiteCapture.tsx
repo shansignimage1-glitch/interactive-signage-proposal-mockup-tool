@@ -352,16 +352,24 @@ const MobileSiteCapture: React.FC<MobileSiteCaptureProps> = ({ state, syncStatus
     };
   }, []);
 
+  // Read the LIVE capture list, not this render's `captures`: dictation calls
+  // these up to a minute after recording started (plus transcription time),
+  // and rebuilding from that stale array erased photos taken and fields typed
+  // in the meantime. The ref is updated immediately so rapid successive
+  // patches also build on each other.
   const patchCapture = (id: string, updates: Partial<SiteCapturePhoto>) => {
+    const next = capturesRef.current.map(capture => capture.id === id ? { ...capture, ...updates } : capture);
+    capturesRef.current = next;
     onUpdate({
-      siteCaptures: captures.map(capture => capture.id === id ? { ...capture, ...updates } : capture),
+      siteCaptures: next,
       lastSaved: Date.now(),
     });
   };
 
   const patchReferenceWall = (updates: Partial<ReferenceWallFieldMeasurement>) => {
     if (!activeCapture) return;
-    patchCapture(activeCapture.id, { referenceWall: { ...activeCapture.referenceWall, ...updates } });
+    const live = capturesRef.current.find(capture => capture.id === activeCapture.id) ?? activeCapture;
+    patchCapture(activeCapture.id, { referenceWall: { ...live.referenceWall, ...updates } });
   };
 
   const closeCameraPreview = () => {

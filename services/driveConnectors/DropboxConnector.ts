@@ -49,8 +49,14 @@ const api = async (url: string, init?: RequestInit) => {
 };
 const refPath = (ref: string) => ref.slice(DROPBOX_REF_PREFIX.length);
 const safeName = (name: string) => name.replace(/[\\/]/g, '_');
+// Everything this app writes lives in one folder. If the Dropbox app is ever
+// registered with "Full Dropbox" access instead of "App folder", the root is
+// the user's entire Dropbox — so neither uploads nor delete-all may use it.
+const APP_FOLDER = '/SignagePro';
+// Files written before APP_FOLDER existed sit at the root as image-<sha256>.
+const LEGACY_ROOT_IMAGE = /^image-[0-9a-f]{64}$/;
 const upload = async (blob: Blob, name: string) => {
-  const path = `/${safeName(name)}`;
+  const path = `${APP_FOLDER}/${safeName(name)}`;
   const response = await api('https://content.dropboxapi.com/2/files/upload', {
     method: 'POST', headers: { 'Content-Type': 'application/octet-stream', 'Dropbox-API-Arg': JSON.stringify({ path, mode: 'overwrite', autorename: false }) }, body: blob,
   });
@@ -88,13 +94,22 @@ export const dropboxConnector: DriveConnector = {
   fetchImage: async ref => (await api('https://content.dropboxapi.com/2/files/download', { method: 'POST', headers: { 'Dropbox-API-Arg': JSON.stringify({ path: refPath(ref) }) } })).blob(),
   deleteImage: async ref => { await api('https://api.dropboxapi.com/2/files/delete_v2', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: refPath(ref) }) }).catch(() => undefined); },
   deleteAllAppData: async () => {
-    let response = await api('https://api.dropboxapi.com/2/files/list_folder', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: '', recursive: false }) });
+    const json = { 'Content-Type': 'application/json' };
+    // The app folder holds everything written since APP_FOLDER was introduced.
+    // A missing folder (path/not_found) simply means nothing to delete.
+    await api('https://api.dropboxapi.com/2/files/delete_v2', { method: 'POST', headers: json, body: JSON.stringify({ path: APP_FOLDER }) })
+      .catch(error => { if (!String(error).includes('not_found')) throw error; });
+    // Legacy files at the root: delete ONLY this app's content-addressed image
+    // names, never anything else the user keeps there.
+    let response = await api('https://api.dropboxapi.com/2/files/list_folder', { method: 'POST', headers: json, body: JSON.stringify({ path: '', recursive: false }) });
     let data = await response.json(); const paths: string[] = [];
-    paths.push(...(data.entries ?? []).map((entry: { path_lower: string }) => entry.path_lower));
+    const collect = (entries: Array<{ '.tag': string; name: string; path_lower: string }> = []) =>
+      paths.push(...entries.filter(entry => entry['.tag'] === 'file' && LEGACY_ROOT_IMAGE.test(entry.name)).map(entry => entry.path_lower));
+    collect(data.entries);
     while (data.has_more) {
-      response = await api('https://api.dropboxapi.com/2/files/list_folder/continue', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cursor: data.cursor }) });
-      data = await response.json(); paths.push(...(data.entries ?? []).map((entry: { path_lower: string }) => entry.path_lower));
+      response = await api('https://api.dropboxapi.com/2/files/list_folder/continue', { method: 'POST', headers: json, body: JSON.stringify({ cursor: data.cursor }) });
+      data = await response.json(); collect(data.entries);
     }
-    await Promise.all(paths.map(path => api('https://api.dropboxapi.com/2/files/delete_v2', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path }) })));
+    await Promise.all(paths.map(path => api('https://api.dropboxapi.com/2/files/delete_v2', { method: 'POST', headers: json, body: JSON.stringify({ path }) })));
   },
 };

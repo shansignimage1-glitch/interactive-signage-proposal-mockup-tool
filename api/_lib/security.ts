@@ -23,19 +23,38 @@ export function allowPost(req: VercelRequest, res: VercelResponse): boolean {
   return false;
 }
 
+// jose error codes that mean "this token is not valid" (expired, bad
+// signature, wrong issuer/audience, malformed, unknown key id). A JWKS network
+// failure (ERR_JWKS_TIMEOUT etc.) is NOT the caller's fault and stays a 5xx.
+const INVALID_TOKEN_CODE = /^ERR_(JWT_|JWS_|JWKS_NO_MATCHING_KEY|JWKS_MULTIPLE_MATCHING_KEYS)/;
+
 export async function requireFirebaseUser(req: VercelRequest): Promise<string> {
   const header = req.headers.authorization;
   if (!header?.startsWith('Bearer ')) throw new Error('UNAUTHORIZED');
-  const { payload } = await jwtVerify(header.slice(7), FIREBASE_JWKS, {
-    issuer: `https://securetoken.google.com/${PROJECT_ID}`,
-    audience: PROJECT_ID,
-  });
+  let payload;
+  try {
+    ({ payload } = await jwtVerify(header.slice(7), FIREBASE_JWKS, {
+      issuer: `https://securetoken.google.com/${PROJECT_ID}`,
+      audience: PROJECT_ID,
+    }));
+  } catch (error) {
+    // Expired/invalid tokens must return 401 so the client re-authenticates;
+    // they previously fell through to a generic 500/502.
+    const code = (error as { code?: unknown })?.code;
+    if (typeof code === 'string' && INVALID_TOKEN_CODE.test(code)) throw new Error('UNAUTHORIZED');
+    throw error;
+  }
   if (!payload.sub) throw new Error('UNAUTHORIZED');
   return payload.sub;
 }
 
 export function enforceRateLimit(uid: string, action: string, max: number, windowMs: number): void {
   const now = Date.now();
+  // A warm instance lives for many requests; drop expired windows so the map
+  // cannot grow without bound.
+  if (limits.size > 5_000) {
+    for (const [key, state] of limits) if (state.resetAt <= now) limits.delete(key);
+  }
   const key = `${uid}:${action}`;
   const current = limits.get(key);
   if (!current || current.resetAt <= now) {

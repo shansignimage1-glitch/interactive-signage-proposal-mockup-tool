@@ -69,23 +69,37 @@ const CalibrationWizard: React.FC<CalibrationWizardProps> = ({
 
   const patch = (updates: Partial<CalibrationDraft>) => onChange({ ...draft, ...updates });
 
+  // The draft has one `unit` field shared by both plane modes. Its defaults
+  // are metres for a known-size wall (door '0.813' × '2.032') and millimetres
+  // for a parallel offset ('500'), so it must follow the active mode.
+  const unitForPlaneMode = (planeMode: CalibrationDraft['planeMode']) =>
+    planeMode === 'parallel-offset' ? 'mm' as const : 'm' as const;
+
   const selectMethod = (method: CalibrationMethod) => {
     const keepPoints = draft.method === method ? draft.points : [];
     if (method === 'plane') {
-      patch({ method, stage: 'place', points: keepPoints, presetId: draft.method === 'plane' ? draft.presetId : 'door', width: draft.method === 'plane' ? draft.width : '0.813', height: draft.method === 'plane' ? draft.height : '2.032', unit: draft.method === 'plane' ? draft.unit : 'm' });
+      patch({ method, stage: 'place', points: keepPoints, presetId: draft.method === 'plane' ? draft.presetId : 'door', width: draft.method === 'plane' ? draft.width : '0.813', height: draft.method === 'plane' ? draft.height : '2.032', unit: draft.method === 'plane' ? draft.unit : unitForPlaneMode(draft.planeMode) });
     } else {
       patch({ method, stage: 'place', points: keepPoints, presetId: draft.method === 'line' ? draft.presetId : 'door_height', value: draft.method === 'line' ? draft.value : '', unit: draft.method === 'line' ? draft.unit : 'm' });
     }
   };
 
   const selectPlaneMode = (planeMode: CalibrationDraft['planeMode']) => {
+    const modeChanged = draft.planeMode !== planeMode;
     patch({
       method: 'plane',
       planeMode,
       stage: 'place',
-      points: draft.planeMode === planeMode ? draft.points : [],
+      points: modeChanged ? [] : draft.points,
       referencePlaneId: draft.referencePlaneId || confirmedPlanes[0]?.id || '',
       presetId: planeMode === 'known-size' ? 'door' : 'parallel_offset',
+      // Switching mode re-seeds the fields that the preset label promises,
+      // in the unit they are expressed in.
+      ...(modeChanged
+        ? planeMode === 'known-size'
+          ? { width: '0.813', height: '2.032', unit: 'm' as const }
+          : { unit: 'mm' as const }
+        : {}),
     });
   };
 
