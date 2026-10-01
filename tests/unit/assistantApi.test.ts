@@ -9,6 +9,7 @@ const aiMocks = vi.hoisted(() => ({
 const securityMocks = vi.hoisted(() => ({
   allowPost: vi.fn(),
   enforceRateLimit: vi.fn(),
+  enforceDailyBudget: vi.fn(),
   requireApiKey: vi.fn(),
   requireFirebaseUser: vi.fn(),
   sendApiError: vi.fn(),
@@ -59,6 +60,7 @@ describe('SignagePro assistant endpoint', () => {
 
     expect(securityMocks.requireFirebaseUser).toHaveBeenCalledOnce();
     expect(securityMocks.enforceRateLimit).toHaveBeenCalledWith('user-1', 'assistant', 20, 60_000);
+    expect(securityMocks.enforceDailyBudget).toHaveBeenCalledWith('assistant', 2_000);
     expect(aiMocks.constructorOptions).toEqual([{ apiKey: 'test-key' }]);
     expect(aiMocks.generateContent).toHaveBeenCalledWith({
       model: 'gemini-3.6-flash',

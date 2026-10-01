@@ -1,4 +1,4 @@
-import { enforceRateLimit, requireFirebaseUser, type VercelRequest, type VercelResponse } from './_lib/security.js';
+import { enforceDailyBudget, enforceRateLimit, requireFirebaseUser, type VercelRequest, type VercelResponse } from './_lib/security.js';
 
 const mapsKey = () => {
   const key = process.env.GOOGLE_MAPS_API_KEY?.replace(/^\uFEFF/, '').trim();
@@ -14,9 +14,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(400).json({ error: 'Invalid photo coordinates.' });
     }
 
-    const forwarded = (req.headers as Record<string, string | undefined>)['x-forwarded-for']?.split(',')[0]?.trim() || 'unknown';
-    const actor = req.headers.authorization ? await requireFirebaseUser(req) : `guest:${forwarded}`;
-    enforceRateLimit(actor, 'geocode', 20, 60 * 60_000);
+    // Vercel sets x-real-ip / x-forwarded-for itself, so clients can't spoof it.
+    const headers = req.headers as Record<string, string | undefined>;
+    const clientIp = headers['x-real-ip']?.trim() || headers['x-forwarded-for']?.split(',')[0]?.trim() || 'unknown';
+    const isGuest = !req.headers.authorization;
+    const actor = isGuest ? `guest:${clientIp}` : await requireFirebaseUser(req);
+    await enforceRateLimit(actor, 'geocode', 20, 60 * 60_000);
+    // Guests (no sign-in) share a small separate daily allowance so anonymous
+    // traffic can never use up the budget signed-in users rely on.
+    await enforceDailyBudget(isGuest ? 'geocode_guest' : 'geocode', isGuest ? 200 : 2_000);
 
     const url = new URL(`https://geocode.googleapis.com/v4/geocode/location/${latitude},${longitude}`);
     url.searchParams.set('languageCode', 'en');
@@ -38,6 +44,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const code = error instanceof Error ? error.message : '';
     if (code === 'UNAUTHORIZED') return res.status(401).json({ error: 'Please sign in again to use photo location.' });
     if (code === 'RATE_LIMIT') return res.status(429).json({ error: 'Too many address lookups. Please try again later.' });
+    if (code === 'DAILY_BUDGET') return res.status(429).json({ error: 'Address lookup has reached today\'s limit. Enter the address manually or try again tomorrow.' });
     if (code === 'MAPS_CONFIG') return res.status(503).json({ error: 'Google Maps address lookup is not configured yet.' });
     console.error('Geocoding endpoint error:', error);
     return res.status(502).json({ error: 'Google Maps could not resolve this photo location.' });

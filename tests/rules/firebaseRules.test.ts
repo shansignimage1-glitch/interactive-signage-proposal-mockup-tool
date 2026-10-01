@@ -3,7 +3,7 @@ import { resolve } from 'node:path';
 import { afterAll, beforeAll, beforeEach, describe, it } from 'vitest';
 import { assertFails, assertSucceeds, initializeTestEnvironment, RulesTestEnvironment } from '@firebase/rules-unit-testing';
 import { doc, getDoc, setDoc, deleteDoc } from 'firebase/firestore';
-import { getBytes, listAll, ref, uploadBytes } from 'firebase/storage';
+import { deleteObject, getBytes, listAll, ref, uploadBytes } from 'firebase/storage';
 import { encodeProjectForFirestore } from '../../utils/firestorePayload';
 import { makeProject } from '../fixtures/project';
 
@@ -57,6 +57,17 @@ describe('Firestore project rules', () => {
       });
     });
     await assertFails(getDoc(doc(ownerDb, 'projects/owner_mismatched')));
+  });
+
+  it('lets an owner mark a project deleted and restore it, but never a stranger', async () => {
+    const ownerDb = env.authenticatedContext('owner').firestore();
+    const strangerDb = env.authenticatedContext('stranger').firestore();
+    const project = doc(ownerDb, 'projects/owner_trash');
+    await assertSucceeds(setDoc(project, { userId: 'owner', projectId: 'trash', cloudRevision: 3 }));
+    await assertFails(setDoc(doc(strangerDb, 'projects/owner_trash'), { userId: 'owner', projectId: 'trash', cloudRevision: 4, deletedAt: 1 }));
+    await assertSucceeds(setDoc(project, { userId: 'owner', projectId: 'trash', cloudRevision: 4, deletedAt: Date.now() }));
+    await assertSucceeds(setDoc(project, { userId: 'owner', projectId: 'trash', cloudRevision: 5 }));
+    await assertSucceeds(deleteDoc(project));
   });
 
   it('accepts encoded sign contours that Firestore otherwise rejects as nested arrays', async () => {
@@ -124,6 +135,30 @@ describe('Storage rules', () => {
     await assertFails(listAll(ref(strangerStorage, 'users/owner/images')));
     await assertFails(uploadBytes(ref(strangerStorage, 'users/owner/images/b'), bytes));
   });
+
+  it('caps upload sizes, allowing larger full-resolution capture originals', async () => {
+    const ownerStorage = env.authenticatedContext('owner').storage();
+    const MB = 1024 * 1024;
+    const bytes = (size: number) => new Uint8Array(size);
+    const capture = 'users/owner/captures/project-1/capture-1';
+
+    // Normal app files: fine up to the general cap, rejected beyond it.
+    await assertSucceeds(uploadBytes(ref(ownerStorage, `${capture}/working`), bytes(2 * MB)));
+    await assertFails(uploadBytes(ref(ownerStorage, `${capture}/working-big`), bytes(50 * MB + 1)));
+    await assertFails(uploadBytes(ref(ownerStorage, 'users/owner/images/huge'), bytes(50 * MB + 1)));
+
+    // Originals (incl. restore copies) get the larger allowance, but not unlimited.
+    await assertSucceeds(uploadBytes(ref(ownerStorage, `${capture}/original`), bytes(80 * MB)));
+    await assertSucceeds(uploadBytes(ref(ownerStorage, `${capture}/original-restore-attempt1`), bytes(60 * MB)));
+    // The 150 MB ceiling for originals can't be exercised here: the Storage
+    // emulator rejects request bodies of that size before evaluating rules.
+
+    // A file merely named "original" elsewhere does not get the allowance.
+    await assertFails(uploadBytes(ref(ownerStorage, 'users/owner/images/original'), bytes(60 * MB)));
+
+    // Caps never block deleting.
+    await assertSucceeds(deleteObject(ref(ownerStorage, `${capture}/original`)));
+  }, 120_000);
 
   it('allows signed-in library reads but only administrator writes', async () => {
     const adminStorage = env.authenticatedContext('admin', { admin: true }).storage();

@@ -99,7 +99,7 @@ vi.mock('../../services/AssetResolver', () => ({
   resolveProjectImages: async (state: unknown) => ({ state, failedRefs: [], needsReconnect: false }),
 }));
 
-import { getSiteCaptureAsset, makeSiteCaptureAssetRef, putSiteCaptureAsset, StorageService } from '../../services/StorageService';
+import { DELETED_PROJECT_RETENTION_MS, getSiteCaptureAsset, makeSiteCaptureAssetRef, putSiteCaptureAsset, StorageService } from '../../services/StorageService';
 import { query, runTransaction } from 'firebase/firestore';
 
 describe('StorageService save/load', () => {
@@ -805,13 +805,92 @@ describe('StorageService save/load', () => {
     await StorageService.deleteProjectLocal(project.projectId);
   });
 
-  it('does not delete project state when the authoritative Firestore delete fails', async () => {
+  it('does not delete project state when the permanent purge cannot remove the Firestore index', async () => {
     mocks.deleteDoc.mockRejectedValueOnce(new Error('temporary Firestore outage'));
 
-    await expect(StorageService.deleteProjectCloud('user-delete', 'project-1')).rejects.toThrow('temporary Firestore outage');
+    await expect(StorageService.purgeDeletedProjectCloud('user-delete', 'project-1')).rejects.toThrow('temporary Firestore outage');
 
     expect(mocks.listAll).not.toHaveBeenCalled();
     expect(mocks.deleteObject).not.toHaveBeenCalled();
+  });
+
+  describe('projects deleted on another device', () => {
+    const tombstone = (projectId: string, deletedAt = Date.now()) => ({
+      schemaVersion: 2, userId: 'user-1', projectId, projectName: 'Shopfront', updatedAt: deletedAt,
+      cloudRevision: 4, deletedAt, statePath: `users/user-1/projects/${projectId}/revisions/3.json`,
+      captureObjectPaths: [], previousCaptureObjectPaths: [],
+    });
+
+    it('deleting leaves a restorable tombstone instead of wiping the files', async () => {
+      mocks.remoteExists = true;
+      mocks.remoteRevision = 4;
+      mocks.remoteStatePath = 'users/user-tomb/projects/tomb-1/revisions/4.json';
+
+      await StorageService.deleteProjectCloud('user-tomb', 'tomb-1');
+
+      const written = mocks.transactionSet.mock.calls.at(-1)![1];
+      expect(written).toEqual(expect.objectContaining({ cloudRevision: 5, statePath: mocks.remoteStatePath }));
+      expect(written.deletedAt).toEqual(expect.any(Number));
+      expect(mocks.deleteDoc).not.toHaveBeenCalled();
+      expect(mocks.deleteObject).not.toHaveBeenCalled();
+      expect(mocks.listAll).not.toHaveBeenCalled();
+    });
+
+    it('another device\'s save stops with "deleted" instead of recreating it, and can restore it', async () => {
+      const project = makeProject({ projectId: `deleted-elsewhere-${Date.now()}`, cloudRevision: 3, notes: 'unsynced edit' });
+      mocks.cloudProject = tombstone(project.projectId);
+      mocks.remoteExists = true;
+      mocks.remoteRevision = 4;
+      mocks.remoteStatePath = mocks.cloudProject.statePath;
+      mocks.remoteCaptureObjectPaths = [];
+      mocks.remotePreviousCaptureObjectPaths = [];
+
+      await expect(StorageService.saveProject('user-1', project)).resolves.toBe('deleted');
+      expect(mocks.transactionSet).not.toHaveBeenCalled();
+      expect(StorageService.isProjectDeletedRemotely('user-1', project.projectId)).toBe(true);
+      // The device copy counts as unsynced work, so automatic cleanup keeps it.
+      expect(await StorageService.hasQueuedProjectSync('user-1', project.projectId)).toBe(true);
+      // Later autosaves stop immediately without re-uploading.
+      await expect(StorageService.saveProject('user-1', project)).resolves.toBe('deleted');
+
+      await expect(StorageService.restoreDeletedProject('user-1', project)).resolves.toBe('cloud');
+      const restored = mocks.transactionSet.mock.calls.at(-1)![1];
+      expect(restored.cloudRevision).toBe(5);
+      expect(restored.deletedAt).toBeUndefined();
+      expect(StorageService.isProjectDeletedRemotely('user-1', project.projectId)).toBe(false);
+      await StorageService.deleteProjectLocal(project.projectId);
+    });
+
+    it('listing hides deleted projects and removes clean local copies, but keeps unsynced ones', async () => {
+      const clean = makeProject({ projectId: `tomb-clean-${Date.now()}`, cloudRevision: 3 });
+      const unsynced = makeProject({ projectId: `tomb-unsynced-${Date.now()}`, cloudRevision: 3 });
+      await StorageService.saveProjectLocal(clean);
+      await StorageService.saveProjectLocal(unsynced);
+      await StorageService.queueProjectSync('user-1', unsynced.projectId);
+      mocks.cloudDocs = [
+        { data: () => tombstone(clean.projectId) },
+        { data: () => tombstone(unsynced.projectId) },
+      ];
+
+      expect(await StorageService.listProjectsCloud('user-1')).toEqual([]);
+      const listed = (await StorageService.listProjects('user-1')).map(project => project.id);
+
+      expect(listed).not.toContain(clean.projectId);
+      expect(await StorageService.loadProjectLocal(clean.projectId)).toBeUndefined();
+      expect(listed).toContain(unsynced.projectId);
+      expect(mocks.deleteDoc).not.toHaveBeenCalled(); // still inside the restore window
+      await StorageService.deleteProjectLocal(unsynced.projectId);
+    });
+
+    it('purges a tombstone permanently once its restore window has passed', async () => {
+      const projectId = `tomb-expired-${Date.now()}`;
+      const expiredAt = Date.now() - DELETED_PROJECT_RETENTION_MS - 60_000;
+      mocks.cloudDocs = [{ data: () => tombstone(projectId, expiredAt) }];
+
+      await StorageService.listProjectsCloud('user-1');
+
+      await vi.waitFor(() => expect(mocks.deleteDoc).toHaveBeenCalledWith(expect.objectContaining({ id: `user-1_${projectId}` })));
+    });
   });
 
   it('preserves the empty-list fallback by default and rejects cloud-list failures in strict mode', async () => {
@@ -967,6 +1046,39 @@ describe('StorageService save/load', () => {
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+
+  it('never uploads or re-links a capture original after measuring is finished', async () => {
+    // Regression guard: the stable ".../original" cloud path still holds the
+    // old full-resolution file until cleanup. A save must not look it up and
+    // silently re-link it once "Finish measuring" removed originalRef.
+    const project = makeProject({ projectId: `finished-${Date.now()}` });
+    const captureId = 'capture-finished';
+    const workingRef = makeSiteCaptureAssetRef(project.projectId, captureId, 'working');
+    const thumbnailRef = makeSiteCaptureAssetRef(project.projectId, captureId, 'thumbnail');
+    await putSiteCaptureAsset(workingRef, new Blob(['working'], { type: 'image/jpeg' }));
+    await putSiteCaptureAsset(thumbnailRef, new Blob(['thumb'], { type: 'image/jpeg' }));
+    project.siteCaptures = [{
+      id: captureId, label: 'Front', workingRef, thumbnailRef,
+      fileName: 'front.jpg', mimeType: 'image/jpeg', byteSize: 7,
+      pixelWidth: 8064, pixelHeight: 6048, workingPixelWidth: 4096, workingPixelHeight: 3072,
+      capturedAt: Date.now(), notes: '',
+      referenceWall: { wallName: 'Front wall', planeDepthDirection: 'behind', referencePlaneName: 'Front wall', method: 'laser', notes: '' },
+    }];
+    mocks.getDownloadURL.mockImplementation(async (ref: any) => `https://storage.example/${ref.path}`);
+
+    await expect(StorageService.saveProject('user-1', project)).resolves.toBe('cloud');
+
+    const touchedPaths = [
+      ...mocks.uploadBytes.mock.calls.map(([ref]) => ref.path as string),
+      ...mocks.getDownloadURL.mock.calls.map(([ref]) => ref.path as string),
+    ];
+    expect(touchedPaths.some(path => /\/captures\/.*\/original/.test(path))).toBe(false);
+    const stateUpload = mocks.uploadBytes.mock.calls.find(([ref]) => ref.path.includes('/projects/'))!;
+    const storedState = await readStateUpload(stateUpload[1] as Blob);
+    expect(storedState.siteCaptures[0]).not.toHaveProperty('originalRef');
+    expect(storedState.siteCaptures[0].workingRef).toContain(`/captures/${project.projectId}/${captureId}/working`);
+    await StorageService.deleteProjectLocal(project.projectId);
   });
 
   it('uploads primary and supporting site-capture photos and stores only cloud references in Firestore', async () => {
@@ -1696,7 +1808,7 @@ describe('StorageService save/load', () => {
     }
   });
 
-  it('does not report a cloud capture project loaded when durable asset caching fails', async () => {
+  it('opens a cloud project whose site photo cannot be downloaded, and a save keeps that photo', async () => {
     const project = makeProject({ projectId: `capture-cache-failure-${Date.now()}`, cloudRevision: 1 });
     const missingPath = `users/user-1/captures/${project.projectId}/front/working`;
     const missingUrl = `https://firebasestorage.googleapis.com/v0/b/test/o/${encodeURIComponent(missingPath)}?alt=media`;
@@ -1712,11 +1824,29 @@ describe('StorageService save/load', () => {
     mocks.cloudProject = {
       schemaVersion: 2, userId: 'user-1', projectId: project.projectId, projectName: project.projectName,
       updatedAt: project.lastSaved, cloudRevision: 1, statePath, stateEncoding: 'gzip',
+      captureObjectPaths: [missingPath], previousCaptureObjectPaths: [],
     };
-    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('download unavailable')));
+    const fetchMock = vi.fn().mockRejectedValue(new Error('download unavailable'));
+    vi.stubGlobal('fetch', fetchMock);
     try {
-      await expect(StorageService.loadProjectCloud('user-1', project.projectId, undefined, true, true))
-        .rejects.toThrow('could not be cached safely');
+      // One unreachable photo no longer stops the project from opening...
+      const loaded = await StorageService.loadProjectCloud('user-1', project.projectId, undefined, true, true);
+      expect(loaded?.siteCaptures?.[0].workingRef).toBe(missingUrl);
+      // ...and the app can tell which photos to show as unavailable and retry.
+      expect(await StorageService.findUncachedCapturePhotos(loaded!)).toEqual([missingUrl]);
+
+      // Saving meanwhile must keep the cloud photo, never drop it.
+      mocks.remoteExists = true;
+      mocks.remoteRevision = 1;
+      mocks.remoteStatePath = statePath;
+      mocks.remoteCaptureObjectPaths = [missingPath];
+      mocks.remotePreviousCaptureObjectPaths = [];
+      fetchMock.mockClear();
+      await expect(StorageService.saveProject('user-1', { ...loaded!, notes: 'edited while a photo is missing' })).resolves.toBe('cloud');
+      const stateUpload = mocks.uploadBytes.mock.calls.filter(([ref]) => ref.path.includes('/projects/')).at(-1)!;
+      const storedState = await readStateUpload(stateUpload[1] as Blob);
+      expect(storedState.siteCaptures[0].workingRef).toBe(missingUrl);
+      expect(storedState.notes).toBe('edited while a photo is missing');
     } finally {
       vi.unstubAllGlobals();
       await StorageService.deleteProjectLocal(project.projectId);

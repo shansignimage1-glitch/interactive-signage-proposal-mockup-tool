@@ -1,11 +1,12 @@
 import { GoogleGenAI, Modality } from '@google/genai';
-import { allowPost, enforceRateLimit, requireApiKey, requireFirebaseUser, sendApiError, type VercelRequest, type VercelResponse } from './_lib/security.js';
+import { allowPost, enforceDailyBudget, enforceRateLimit, requireApiKey, requireFirebaseUser, sendApiError, type VercelRequest, type VercelResponse } from './_lib/security.js';
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (!allowPost(req, res)) return;
   try {
     const uid = await requireFirebaseUser(req);
-    enforceRateLimit(uid, 'tts', 10, 60_000);
+    await enforceRateLimit(uid, 'tts', 10, 60_000);
+    await enforceDailyBudget('tts', 500);
     const text = req.body?.text;
     if (typeof text !== 'string' || !text.trim() || text.length > 2_000) return res.status(400).json({ error: 'Invalid speech text.' });
     const ai = new GoogleGenAI({ apiKey: requireApiKey() });

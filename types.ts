@@ -297,7 +297,9 @@ export interface SiteCaptureSupportingPhoto {
 export interface SiteCapturePhoto {
   id: string;
   label: string;
-  originalRef: string;
+  /** Full-resolution photo, used by the precision loupe while measuring.
+   *  Removed by "Finish measuring": the project then keeps only workingRef. */
+  originalRef?: string;
   workingRef: string;
   thumbnailRef: string;
   fileName: string;

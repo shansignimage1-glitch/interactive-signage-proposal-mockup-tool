@@ -759,6 +759,161 @@ test('background upload retains its full source dimensions for editing', async (
   await page.mouse.up();
 });
 
+test('finish measuring keeps a 4096 px photo and every measurement unchanged', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-chromium', 'The measure-sharp/store-lean flow is covered once in the desktop browser.');
+
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Continue as Guest' }).click();
+  const moreControls = page.getByRole('button', { name: 'Open all controls' });
+  if (await moreControls.isVisible()) await moreControls.click();
+
+  // A real 4608 x 2592 JPEG, so the raster downscale path is exercised.
+  const jpeg = await page.evaluate(async () => {
+    const canvas = new OffscreenCanvas(4608, 2592);
+    const context = canvas.getContext('2d')!;
+    context.fillStyle = '#314158';
+    context.fillRect(0, 0, 4608, 2592);
+    context.fillStyle = '#38bdf8';
+    context.fillRect(1400, 900, 1800, 800);
+    const blob = await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.9 });
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    let binary = '';
+    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    return btoa(binary);
+  });
+  await page.getByRole('button', { name: 'New Image / Camera' }).click();
+  await page.locator('input[type="file"][accept="image/*"]').setInputFiles({
+    name: 'facade.jpg', mimeType: 'image/jpeg', buffer: Buffer.from(jpeg, 'base64'),
+  });
+  await page.getByTestId('confirm-image-crop').click();
+  const surface = page.locator('#export-target');
+  const surfaceSize = () => surface.evaluate(element => ({
+    width: Number.parseFloat((element as HTMLElement).style.width),
+    height: Number.parseFloat((element as HTMLElement).style.height),
+  }));
+  await expect.poll(surfaceSize).toEqual({ width: 4608, height: 2592 });
+
+  // Calibrate, then measure on the full-resolution photo.
+  await calibrateCanvas(page);
+  await page.getByRole('button', { name: 'Measure line' }).click();
+  const bounds = (await surface.boundingBox())!;
+  await surface.click({ position: { x: bounds.width * 0.3, y: bounds.height * 0.6 } });
+  await surface.click({ position: { x: bounds.width * 0.7, y: bounds.height * 0.6 } });
+  const measurementLabels = () => page.locator('[data-testid^="dimension-label-"]').allTextContents();
+  await expect.poll(async () => (await measurementLabels()).length).toBeGreaterThan(0);
+  const labelsBefore = await measurementLabels();
+
+  const card = page.getByTestId('high-resolution-photo');
+  await expect(card).toContainText('High-resolution photo · 4,608 × 2,592 px');
+  await card.getByRole('button', { name: 'Finish measuring' }).click();
+
+  const dialog = page.getByRole('dialog', { name: 'Finish measuring' });
+  await expect(dialog.getByRole('button', { name: 'Save original to Photos / Files' })).toBeVisible();
+  await dialog.getByRole('button', { name: 'Finish measuring' }).click();
+  await expect(dialog).toBeHidden();
+
+  // Lean photo, same framing, identical real-world measurements.
+  await expect.poll(surfaceSize).toEqual({ width: 4096, height: 2304 });
+  await expect.poll(() => page.locator('#export-target img[alt="Background"]').evaluate(image =>
+    (image as HTMLImageElement).naturalWidth)).toBe(4096);
+  expect(await measurementLabels()).toEqual(labelsBefore);
+  await expect(card).toBeHidden();
+});
+
+test('site photo loupe uses the full-resolution original until measuring is finished', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-chromium', 'The capture-original flow is covered once in the desktop browser.');
+  test.setTimeout(90_000);
+
+  // 1. Capture a 6000 x 4000 site photo in phone capture mode.
+  await page.goto('/?mobileCapture=1');
+  await page.getByRole('button', { name: 'Continue as Guest' }).click();
+  const mobile = page.getByTestId('mobile-site-capture');
+  const jpeg = await page.evaluate(async () => {
+    const canvas = new OffscreenCanvas(6000, 4000);
+    const context = canvas.getContext('2d')!;
+    context.fillStyle = '#243447';
+    context.fillRect(0, 0, 6000, 4000);
+    context.fillStyle = '#f59e0b';
+    context.fillRect(2000, 1500, 2000, 1000);
+    const blob = await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.9 });
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    let binary = '';
+    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    return btoa(binary);
+  });
+  await mobile.locator('input[type=file]').setInputFiles({ name: 'front.jpg', mimeType: 'image/jpeg', buffer: Buffer.from(jpeg, 'base64') });
+  await mobile.getByLabel('Known wall width in m').fill('12');
+  await mobile.getByLabel('Known wall height in m').fill('8');
+  await mobile.getByRole('button', { name: 'Views' }).click();
+  await mobile.getByRole('button', { name: /Create editor view/ }).click();
+  await expect(mobile.getByText('Editor ready')).toBeVisible();
+  // Let autosave persist the promoted view before switching to the editor.
+  await expect.poll(() => page.evaluate(async () => {
+    const open = indexedDB.open('SignageProDB');
+    const db = await new Promise<IDBDatabase>((resolve, reject) => { open.onsuccess = () => resolve(open.result); open.onerror = () => reject(open.error); });
+    const projects = await new Promise<any[]>((resolve, reject) => {
+      const request = db.transaction('projects', 'readonly').objectStore('projects').getAll();
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    db.close();
+    return projects.some(project => project.canvases?.some((canvas: any) => canvas.siteCaptureLink));
+  }), { timeout: 15_000 }).toBe(true);
+
+  // 2. Open the same project in the editor: the view uses the 4096 px working copy.
+  await page.goto('/?editor=1');
+  await page.getByRole('button', { name: 'Continue as Guest' }).click();
+  const moreControls = page.getByRole('button', { name: 'Open all controls' });
+  if (await moreControls.isVisible()) await moreControls.click();
+  const card = page.getByTestId('high-resolution-photo');
+  await expect(card).toContainText('High-resolution photo · 6,000 × 4,000 px');
+
+  // 3. The precision loupe shows the full-resolution original.
+  await addPlaceholderSign(page);
+  await page.getByRole('button', { name: 'Select & adjust' }).click();
+  const corner = page.getByTestId('sign-corner-handle-0');
+  const cornerBounds = (await corner.boundingBox())!;
+  await page.mouse.move(cornerBounds.x + cornerBounds.width / 2, cornerBounds.y + cornerBounds.height / 2);
+  await page.mouse.down();
+  const loupeImage = page.getByTestId('precision-loupe').locator('img');
+  await expect(loupeImage).toHaveAttribute('data-precision-source', 'original');
+  await expect.poll(() => loupeImage.evaluate(image => (image as HTMLImageElement).naturalWidth)).toBe(6000);
+  await page.mouse.up();
+
+  // 4. Finish measuring: the original is unlinked and removed from this device.
+  await card.getByRole('button', { name: 'Finish measuring' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Finish measuring' });
+  await expect(dialog.getByRole('button', { name: 'Save original to Photos / Files' })).toBeVisible();
+  await dialog.getByRole('button', { name: 'Finish measuring' }).click();
+  await expect(dialog).toBeHidden();
+  await expect(card).toBeHidden();
+
+  const stored = await page.evaluate(async () => {
+    const open = indexedDB.open('SignageProDB');
+    const db = await new Promise<IDBDatabase>((resolve, reject) => { open.onsuccess = () => resolve(open.result); open.onerror = () => reject(open.error); });
+    const read = <T,>(store: string) => new Promise<T[]>((resolve, reject) => {
+      const request = db.transaction(store, 'readonly').objectStore(store).getAll();
+      request.onsuccess = () => resolve(request.result as T[]);
+      request.onerror = () => reject(request.error);
+    });
+    const projects = await read<any>('projects');
+    const assets = await read<any>('assets');
+    const capture = projects.flatMap(project => project.siteCaptures ?? []).find((item: any) => item.fileName === 'front.jpg');
+    return {
+      captureHasOriginal: capture ? 'originalRef' in capture : null,
+      originalAssets: assets.filter(asset => String(asset.ref).endsWith('/original')).length,
+      workingAssets: assets.filter(asset => String(asset.ref).endsWith('/working')).length,
+    };
+  });
+  expect(stored).toEqual({ captureHasOriginal: false, originalAssets: 0, workingAssets: 1 });
+
+  // 5. Without an original, the loupe falls back to the working copy.
+  await page.mouse.move(cornerBounds.x + cornerBounds.width / 2, cornerBounds.y + cornerBounds.height / 2);
+  await page.mouse.down();
+  await expect(page.getByTestId('precision-loupe').locator('img')).toHaveAttribute('data-precision-source', 'working');
+  await page.mouse.up();
+});
+
 test('uploaded PNG signs retain enough source pixels for sharp canvas rendering', async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== 'desktop-chromium', 'High-resolution sign import is covered once in the desktop browser.');
 

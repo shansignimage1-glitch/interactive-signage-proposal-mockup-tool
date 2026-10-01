@@ -1,5 +1,5 @@
 import { GoogleGenAI } from '@google/genai';
-import { allowPost, enforceRateLimit, requireApiKey, requireFirebaseUser, sendApiError, type VercelRequest, type VercelResponse } from './_lib/security.js';
+import { allowPost, enforceDailyBudget, enforceRateLimit, requireApiKey, requireFirebaseUser, sendApiError, type VercelRequest, type VercelResponse } from './_lib/security.js';
 
 const ALLOWED_AUDIO = new Set(['audio/webm', 'audio/mp4', 'audio/mpeg', 'audio/wav', 'audio/ogg', 'audio/aac']);
 
@@ -7,7 +7,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (!allowPost(req, res)) return;
   try {
     const uid = await requireFirebaseUser(req);
-    enforceRateLimit(uid, 'transcribe', 30, 60_000);
+    await enforceRateLimit(uid, 'transcribe', 30, 60_000);
+    await enforceDailyBudget('transcribe', 1_000);
     const data = req.body?.audio as string;
     const mimeType = String(req.body?.mimeType ?? '').split(';')[0];
     if (!ALLOWED_AUDIO.has(mimeType) || typeof data !== 'string' || data.length < 20) return res.status(400).json({ error: 'Invalid audio recording.' });

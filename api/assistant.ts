@@ -1,5 +1,5 @@
 import { GoogleGenAI } from '@google/genai';
-import { allowPost, enforceRateLimit, requireApiKey, requireFirebaseUser, sendApiError, type VercelRequest, type VercelResponse } from './_lib/security.js';
+import { allowPost, enforceDailyBudget, enforceRateLimit, requireApiKey, requireFirebaseUser, sendApiError, type VercelRequest, type VercelResponse } from './_lib/security.js';
 import { buildAssistantSystemInstruction } from './_lib/assistantKnowledge.js';
 
 type Message = { role: 'user' | 'model'; text: string };
@@ -8,7 +8,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (!allowPost(req, res)) return;
   try {
     const uid = await requireFirebaseUser(req);
-    enforceRateLimit(uid, 'assistant', 20, 60_000);
+    await enforceRateLimit(uid, 'assistant', 20, 60_000);
+    await enforceDailyBudget('assistant', 2_000);
     const messages = (req.body?.messages ?? []) as Message[];
     if (!Array.isArray(messages) || messages.length < 1 || messages.length > 24) return res.status(400).json({ error: 'Invalid conversation.' });
     let total = 0;

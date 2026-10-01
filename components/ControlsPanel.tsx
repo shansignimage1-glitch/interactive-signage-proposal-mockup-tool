@@ -41,6 +41,9 @@ interface ControlsPanelProps {
   viewLocked: boolean;
   onViewLockedChange: (locked: boolean) => void;
   onOpenCalibration: (options?: { addPlane?: boolean; widthMm?: number; heightMm?: number; planeName?: string }) => void;
+  /** Present while this view still holds a full-resolution photo. */
+  highResolutionPhoto?: { width: number; height: number } | null;
+  onFinishMeasuring?: () => void;
   onPromoteCapture: (capture: SiteCapturePhoto) => Promise<void>;
   showCalibrationReference: boolean;
   setShowCalibrationReference: (show: boolean) => void;
@@ -204,6 +207,8 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
   viewLocked,
   onViewLockedChange,
   onOpenCalibration,
+  highResolutionPhoto,
+  onFinishMeasuring,
   onPromoteCapture,
   showCalibrationReference,
   setShowCalibrationReference,
@@ -1187,6 +1192,18 @@ const ControlsPanel: React.FC<ControlsPanelProps> = ({
                     </div>
                     <p className="mt-1.5 text-[10px] leading-snug text-gray-500">Tap the first point, then the second. Select a finished measurement to adjust its large handles.</p>
                 </div>
+                {highResolutionPhoto && onFinishMeasuring && (
+                    <div className="rounded-lg border border-amber-500/30 bg-amber-500/[0.07] p-3" data-testid="high-resolution-photo">
+                        <p className="text-xs font-semibold text-amber-200">{Math.max(highResolutionPhoto.width, highResolutionPhoto.height) > 4096 ? 'High-resolution photo' : 'Original photo'} · {highResolutionPhoto.width.toLocaleString()} × {highResolutionPhoto.height.toLocaleString()} px</p>
+                        <p className="mt-1 text-[10px] leading-snug text-gray-400">The magnifier uses full camera detail for precise points. When your measurements are done, finish to keep only the lighter working copy (at most 4,096 px).</p>
+                        <button
+                            onClick={onFinishMeasuring}
+                            className="mt-2 flex min-h-11 w-full items-center justify-center gap-2 rounded-lg bg-amber-500 px-3 text-xs font-bold text-gray-950 hover:bg-amber-400"
+                        >
+                            <Check className="h-4 w-4" /> Finish measuring
+                        </button>
+                    </div>
+                )}
                 {activeCanvas.dimensions.length > 0 && state.showDimensions && (
                     <div className="space-y-2 max-h-32 overflow-y-auto pr-1 custom-scrollbar">
                         {activeCanvas.dimensions.map(dim => (

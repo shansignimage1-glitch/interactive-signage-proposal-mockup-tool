@@ -1,11 +1,13 @@
 import { GoogleGenAI } from '@google/genai';
-import { allowPost, enforceRateLimit, requireApiKey, requireFirebaseUser, sendApiError, type VercelRequest, type VercelResponse } from './_lib/security.js';
+import { allowPost, enforceDailyBudget, enforceRateLimit, requireApiKey, requireFirebaseUser, sendApiError, type VercelRequest, type VercelResponse } from './_lib/security.js';
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (!allowPost(req, res)) return;
   try {
     const uid = await requireFirebaseUser(req);
-    enforceRateLimit(uid, 'cleanup', 5, 10 * 60_000);
+    await enforceRateLimit(uid, 'cleanup', 5, 10 * 60_000);
+    // Image generation is the most expensive call; keep its daily ceiling low.
+    await enforceDailyBudget('cleanup', 200);
     const { image, mimeType, prompt } = req.body ?? {};
     // Vercel rejects request bodies over 4.5 MB before this code runs (with a
     // non-JSON 413), so a larger limit here was unreachable. Keep the check

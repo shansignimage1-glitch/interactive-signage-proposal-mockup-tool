@@ -11,6 +11,7 @@ const Assistant = React.lazy(() => import('./components/Assistant'));
 const ProjectManager = React.lazy(() => import('./components/ProjectManager'));
 const ElementStudio = React.lazy(() => import('./components/ElementStudio'));
 const DriveSettings = React.lazy(() => import('./components/DriveSettings'));
+const FinishMeasuringDialog = React.lazy(() => import('./components/FinishMeasuringDialog'));
 const AccountSettings = React.lazy(() => import('./components/AccountSettings'));
 const Proposal3DViewer = React.lazy(() => import('./components/Proposal3DViewer'));
 const MobileSiteCapture = React.lazy(() => import('./components/MobileSiteCapture'));
@@ -25,13 +26,14 @@ import { normalizeProjectState } from './utils/projectMigration';
 import { isValidSurveyPlaneSize } from './utils/fieldMeasurements';
 import CalibrationWizard, { CalibrationDraft } from './components/CalibrationWizard';
 import { TITLE_BLOCK_TEMPLATES } from './data/titleBlockTemplates';
-import { getSiteCaptureAsset, StorageService, type ProjectSaveResult } from './services/StorageService';
+import { deleteLocalAsset, getAssetBlob, getSiteCaptureAsset, StorageService, type ProjectSaveResult } from './services/StorageService';
 import { Wifi, WifiOff, RefreshCw, LogIn, LogOut, Loader2, AlertTriangle, User as UserIcon, HardDrive, Database, Settings, Building2 } from 'lucide-react';
 import { notify } from './services/toast';
 import { reportError, reportWarning } from './services/monitoring';
 import { captureElement } from './utils/exportCapture';
-import { optimizeImageFile } from './services/imageProcessing';
+import { optimizeImageBlob, optimizeImageFile } from './services/imageProcessing';
 import { blobToDataUri } from './services/imageHash';
+import { getFinishMeasuringInfo, LEAN_MAX_DIMENSION, leanSize, scaleCanvasGeometry } from './utils/precisionPhoto';
 import { resolveProjectImages } from './services/AssetResolver';
 import { hasSameEditableContent } from './utils/historyContent';
 
@@ -196,6 +198,9 @@ const App: React.FC = () => {
   const [syncStatus, setSyncStatus] = useState<'synced' | 'local_only' | 'error'>('local_only');
   const [lastCloudSavedAt, setLastCloudSavedAt] = useState<number | null>(null);
   const [syncConflict, setSyncConflict] = useState(false);
+  // The open project was deleted on another device; the user restores or discards it.
+  const [deletedElsewhere, setDeletedElsewhere] = useState(false);
+  const deletedElsewhereRef = useRef(false);
   const [needsCloudDiscovery, setNeedsCloudDiscovery] = useState(false);
   
   // History for Undo/Redo
@@ -215,6 +220,13 @@ const App: React.FC = () => {
   const [showAssistant, setShowAssistant] = useState(false);
   const [showProjectManager, setShowProjectManager] = useState(false);
   const [showDriveSettings, setShowDriveSettings] = useState(false);
+  // "Measure sharp, store lean": full-resolution loupe source for the active
+  // view, and the Finish measuring dialog (view id + preloaded original).
+  const [precisionBackground, setPrecisionBackground] = useState<string | null>(null);
+  const [finishMeasuringCanvasId, setFinishMeasuringCanvasId] = useState<string | null>(null);
+  const [finishOriginal, setFinishOriginal] = useState<
+      { status: 'loading' } | { status: 'ready'; file: File } | { status: 'unavailable'; reason: string }
+  >({ status: 'loading' });
   const [showAccountSettings, setShowAccountSettings] = useState(false);
   const [showProposal3D, setShowProposal3D] = useState(false);
   const [isPhoneCapture, setIsPhoneCapture] = useState(() => shouldUsePhoneCapture(readDeviceModeEnvironment(window)));
@@ -296,6 +308,11 @@ const App: React.FC = () => {
       // must keep it flush first (flushPendingAutosave); any left here was
       // intentionally discarded and must never be saved later.
       pendingAutosaveRef.current = null;
+      // The deleted-elsewhere prompt belongs to the project being opened.
+      const openedDeletedProject = Boolean(newState.user
+          && StorageService.isProjectDeletedRemotely(newState.user.uid, newState.projectId));
+      deletedElsewhereRef.current = openedDeletedProject;
+      setDeletedElsewhere(openedDeletedProject);
       suppressNextAutosaveRef.current = suppressAutosave;
       stateRef.current = newState;
       setState(newState);
@@ -777,6 +794,15 @@ const App: React.FC = () => {
               setSyncStatus('error');
               setSyncConflict(true);
               notify('This project changed on another device. Choose which copy to keep.', 'warning');
+          } else if (result === 'deleted') {
+              setSyncStatus('local_only');
+              setLastCloudSavedAt(null);
+              // Notify once; autosave keeps returning 'deleted' until the user decides.
+              if (!deletedElsewhereRef.current) {
+                  notify('This project was deleted on another device. Restore it, or discard this copy.', 'warning');
+              }
+              deletedElsewhereRef.current = true;
+              setDeletedElsewhere(true);
           } else if (result === 'cloud') {
               setSyncStatus('synced');
               setLastCloudSavedAt(Date.now());
@@ -824,6 +850,42 @@ const App: React.FC = () => {
       }
   };
 
+  // --- Deleted on another device: restore or discard ---
+  const restoreDeletedProject = async () => {
+      const current = stateRef.current;
+      if (!current.user) return;
+      const result = await StorageService.restoreDeletedProject(current.user.uid, current);
+      if (result === 'cloud') {
+          deletedElsewhereRef.current = false;
+          setDeletedElsewhere(false);
+          setSyncConflict(false);
+          setSyncStatus('synced');
+          setLastCloudSavedAt(Date.now());
+          const persisted = await StorageService.loadProjectLocal(current.projectId);
+          if (persisted?.cloudRevision !== undefined) updateState({ cloudRevision: persisted.cloudRevision });
+          notify('Project restored to the cloud.', 'success');
+      } else {
+          notify(result === 'queued'
+              ? 'You are offline. Restore will be available once you are back online.'
+              : 'The project could not be restored right now. Please try again.', 'error');
+      }
+  };
+
+  const discardDeletedProject = async () => {
+      const current = stateRef.current;
+      if (!current.user) return;
+      discardPendingAutosave();
+      await StorageService.discardDeletedProject(current.user.uid, current.projectId);
+      const cleanState = createCleanProjectState(current.user, current.isOnline);
+      if (current.user.uid.startsWith('guest_')) localStorage.setItem(GUEST_PROJECT_ID_KEY, cleanState.projectId);
+      startSession(cleanState);
+      await StorageService.saveProjectLocal(cleanState);
+      setSyncStatus('local_only');
+      setLastCloudSavedAt(null);
+      notify('Discarded this copy. A new project has been started.', 'info');
+      void triggerBackendSync(cleanState);
+  };
+
   const retryPendingCloudSync = useCallback(async (uid: string) => {
       const initial = stateRef.current;
       if (initial.user?.uid !== uid || !initial.isOnline) return;
@@ -838,6 +900,12 @@ const App: React.FC = () => {
       // stranded merely because Project B is the active tablet workspace.
       // Only the active project needs UI/revision reconciliation below.
       if (hadAnyQueuedChanges && !hadQueuedChanges) return;
+      if (StorageService.isProjectDeletedRemotely(uid, projectId)) {
+          deletedElsewhereRef.current = true;
+          setDeletedElsewhere(true);
+          setSyncStatus('local_only');
+          return;
+      }
       if (await StorageService.hasQueuedProjectSync(uid, projectId)) {
           if (StorageService.hasProjectSyncConflict(uid, projectId)) {
               setSyncConflict(true);
@@ -1090,6 +1158,175 @@ const App: React.FC = () => {
   const hasUntrackedEdits = !!history[historyIndex] && !hasSameEditableContent(state, history[historyIndex]);
   const canUndo = historyIndex > 0 || hasUntrackedEdits;
   const canRedo = historyIndex < history.length - 1 && !hasUntrackedEdits;
+
+  // --- Cloud site photos that could not be downloaded to this device ---
+  // A project opens even when some photos can't be fetched; they show as
+  // unavailable and are retried in the background until they arrive.
+  const [unavailablePhotoCount, setUnavailablePhotoCount] = useState(0);
+  const unavailablePhotoCountRef = useRef(0);
+  const setUnavailablePhotos = useCallback((count: number) => {
+      unavailablePhotoCountRef.current = count;
+      setUnavailablePhotoCount(count);
+  }, []);
+  const retryUnavailablePhotos = useCallback(async (announce = false) => {
+      const project = stateRef.current;
+      if (!project.user || project.user.uid.startsWith('guest_')) return;
+      const stillMissing = await StorageService.cacheCapturePhotos(project).catch(() => null);
+      if (stillMissing === null || stateRef.current.projectId !== project.projectId) return;
+      const previous = unavailablePhotoCountRef.current;
+      setUnavailablePhotos(stillMissing.length);
+      if (previous > 0 && stillMissing.length === 0) notify('All site photos are now available on this device.', 'success');
+      else if (announce && stillMissing.length > 0) notify('Some site photos are still unavailable. The app will keep retrying.', 'info');
+  }, [setUnavailablePhotos]);
+  useEffect(() => {
+      const project = stateRef.current;
+      if (!project.user || project.user.uid.startsWith('guest_')) { setUnavailablePhotos(0); return; }
+      let cancelled = false;
+      void StorageService.findUncachedCapturePhotos(project)
+          .then(missing => { if (!cancelled) setUnavailablePhotos(missing.length); })
+          .catch(() => undefined);
+      return () => { cancelled = true; };
+  }, [state.projectId, state.siteCaptures, state.user?.uid, setUnavailablePhotos]);
+  useEffect(() => {
+      if (unavailablePhotoCount === 0) return;
+      void retryUnavailablePhotos();
+      const interval = window.setInterval(() => void retryUnavailablePhotos(), 30_000);
+      const retryWhenOnline = () => void retryUnavailablePhotos();
+      window.addEventListener('online', retryWhenOnline);
+      return () => {
+          window.clearInterval(interval);
+          window.removeEventListener('online', retryWhenOnline);
+      };
+      // Restart the loop only when photos go from none-missing to some-missing.
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [unavailablePhotoCount > 0, state.projectId, retryUnavailablePhotos]);
+
+  // --- High-resolution measuring ("measure sharp, store lean") ---
+  const finishMeasuringInfo = activeCanvas ? getFinishMeasuringInfo(activeCanvas, state.siteCaptures) : null;
+  const precisionOriginalRef = finishMeasuringInfo?.kind === 'capture-original' ? finishMeasuringInfo.originalRef : null;
+  const activeBackgroundWidth = activeCanvas?.backgroundSize.width ?? 0;
+  const activeBackgroundHeight = activeCanvas?.backgroundSize.height ?? 0;
+
+  // A promoted site photo is edited on its 4096 px working copy; the loupe
+  // shows its full-resolution original instead. Uploaded backgrounds need
+  // nothing extra — they are already full resolution on the uploading device.
+  useEffect(() => {
+      setPrecisionBackground(null);
+      if (!precisionOriginalRef || !activeBackgroundWidth || !activeBackgroundHeight) return;
+      let cancelled = false;
+      let objectUrl: string | null = null;
+      const expectedRatio = activeBackgroundWidth / activeBackgroundHeight;
+      void (async () => {
+          const blob = await getAssetBlob(precisionOriginalRef).catch(() => null);
+          if (!blob || cancelled) return;
+          objectUrl = URL.createObjectURL(blob);
+          const image = new Image();
+          image.onload = () => {
+              if (cancelled || !objectUrl) return;
+              // Use it only with identical framing, or loupe points would drift.
+              const ratio = image.naturalWidth / image.naturalHeight;
+              if (Math.abs(ratio - expectedRatio) / expectedRatio < 0.01) setPrecisionBackground(objectUrl);
+          };
+          image.src = objectUrl;
+      })();
+      return () => {
+          cancelled = true;
+          if (objectUrl) URL.revokeObjectURL(objectUrl);
+      };
+  }, [precisionOriginalRef, activeBackgroundWidth, activeBackgroundHeight]);
+
+  const openFinishMeasuring = () => {
+      if (!activeCanvas || !finishMeasuringInfo) return;
+      const canvasId = activeCanvas.id;
+      const info = finishMeasuringInfo;
+      const backgroundRef = activeCanvas.backgroundImage;
+      setFinishMeasuringCanvasId(canvasId);
+      setFinishOriginal({ status: 'loading' });
+      // Preload so "Save original" runs inside the tap (iOS share-sheet rule).
+      void (async () => {
+          // An uploaded background is full resolution only on the uploading
+          // device; elsewhere the project holds just the lean cloud copy.
+          const sourceRef = info.kind === 'capture-original' ? info.originalRef
+              : backgroundRef.startsWith('data:') ? backgroundRef : null;
+          const blob = sourceRef ? await getAssetBlob(sourceRef).catch(() => null) : null;
+          const reason = info.kind === 'oversized-background'
+              ? 'The full-resolution original is only on the device that uploaded this photo.'
+              : 'The original could not be loaded on this device right now.';
+          if (!blob) { setFinishOriginal({ status: 'unavailable', reason }); return; }
+          const extension = ({ 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/heic': 'heic' } as Record<string, string>)[blob.type] ?? 'jpg';
+          const safe = (text: string) => text.replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '') || 'photo';
+          const name = info.kind === 'capture-original' && info.capture.fileName
+              ? info.capture.fileName
+              : `${safe(stateRef.current.projectName)}-${safe(activeCanvas.name)}-original.${extension}`;
+          setFinishOriginal({ status: 'ready', file: new File([blob], name, { type: blob.type || 'image/jpeg' }) });
+      })();
+  };
+
+  const loadImageSize = (src: string) => new Promise<{ width: number; height: number }>((resolve, reject) => {
+      const image = new Image();
+      image.onload = () => resolve({ width: image.naturalWidth, height: image.naturalHeight });
+      image.onerror = () => reject(new Error('The photo could not be loaded.'));
+      image.src = src;
+  });
+
+  const finishMeasuring = async () => {
+      const current = stateRef.current;
+      const canvas = current.canvases.find(c => c.id === finishMeasuringCanvasId);
+      const info = canvas ? getFinishMeasuringInfo(canvas, current.siteCaptures) : null;
+      if (!canvas || !info) { setFinishMeasuringCanvasId(null); return; }
+      try {
+          let next: MockupState;
+          let releasedLocalRef: string | null = null;
+          if (info.kind === 'capture-original') {
+              // The view already uses the 4096 px working copy; unlinking the
+              // original is all that's needed. Cloud cleanup then deletes the
+              // stored original once no retained revision references it.
+              next = {
+                  ...current,
+                  siteCaptures: (current.siteCaptures ?? []).map(capture => {
+                      if (capture.id !== info.capture.id) return capture;
+                      const { originalRef: _released, ...kept } = capture;
+                      return kept;
+                  }),
+              };
+              releasedLocalRef = info.originalRef;
+          } else {
+              // Shrink this device's full-resolution copy (other devices already
+              // hold the lean cloud copy) and map every coordinate into it, so
+              // all measurements keep their real-world values.
+              let backgroundImage = canvas.backgroundImage;
+              // Vector backgrounds are resolution-independent: keep the file and
+              // only move the coordinates into the lean size.
+              if (backgroundImage.startsWith('data:') && !backgroundImage.startsWith('data:image/svg+xml')) {
+                  const source = await getAssetBlob(backgroundImage);
+                  if (!source) throw new Error('The full-resolution photo is missing.');
+                  backgroundImage = await blobToDataUri(await optimizeImageBlob(source, LEAN_MAX_DIMENSION));
+              }
+              const natural = await loadImageSize(backgroundImage);
+              // Never rescale into something larger than the lean size.
+              const target = Math.max(natural.width, natural.height) > LEAN_MAX_DIMENSION
+                  ? leanSize(natural.width, natural.height)
+                  : natural;
+              const scaled = {
+                  ...scaleCanvasGeometry(canvas, target.width / canvas.backgroundSize.width, target.height / canvas.backgroundSize.height),
+                  backgroundImage,
+                  backgroundSize: target,
+              };
+              next = { ...current, canvases: current.canvases.map(c => c.id === canvas.id ? scaled : c) };
+          }
+          // Deliberately not undoable: undo would re-link an original that is
+          // about to be deleted, and a save would then fail looking for it.
+          startSession({ ...next, isSyncing: false }, true);
+          const result = await triggerBackendSync(stateRef.current);
+          // Remove this device's copy only once the unlinked project is saved.
+          if (result !== 'error' && releasedLocalRef) await deleteLocalAsset(releasedLocalRef).catch(() => undefined);
+          setFinishMeasuringCanvasId(null);
+          notify('Measuring finished. This view now keeps only its lighter working copy.', 'success');
+      } catch (error) {
+          reportError('finish-measuring', error, { canvasId: canvas.id, kind: info.kind });
+          notify(error instanceof Error ? error.message : 'Measuring could not be finished. Nothing was changed.', 'error');
+      }
+  };
 
   const addToHistory = useCallback((newState: MockupState) => {
       const currentIndex = historyIndexRef.current;
@@ -1955,6 +2192,19 @@ const App: React.FC = () => {
                   <button className="underline" onClick={keepLocalConflictCopy}>Keep this device</button>
               </div>
           )}
+          {unavailablePhotoCount > 0 && (
+              <div role="status" data-testid="unavailable-photos-banner" className="bg-gray-800/95 text-amber-200 border border-amber-500/40 px-3 py-1 rounded-full text-xs font-bold flex items-center gap-2 pointer-events-auto">
+                  <AlertTriangle className="w-3 h-3" /> {unavailablePhotoCount} site photo{unavailablePhotoCount === 1 ? '' : 's'} unavailable
+                  <button className="underline" onClick={() => void retryUnavailablePhotos(true)}>Retry now</button>
+              </div>
+          )}
+          {deletedElsewhere && (
+              <div role="alert" data-testid="deleted-elsewhere-banner" className="bg-amber-600/95 text-white px-3 py-1 rounded-full text-xs font-bold flex items-center gap-2 pointer-events-auto">
+                  <AlertTriangle className="w-3 h-3" /> Deleted on another device
+                  <button className="underline" onClick={restoreDeletedProject}>Restore it</button>
+                  <button className="underline" onClick={discardDeletedProject}>Discard this copy</button>
+              </div>
+          )}
       </div>
 
       {/* User Profile / Logout (Top Right) */}
@@ -2012,6 +2262,8 @@ const App: React.FC = () => {
         viewLocked={viewLocked}
         onViewLockedChange={handleViewLockedChange}
         onOpenCalibration={openCalibration}
+        highResolutionPhoto={finishMeasuringInfo ? { width: finishMeasuringInfo.width, height: finishMeasuringInfo.height } : null}
+        onFinishMeasuring={openFinishMeasuring}
         onPromoteCapture={handlePromoteSiteCapture}
         showCalibrationReference={showCalibrationReference}
         setShowCalibrationReference={setShowCalibrationReference}
@@ -2042,6 +2294,7 @@ const App: React.FC = () => {
       <div className="flex-1 relative overflow-hidden bg-gray-950">
          <MockupCanvas
            images={{ background: activeCanvas.backgroundImage, backgroundSize: activeCanvas.backgroundSize }}
+           precisionBackground={precisionBackground}
            signs={activeCanvas.signs}
            activeSignId={activeCanvas.activeSignId}
            dimensions={activeCanvas.dimensions}
@@ -2129,6 +2382,18 @@ const App: React.FC = () => {
              imageUrl={activeCanvas.backgroundImage}
              onClose={() => setShowCleanupTool(false)}
              onSave={handleCleanupSave}
+          />
+        </Suspense>
+      )}
+
+      {finishMeasuringCanvasId && finishMeasuringInfo && activeCanvas.id === finishMeasuringCanvasId && (
+        <Suspense fallback={null}>
+          <FinishMeasuringDialog
+             info={finishMeasuringInfo}
+             viewName={activeCanvas.name}
+             original={finishOriginal}
+             onConfirm={finishMeasuring}
+             onClose={() => setFinishMeasuringCanvasId(null)}
           />
         </Suspense>
       )}

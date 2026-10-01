@@ -17,7 +17,10 @@ import { getBackingDepth, getElementExtrusionDepthPx, getElementPhysicalDepthMul
 
 interface MockupCanvasProps {
   images: AppImages;
-  
+  /** Full-resolution rendition of the background (same framing), shown only
+   *  inside the precision loupe so points can be placed at camera detail. */
+  precisionBackground?: string | null;
+
   // Pass these explicitly from the active canvas
   signs: Sign[];
   activeSignId: string | null;
@@ -137,8 +140,9 @@ const PAPER_DIMENSIONS_MM: Record<PaperSize, { width: number, height: number }> 
 // Using 4 for slightly cleaner integers and better default zoom
 const PX_PER_MM = 4;
 
-const MockupCanvas: React.FC<MockupCanvasProps> = ({ 
-    images, 
+const MockupCanvas: React.FC<MockupCanvasProps> = ({
+    images,
+    precisionBackground,
     signs,
     activeSignId,
     dimensions,
@@ -1981,7 +1985,11 @@ const MockupCanvas: React.FC<MockupCanvasProps> = ({
         >
           {images.background && (
             <img
-              src={images.background}
+              // The loupe is drawn at the background's coordinate size, so a
+              // full-resolution source with the same framing lines up exactly
+              // and simply shows more detail when magnified.
+              src={precisionBackground || images.background}
+              data-precision-source={precisionBackground ? 'original' : 'working'}
               alt=""
               crossOrigin="anonymous"
               className="absolute max-w-none select-none"

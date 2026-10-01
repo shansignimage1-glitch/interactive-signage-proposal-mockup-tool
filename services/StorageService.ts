@@ -11,7 +11,15 @@ import { assertStorageCapacity, optimizeDataUri } from './imageProcessing';
 import { decodeProjectFromFirestore, withoutUndefined } from '../utils/firestorePayload';
 import { gzipSync, gunzipSync, strFromU8, strToU8 } from 'fflate';
 
-export type ProjectSaveResult = 'cloud' | 'local' | 'queued' | 'conflict' | 'error';
+/** 'deleted': another device deleted this project; the device copy is kept
+ *  until the user chooses to restore it or discard it. */
+export type ProjectSaveResult = 'cloud' | 'local' | 'queued' | 'conflict' | 'deleted' | 'error';
+
+// A deleted project first becomes a "tombstone": its Firestore index gains
+// deletedAt but keeps its state/photo pointers, so another device that still
+// has it open can RESTORE it (photos intact) or discard its copy. After this
+// window the next device that lists projects purges it for good.
+export const DELETED_PROJECT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
 const FIRESTORE_COLLECTION = 'projects';
 const DB_NAME = 'SignageProDB';
@@ -34,6 +42,17 @@ const cloudProjectListRefreshedAt = new Map<string, number>();
 const projectDeletionEpochs = new Map<string, number>();
 const deletedProjectKeys = new Set<string>();
 const projectSyncConflicts = new Set<string>();
+/** Projects this device found tombstoned by another device. */
+const projectsDeletedRemotely = new Set<string>();
+/** Expired tombstones already being purged this session (purge runs once). */
+const tombstonePurgesStarted = new Set<string>();
+// How long a fetched cloud index may be reused without another Firestore read.
+// Shared by the project list and project opening, so what the list shows is
+// what opens. A fresh read here is where iOS WebKit's Firestore channel can
+// stall for 30 s+, e.g. tapping a project a couple of seconds after listing.
+// Staleness is bounded and safe: a newer revision saved elsewhere inside this
+// window still surfaces as a sync conflict on the next save.
+const CLOUD_INDEX_REUSE_MS = 15_000;
 const revisionKey = (userId: string, projectId: string) => `${userId}_${projectId}`;
 const projectDocumentId = (userId: string, projectId: string) => `${userId}_${encodeURIComponent(projectId)}`;
 const projectStorageId = (projectId: string) => encodeURIComponent(projectId);
@@ -74,12 +93,14 @@ type CloudProjectIndex = {
     cloudRevision?: number;
     canvasCount?: number;
     hasImage?: boolean;
+    /** Set when the project was deleted (tombstone); see DELETED_PROJECT_RETENTION_MS. */
+    deletedAt?: number;
     [key: string]: unknown;
 };
 
 const cachedCloudProjectMetadata = (userId: string): ProjectMetadata[] =>
     [...knownCloudProjectIndexes.values()]
-        .filter(index => index.userId === userId)
+        .filter(index => index.userId === userId && !index.deletedAt)
         .map(index => ({
             id: index.projectId,
             name: index.projectName ?? 'Untitled Project',
@@ -329,6 +350,25 @@ export const deleteSiteCaptureAssetRefs = async (refs: readonly string[]): Promi
     });
 };
 
+/** Bytes for any image ref the app stores: a data URI, a local site-capture
+ *  asset, a cached cloud object, or (last resort) the hosted URL itself. */
+export const getAssetBlob = async (ref: string): Promise<Blob | null> => {
+    if (ref.startsWith('data:')) return dataUriToBlob(ref);
+    if (ref.startsWith(SITE_CAPTURE_SCHEME)) return getSiteCaptureAsset(ref);
+    const cached = await getCachedAsset(ref).catch(() => null);
+    if (cached?.blob) return cached.blob;
+    if (/^https?:/i.test(ref)) {
+        const response = await fetch(ref);
+        if (response.ok) return response.blob();
+    }
+    return null;
+};
+
+/** Remove this device's local copy of an asset (local capture or cloud cache). */
+export const deleteLocalAsset = async (ref: string): Promise<void> => {
+    await idbOperation(STORE_ASSETS, 'readwrite', store => store.delete(ref));
+};
+
 const uploadSiteCaptureAsset = async (
     userId: string,
     projectId: string,
@@ -563,11 +603,20 @@ const downloadHostedSiteCapture = async (url: string): Promise<Blob> => {
     }
 };
 
-const cacheHostedSiteCaptureAssets = async (project: MockupState): Promise<void> => {
+/**
+ * Download every cloud site photo of a project into the durable device cache.
+ * Returns the refs that could not be cached (never throws), so one missing or
+ * unreachable photo no longer stops the whole project from opening.
+ *
+ * Saving stays safe meanwhile: a save keeps a cloud photo's existing reference
+ * while the object is retained by the current revision, and otherwise refuses
+ * to commit (uploadSiteCaptureAsset throws) — it never drops the photo.
+ */
+const cacheHostedSiteCaptureAssets = async (project: MockupState): Promise<string[]> => {
     const refs = collectHostedSiteCaptureRefs(project);
-    if (!refs.length) return;
+    if (!refs.length) return [];
     let cursor = 0;
-    const failures: unknown[] = [];
+    const failed: string[] = [];
     const worker = async () => {
         while (cursor < refs.length) {
             const ref = refs[cursor++];
@@ -575,14 +624,16 @@ const cacheHostedSiteCaptureAssets = async (project: MockupState): Promise<void>
                 if (await getCachedAsset(ref)) continue;
                 await putCachedAsset(ref, await downloadHostedSiteCapture(ref));
             } catch (error) {
-                failures.push(error);
+                failed.push(ref);
+                reportWarning('capture-cache', 'A site photo could not be downloaded for offline use', {
+                    projectId: project.projectId,
+                    error: String(error),
+                });
             }
         }
     };
     await Promise.all(Array.from({ length: Math.min(3, refs.length) }, worker));
-    if (failures.length) {
-        throw new Error('One or more site photographs could not be cached safely for offline recovery.', { cause: failures[0] });
-    }
+    return failed;
 };
 
 type CloudCaptureRetentionState = {
@@ -591,6 +642,8 @@ type CloudCaptureRetentionState = {
     retainedObjectPaths: Set<string>;
     expectedExists: boolean;
     expectedStatePath?: string;
+    /** The index is a tombstone: another device deleted this project. */
+    deleted?: boolean;
 };
 
 const captureRetentionStateFromIndex = async (
@@ -608,6 +661,7 @@ const captureRetentionStateFromIndex = async (
             retainedObjectPaths: new Set([...currentObjectPaths, ...(index.previousCaptureObjectPaths ?? [])]),
             expectedExists: true,
             expectedStatePath: index.statePath,
+            deleted: Boolean(index.deletedAt),
         };
     }
 
@@ -622,6 +676,7 @@ const captureRetentionStateFromIndex = async (
         retainedObjectPaths: new Set([...currentObjectPaths, ...previousObjectPaths]),
         expectedExists: true,
         expectedStatePath: index.statePath,
+        deleted: Boolean(index.deletedAt),
     };
 };
 
@@ -846,11 +901,20 @@ export const StorageService = {
       // that fresh result when Project Manager opens instead of starting a
       // second WebKit Firestore channel that can stall for tens of seconds.
       const listAge = Date.now() - (cloudProjectListRefreshedAt.get(userId) ?? 0);
-      const cloud = listAge < 15_000
+      const cloud = listAge < CLOUD_INDEX_REUSE_MS
           ? cachedCloudProjectMetadata(userId)
           : await StorageService.listProjectsCloud(userId);
+      // Carry deletions made on other devices over to this one. A copy with
+      // unsynced edits stays, so the user can still restore or discard it.
+      const removedHere = new Set<string>();
+      for (const project of local) {
+          if (!projectsDeletedRemotely.has(revisionKey(userId, project.id))) continue;
+          if (await StorageService.hasQueuedProjectSync(userId, project.id)) continue;
+          await StorageService.deleteProjectLocal(project.id).catch(() => undefined);
+          removedHere.add(project.id);
+      }
       const byId = new Map<string, ProjectMetadata>();
-      for (const project of [...local, ...cloud]) {
+      for (const project of [...local.filter(item => !removedHere.has(item.id)), ...cloud]) {
           const existing = byId.get(project.id);
           if (!existing || project.lastModified > existing.lastModified) byId.set(project.id, project);
       }
@@ -995,6 +1059,13 @@ export const StorageService = {
               const snapshot = await getDoc(doc(db, FIRESTORE_COLLECTION, projectDocumentId(userId, job.projectId)));
               if (snapshot.exists()) {
                   const index = snapshot.data() as CloudProjectIndex;
+                  if (index.deletedAt) {
+                      // Deleted on another device. Keep the queued edits until
+                      // the user restores or discards this copy — never retry.
+                      projectsDeletedRemotely.add(key);
+                      knownCloudProjectIndexes.set(key, index);
+                      continue;
+                  }
                   const remoteRevision = index.cloudRevision ?? 0;
                   const localRevision = project.cloudRevision ?? 0;
                   const remoteSavedAt = index.updatedAt ?? index.lastSaved ?? 0;
@@ -1079,7 +1150,9 @@ export const StorageService = {
       if (userId.startsWith('guest_')) return;
 
       const cloud = await getDocs(query(collection(db, FIRESTORE_COLLECTION), where('userId', '==', userId)));
-      for (const doc of cloud.docs) await StorageService.deleteProjectCloud(userId, doc.data().projectId);
+      // Account deletion is immediate and permanent: purge live projects and
+      // any tombstones still inside their restore window.
+      for (const doc of cloud.docs) await StorageService.purgeDeletedProjectCloud(userId, doc.data().projectId);
       const remainingProjects = await getDocs(query(collection(db, FIRESTORE_COLLECTION), where('userId', '==', userId)));
       if (!remainingProjects.empty) throw new Error('Some cloud projects could not be deleted');
 
@@ -1103,9 +1176,15 @@ export const StorageService = {
 
   // --- Cloud Sync (Firestore) ---
 
-  // Without this, a project deleted locally kept living in Firestore forever —
-  // and could even reappear, since login loads the most-recently-updated cloud
-  // project. Image cleanup is best-effort and never blocks the delete itself.
+  /**
+   * Delete a project everywhere. The Firestore index becomes a tombstone
+   * (deletedAt, revision + 1) that keeps its state/photo pointers, so:
+   *  - other devices see the deletion instead of silently re-uploading it;
+   *  - a device with unsynced edits can still restore it, photos intact;
+   *  - the files are purged after DELETED_PROJECT_RETENTION_MS.
+   * The bumped revision makes any save racing with this delete fail its
+   * transaction instead of resurrecting the project.
+   */
   deleteProjectCloud: async (userId: string, projectId: string): Promise<void> => {
       if (userId.startsWith('guest_')) return;
       const key = revisionKey(userId, projectId);
@@ -1115,6 +1194,62 @@ export const StorageService = {
       // Reserve both slots synchronously. Saves invoked before this deletion
       // finish/abort first; saves invoked after it see the tombstone and cannot
       // recreate the Firestore document or its local state.
+      const localReservation = reserveProjectLock(projectLocalSaveTails, key);
+      const cloudReservation = reserveProjectLock(projectSaveTails, key);
+      let authoritativeDeleted = false;
+      try {
+          await localReservation.waitForTurn;
+          localReservation.release();
+          await cloudReservation.waitForTurn;
+          const projectRef = doc(db, FIRESTORE_COLLECTION, projectDocumentId(userId, projectId));
+          const deletedAt = Date.now();
+          await runTransaction(db, async transaction => {
+              const remote = await transaction.get(projectRef);
+              if (!remote.exists()) return; // never reached the cloud
+              const index = remote.data() as CloudProjectIndex;
+              if (index.deletedAt) return;
+              transaction.set(projectRef, withoutUndefined({
+                  ...index,
+                  deletedAt,
+                  updatedAt: deletedAt,
+                  cloudRevision: (index.cloudRevision ?? 0) + 1,
+              }));
+          });
+          authoritativeDeleted = true;
+          knownCloudProjectIndexes.delete(key);
+          knownCloudProjectIndexFetchedAt.delete(key);
+          knownCloudRevisions.delete(key);
+          projectSyncConflicts.delete(key);
+          projectsDeletedRemotely.delete(key);
+          cloudProjectListRefreshedAt.set(userId, Date.now());
+          latestProjectSaveSequences.delete(key);
+          latestPersistedProjectSaveSequences.delete(key);
+          latestProjectSaveTimestamps.delete(key);
+      } catch (error) {
+          // A failed authoritative delete leaves the project valid. Allow a
+          // later save/retry, but retain the incremented epoch so older work
+          // that already observed this deletion cannot resume.
+          if (!authoritativeDeleted && projectDeletionEpochs.get(key) === deletionEpoch) {
+              deletedProjectKeys.delete(key);
+          }
+          throw error;
+      } finally {
+          localReservation.release();
+          cloudReservation.release();
+      }
+  },
+
+  /**
+   * Permanently remove a project's cloud data: its index (live or tombstone),
+   * state revisions, site photos, now-unreferenced images and drive files.
+   * Used once a tombstone's restore window expires, and by delete-all.
+   */
+  purgeDeletedProjectCloud: async (userId: string, projectId: string): Promise<void> => {
+      if (userId.startsWith('guest_')) return;
+      const key = revisionKey(userId, projectId);
+      const deletionEpoch = (projectDeletionEpochs.get(key) ?? 0) + 1;
+      projectDeletionEpochs.set(key, deletionEpoch);
+      deletedProjectKeys.add(key);
       const localReservation = reserveProjectLock(projectLocalSaveTails, key);
       const cloudReservation = reserveProjectLock(projectSaveTails, key);
       let authoritativeDeleted = false;
@@ -1140,6 +1275,7 @@ export const StorageService = {
       knownCloudProjectIndexFetchedAt.delete(key);
       knownCloudRevisions.delete(key);
       projectSyncConflicts.delete(key);
+      projectsDeletedRemotely.delete(key);
       cloudProjectListRefreshedAt.set(userId, Date.now());
       latestProjectSaveSequences.delete(key);
       latestPersistedProjectSaveSequences.delete(key);
@@ -1154,6 +1290,8 @@ export const StorageService = {
               const snapshot = await getDocs(query(collection(db, FIRESTORE_COLLECTION), where('userId', '==', userId)));
               const stillReferenced = new Set<string>();
               for (const projectDoc of snapshot.docs) {
+                  // Tombstones inside their restore window still count: their
+                  // drive files must survive a possible restore.
                   const project = await readCloudProjectState(projectDoc.data() as CloudProjectIndex);
                   collectDriveRefs(project).forEach(ref => stillReferenced.add(ref));
               }
@@ -1249,6 +1387,14 @@ export const StorageService = {
           await cloudReservation.waitForTurn;
           if (deletedProjectKeys.has(key) || (projectDeletionEpochs.get(key) ?? 0) !== deletionEpoch) return 'error';
           if ((latestPersistedProjectSaveSequences.get(key) ?? 0) > saveSequence) return 'local';
+          // Deleted on another device: keep this copy (queued, so it counts as
+          // unsynced work) but never re-upload it unless the user restores it.
+          const markDeletedRemotely = async (): Promise<ProjectSaveResult> => {
+              projectsDeletedRemotely.add(key);
+              if (!fromQueue) await StorageService.queueProjectSync(userId, state.projectId);
+              return 'deleted';
+          };
+          if (!force && projectsDeletedRemotely.has(key)) return await markDeletedRemotely();
 
       let pendingStatePath: string | null = null;
       const createdCaptureObjectPaths = new Set<string>();
@@ -1286,6 +1432,8 @@ export const StorageService = {
                       expectedExists: false,
                     }
                   : await readAuthoritativeCloudCaptureState(userId, state.projectId);
+          // Checked before the revision conflict: a tombstone bumps the revision.
+          if (!force && authoritativeCaptureState.deleted) return await markDeletedRemotely();
           if (!force && authoritativeCaptureState.revision > baseRevision) {
               projectSyncConflicts.add(key);
               return 'conflict';
@@ -1349,7 +1497,11 @@ export const StorageService = {
           };
           const siteCaptures = await settleCaptureUploads((state.siteCaptures ?? []).map(async capture => ({
               ...capture,
-              originalRef: await uploadSiteCaptureAsset(userId, state.projectId, capture.id, 'original', capture.originalRef, createdCaptureObjectPaths, uploadAttemptId, authoritativeCaptureState.retainedObjectPaths, pendingCaptureMappings),
+              // Absent after "Finish measuring": never upload (or re-link an
+              // older cloud copy of) an original the user has released.
+              originalRef: capture.originalRef
+                  ? await uploadSiteCaptureAsset(userId, state.projectId, capture.id, 'original', capture.originalRef, createdCaptureObjectPaths, uploadAttemptId, authoritativeCaptureState.retainedObjectPaths, pendingCaptureMappings)
+                  : undefined,
               annotationBaseRef: capture.annotationBaseRef
                   ? await uploadSiteCaptureAsset(userId, state.projectId, capture.id, 'annotation-base', capture.annotationBaseRef, createdCaptureObjectPaths, uploadAttemptId, authoritativeCaptureState.retainedObjectPaths, pendingCaptureMappings)
                   : undefined,
@@ -1418,6 +1570,8 @@ export const StorageService = {
               const remote = await transaction.get(projectRef);
               const remoteData = remote.exists() ? remote.data() as CloudProjectIndex : undefined;
               const remoteRevision = remoteData?.cloudRevision ?? 0;
+              // Deleted by another device while this save was uploading.
+              if (!force && remoteData?.deletedAt) return 'deleted' as const;
               // Any change after the asset preflight must restart the save.
               // This guarantees that obsolete hosted refs are either retained
               // or copied before a forced restore can commit them again.
@@ -1473,10 +1627,15 @@ export const StorageService = {
                   index: firestoreIndex,
               };
           });
-          if (transactionResult === null) {
+          if (transactionResult === null || transactionResult === 'deleted') {
               await deleteObject(storageRef(storage, pendingStatePath)).catch(() => undefined);
               pendingStatePath = null;
               await removeCreatedCaptureObjects();
+              // The cached index is stale; the next attempt must re-read the
+              // cloud instead of repeating the same mismatch forever.
+              knownCloudProjectIndexes.delete(key);
+              knownCloudProjectIndexFetchedAt.delete(key);
+              if (transactionResult === 'deleted') return await markDeletedRemotely();
               if (!fromQueue) await StorageService.queueProjectSync(userId, state.projectId);
               return 'queued';
           }
@@ -1496,6 +1655,7 @@ export const StorageService = {
            knownCloudProjectIndexes.set(key, transactionResult.index);
            knownCloudProjectIndexFetchedAt.set(key, Date.now());
            projectSyncConflicts.delete(key);
+           projectsDeletedRemotely.delete(key); // a restore replaces the tombstone
            // A newer invocation may already have written a fresher local
            // snapshot while this upload was running. Never overwrite it with
            // this older state just to record the cloud revision.
@@ -1568,6 +1728,52 @@ export const StorageService = {
        }
    },
 
+  /** Fire-and-forget: permanently purge a tombstone whose restore window has
+   *  passed — unless this device still has unsynced edits for it, in which
+   *  case the user keeps the restore/discard choice. */
+  purgeExpiredTombstone: (userId: string, projectId: string, deletedAt: number): void => {
+      const key = revisionKey(userId, projectId);
+      if (Date.now() - deletedAt < DELETED_PROJECT_RETENTION_MS || tombstonePurgesStarted.has(key)) return;
+      tombstonePurgesStarted.add(key);
+      void (async () => {
+          if (await StorageService.hasQueuedProjectSync(userId, projectId)) return;
+          await StorageService.purgeDeletedProjectCloud(userId, projectId);
+      })().catch(error => {
+          tombstonePurgesStarted.delete(key);
+          reportWarning('tombstone-purge', 'Expired deleted project could not be purged yet', { projectId, error: String(error) });
+      });
+  },
+
+  /** Cloud site photos of this project that are not yet on this device. */
+  findUncachedCapturePhotos: async (project: MockupState): Promise<string[]> => {
+      const refs = collectHostedSiteCaptureRefs(project);
+      const cached = await Promise.all(refs.map(ref => getCachedAsset(ref).then(Boolean).catch(() => false)));
+      return refs.filter((_, index) => !cached[index]);
+  },
+
+  /** Try again to download a project's cloud site photos; returns those still missing. */
+  cacheCapturePhotos: (project: MockupState): Promise<string[]> => cacheHostedSiteCaptureAssets(project),
+
+  /** True when another device deleted this project (see ProjectSaveResult 'deleted'). */
+  isProjectDeletedRemotely: (userId: string, projectId: string): boolean =>
+      projectsDeletedRemotely.has(revisionKey(userId, projectId)),
+
+  /** Bring a project deleted elsewhere back from this device's copy. Its cloud
+   *  photos are still retained by the tombstone, so nothing is lost. */
+  restoreDeletedProject: async (userId: string, state: MockupState): Promise<ProjectSaveResult> => {
+      projectsDeletedRemotely.delete(revisionKey(userId, state.projectId));
+      const result = await StorageService.saveProject(userId, state, false, true);
+      if (result === 'deleted') projectsDeletedRemotely.add(revisionKey(userId, state.projectId));
+      return result;
+  },
+
+  /** Accept another device's deletion: drop this device's copy and queue. */
+  discardDeletedProject: async (userId: string, projectId: string): Promise<void> => {
+      await StorageService.discardQueuedProjectSync(userId, projectId);
+      await StorageService.deleteProjectLocal(projectId);
+      projectsDeletedRemotely.delete(revisionKey(userId, projectId));
+  },
+
   listProjectsCloud: async (userId: string, throwOnError = false): Promise<ProjectMetadata[]> => {
       if (userId.startsWith('guest_')) return [];
       try {
@@ -1587,18 +1793,26 @@ export const StorageService = {
           const snapshot = await readProjects(query(collection(db, FIRESTORE_COLLECTION), where('userId', '==', userId)));
 
           const seen = new Set<string>();
-          const projects = snapshot.docs.map(doc => {
+          const projects = snapshot.docs.flatMap(doc => {
                const d = doc.data();
                const key = revisionKey(userId, d.projectId);
                seen.add(key);
                knownCloudProjectIndexes.set(key, d as CloudProjectIndex);
                knownCloudProjectIndexFetchedAt.set(key, Date.now());
-              return {
+               if (d.deletedAt) {
+                   // Deleted on some device: never list it, remember it so this
+                   // device's saves stop instead of recreating it, and purge it
+                   // for good once its restore window has passed.
+                   projectsDeletedRemotely.add(key);
+                   StorageService.purgeExpiredTombstone(userId, d.projectId, d.deletedAt);
+                   return [];
+               }
+              return [{
                   id: d.projectId,
                   name: d.projectName ?? 'Untitled Project',
                   lastModified: d.updatedAt ?? d.lastSaved,
                   canvasCount: d.canvasCount ?? d.canvases?.length ?? 1,
-              };
+              }];
           }).sort((a, b) => (b.lastModified ?? 0) - (a.lastModified ?? 0));
            for (const [key, index] of knownCloudProjectIndexes) {
                if (index.userId === userId && !seen.has(key)) {
@@ -1627,10 +1841,10 @@ export const StorageService = {
            const key = revisionKey(userId, projectId);
            let index = forceRefresh ? undefined : knownCloudProjectIndexes.get(key);
            const cachedAt = knownCloudProjectIndexFetchedAt.get(key) ?? 0;
-           // A network list/save may hand its index to the immediately following
-           // load once. Cached lists shown later must re-check Firestore so a
-           // still-valid retained revision cannot remain stale indefinitely.
-           const usedCachedIndex = Boolean(index && Date.now() - cachedAt <= 1_000);
+           // A network list/save may hand its index to the following load once,
+           // within CLOUD_INDEX_REUSE_MS. Older cached indexes must re-check
+           // Firestore so a still-valid retained revision cannot stay stale.
+           const usedCachedIndex = Boolean(index && Date.now() - cachedAt <= CLOUD_INDEX_REUSE_MS);
            if (usedCachedIndex) knownCloudProjectIndexFetchedAt.delete(key);
            else index = undefined;
            if (!index) {
@@ -1643,6 +1857,11 @@ export const StorageService = {
                }
                index = snapshot.data() as CloudProjectIndex;
                knownCloudProjectIndexes.set(key, index);
+           }
+           if (index.deletedAt) {
+               // Deleted on another device: there is no cloud copy to open.
+               projectsDeletedRemotely.add(key);
+               return null;
            }
           let projectState: MockupState;
           try {
@@ -1662,9 +1881,10 @@ export const StorageService = {
               projectState = await readCloudProjectState(index);
            }
            // A device that has opened the project must be able to keep its
-           // local copy even after later revisions age old cloud objects out.
-           // Cache every hosted capture blob before treating the cloud load as
-           // successful; stale-ref rehoming reads this durable cache first.
+           // local copy even after later revisions age old cloud objects out;
+           // stale-ref rehoming reads this durable cache first. Photos that
+           // can't be fetched right now no longer block opening the project:
+           // the editor shows them as unavailable and keeps retrying.
            await cacheHostedSiteCaptureAssets(projectState);
            // Deliberately do NOT advance knownCloudRevisions here. Reading the
            // cloud copy is not adopting it: callers that keep the local copy
